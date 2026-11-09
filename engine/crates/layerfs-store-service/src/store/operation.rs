@@ -65,6 +65,12 @@ impl BoundWorkspace {
     pub fn belongs_to(&self, store: &Arc<Store>) -> bool {
         Arc::ptr_eq(&self.store, store)
     }
+    /// A missing owner classification is treated as durable for sync refusal.
+    pub fn has_durable_overlay(&self) -> bool {
+        self.owner
+            .durable_identity()
+            .map_or(true, |identity| identity.is_some())
+    }
 }
 impl StoreOperation {
     pub fn client_handle(&self) -> Arc<CanonicalClient> {

@@ -25,7 +25,7 @@ use layerfs_content::filesystem::PathName;
 use layerfs_workspace::KernelReadOperation;
 use std::{ffi::OsStr, io, os::unix::ffi::OsStrExt, path::Path, time::SystemTime};
 
-/// FLUSH, FSYNC and FSYNCDIR: the declared answer, with no work.
+/// Disposable FLUSH, FSYNC and FSYNCDIR: the declared answer, with no work.
 fn unsynchronized() -> Errno {
     match flush::synchronize() {
         flush::Synchronize::NotImplemented => Errno::ENOSYS,
@@ -273,20 +273,28 @@ impl Filesystem for KernelFilesystem {
         self.release_directory(req, inode, handle, reply);
     }
 
-    // Declared in operations/flush.rs: nothing is buffered here to flush and
-    // no durability is claimed. `ENOSYS` is sticky per connection: the kernel
-    // answers every later one itself, with success.
+    // Disposable mounts retain their old ENOSYS behavior. A durable mount
+    // must not receive ENOSYS: Linux caches it and returns successful fsync to
+    // applications despite the missing durability barrier.
     fn flush(&self, _: &Request, _: INodeNo, _: FileHandle, _: LockOwner, reply: ReplyEmpty) {
         let _timed = self.accounting.timed(Opcode::Flush);
         self.refuse(Opcode::Flush, reply, ReplyEmpty::error, unsynchronized());
     }
     fn fsync(&self, _: &Request, _: INodeNo, _: FileHandle, _: bool, reply: ReplyEmpty) {
         let _timed = self.accounting.timed(Opcode::Fsync);
-        self.refuse(Opcode::Fsync, reply, ReplyEmpty::error, unsynchronized());
+        let errno = match self.services.sync_capability() {
+            crate::ports::SyncCapability::Disposable => unsynchronized(),
+            crate::ports::SyncCapability::DurableUnavailable => Errno::EOPNOTSUPP,
+        };
+        self.refuse(Opcode::Fsync, reply, ReplyEmpty::error, errno);
     }
     fn fsyncdir(&self, _: &Request, _: INodeNo, _: FileHandle, _: bool, reply: ReplyEmpty) {
         let _timed = self.accounting.timed(Opcode::Fsyncdir);
-        self.refuse(Opcode::Fsyncdir, reply, ReplyEmpty::error, unsynchronized());
+        let errno = match self.services.sync_capability() {
+            crate::ports::SyncCapability::Disposable => unsynchronized(),
+            crate::ports::SyncCapability::DurableUnavailable => Errno::EOPNOTSUPP,
+        };
+        self.refuse(Opcode::Fsyncdir, reply, ReplyEmpty::error, errno);
     }
     fn statfs(&self, _: &Request, _: INodeNo, reply: ReplyStatfs) {
         let _timed = self.accounting.timed(Opcode::Statfs);

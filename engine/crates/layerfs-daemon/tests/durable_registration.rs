@@ -152,6 +152,79 @@ fn kernel(mounts: &Path) -> Arc<KernelServing> {
     )
 }
 
+fn assert_durable_sync_unavailable(file: &Path, directory: &Path) {
+    let file = fs::File::open(file).unwrap();
+    assert_eq!(
+        file.sync_all().unwrap_err().raw_os_error(),
+        Some(nix::libc::EOPNOTSUPP)
+    );
+    let directory = fs::File::open(directory).unwrap();
+    assert_eq!(
+        directory.sync_all().unwrap_err().raw_os_error(),
+        Some(nix::libc::EOPNOTSUPP)
+    );
+}
+
+#[test]
+#[ignore = "requires a dedicated Linux container with CAP_SYS_ADMIN and /dev/fuse"]
+fn disposable_mount_keeps_existing_sync_behavior() {
+    let fixture = support::Fixture::new(1, "disposable-sync");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let owner = Owner::start(
+        &fixture.directory.join("overlay.sqlite"),
+        ProfileConfig::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let mounts = fixture.directory.join("mounts");
+    fs::create_dir(&mounts).unwrap();
+    let service = Service::with_kernel(store.clone(), &owner, kernel(&mounts));
+    let identity = WorkspaceId::from_authority([40; 32]).unwrap();
+    let Reply::Bound { token, .. } = service
+        .execute_control(&Request::Mount {
+            workspace: identity,
+            branch: fixture.branch,
+        })
+        .unwrap()
+        .reply
+    else {
+        panic!("no disposable binding")
+    };
+    let Reply::Ready(ready) = service
+        .execute_control(&Request::Attach(token))
+        .unwrap()
+        .reply
+    else {
+        panic!("no disposable mount")
+    };
+    let mut mount = MountGuard(Some(PathBuf::from(&ready.directory)));
+    let file = fs::File::open(Path::new(&ready.directory).join("file-000000")).unwrap();
+    let directory = fs::File::open(&ready.directory).unwrap();
+    file.sync_all().unwrap();
+    directory.sync_all().unwrap();
+    drop((file, directory));
+    let done = service
+        .execute_control(&Request::Unmount(UnmountControl {
+            token,
+            discard: true,
+        }))
+        .unwrap();
+    assert_eq!(done.reply, Reply::Unmounted(token));
+    mount.0 = None;
+    drop(service);
+    owner.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
 #[test]
 #[ignore = "requires a dedicated Linux container with CAP_SYS_ADMIN and /dev/fuse"]
 fn real_fuse_write_survives_daemon_process_loss() {
@@ -205,12 +278,13 @@ fn real_fuse_write_survives_daemon_process_loss() {
                 "printf '%s\\n' 'workspace bytes after process loss' > \"$1\"",
                 "sh",
             ])
-            .arg(file)
+            .arg(&file)
             .uid(65534)
             .gid(65534)
             .status()
             .unwrap();
         assert!(status.success());
+        assert_durable_sync_unavailable(&file, Path::new(&ready.directory));
         fs::write(directory.join("ack"), &ready.directory).unwrap();
         std::thread::sleep(Duration::from_secs(60));
         panic!("parent did not fence the old daemon");
@@ -302,6 +376,7 @@ fn real_fuse_write_survives_daemon_process_loss() {
     let mut recovered_mount = MountGuard(Some(PathBuf::from(&ready.directory)));
     let recovered_file = Path::new(&ready.directory).join("file-000000");
     assert_eq!(fs::read_to_string(&recovered_file).unwrap(), BYTES);
+    assert_durable_sync_unavailable(&recovered_file, Path::new(&ready.directory));
     let reader = Command::new("/bin/cat")
         .arg(&recovered_file)
         .uid(65534)

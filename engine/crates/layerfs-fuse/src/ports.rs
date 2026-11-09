@@ -145,8 +145,20 @@ impl<T> ServiceReply<T> {
 /// One shared mounted Workspace; starting a request creates fresh failure
 /// custody without provider I/O, a new cache or a whole-Workspace lock. The
 /// request's services observe its mount's fence.
+/// How a mount answers an explicit file or directory synchronization request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncCapability {
+    /// Disposable state has no durability contract; keep its existing ENOSYS.
+    Disposable,
+    /// A durable mount must not acknowledge sync until the full contract exists.
+    DurableUnavailable,
+}
 pub trait MountServices: Send + Sync {
     fn request(&self, fence: &Fence) -> Result<Arc<dyn RequestServices>, ServiceError>;
+    /// Unknown implementations fail closed rather than claiming durability.
+    fn sync_capability(&self) -> SyncCapability {
+        SyncCapability::DurableUnavailable
+    }
 }
 /// One kernel request's original operations. No concrete daemon command,
 /// completion, registry or application configuration crosses this boundary.

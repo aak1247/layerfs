@@ -54,9 +54,10 @@ durable owner and use its ordinary control and FUSE Attach path. Registration
 checks the exact owner and Store, and a refusal returns the original binding.
 The caller selects a fresh control namespace and fences the prior process,
 mount and consumers; this path is not a durable roster or automatic restart.
-Terminal unmount closes the database but retains its files. The current FUSE
-FSYNC and FSYNCDIR handlers still answer ENOSYS, so this is not an `fsync`
-durability claim.
+Terminal unmount closes the database but retains its files. Until the full
+barrier is implemented, durable mounts explicitly reject FUSE FSYNC and
+FSYNCDIR with EOPNOTSUPP; they do not use ENOSYS, which Linux would cache as a
+successful synchronization. This is not an `fsync` durability claim.
 
 The durable profile is SQLite DELETE/EXTRA/EXCLUSIVE. SQLite documents that
 [FULL alone is not necessarily durable in DELETE mode](https://sqlite.org/pragma.html#pragma_synchronous).
@@ -165,3 +166,10 @@ physical power loss, Kubernetes or an `fsync` guarantee. The test runner,
 source and image hashes, kernel version, output and exit status are retained
 under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-process-loss-extra-20261109/`.
+
+The subsequent isolated FUSE run checked both profiles: on a durable mount,
+file `fsync` and directory `fsync` returned EOPNOTSUPP before and after the
+manual recovery path; a disposable mount retained its prior successful
+ENOSYS behavior. The test output, executable and source hashes, image and
+kernel facts are retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-sync-refusal-20261109-final/`.

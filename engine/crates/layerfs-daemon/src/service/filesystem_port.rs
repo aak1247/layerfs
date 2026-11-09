@@ -5,7 +5,7 @@ use crate::{
 };
 use layerfs_fuse::ports::{
     BaseDemandFailed, Fence, Fenced, MountServices, RequestServices, ServiceError, ServiceFuture,
-    ServiceReply,
+    ServiceReply, SyncCapability,
 };
 use layerfs_history::HistoryError;
 use layerfs_overlay::{KernelCookieOffer, KernelMount, Publication};
@@ -33,6 +33,13 @@ pub struct Mounted(pub Arc<BoundWorkspace>);
 impl MountServices for Mounted {
     fn request(&self, fence: &Fence) -> Result<Arc<dyn RequestServices>, ServiceError> {
         request(&self.0, fence)
+    }
+    fn sync_capability(&self) -> SyncCapability {
+        if self.0.has_durable_overlay() {
+            SyncCapability::DurableUnavailable
+        } else {
+            SyncCapability::Disposable
+        }
     }
 }
 /// One kernel request's services over `workspace`, under `fence`.

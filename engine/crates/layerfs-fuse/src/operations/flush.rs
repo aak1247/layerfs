@@ -3,8 +3,9 @@
 //! Kernel writeback caching is not negotiated, so every `write(2)` has already
 //! been published by its own WRITE before it returned, and a mapped store is
 //! published by the WRITE the kernel issues before the FSYNC of an `msync`.
-//! Nothing is buffered in the daemon for these requests to push, and the
-//! Overlay is disposable state that is never synchronized to stable media.
+//! Nothing is buffered in the daemon for these requests to push. This module
+//! describes disposable Overlay behavior; durable mounts refuse FSYNC and
+//! FSYNCDIR explicitly until their full synchronization contract is available.
 
 /// What a synchronization request does here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,8 +18,7 @@ pub enum Synchronize {
     /// claim is made either way.
     NotImplemented,
 }
-/// FLUSH on every close, and FSYNC/FSYNCDIR with or without the data-only
-/// flag, get the same answer.
+/// The disposable mount's FLUSH, FSYNC and FSYNCDIR get the same answer.
 pub const fn synchronize() -> Synchronize {
     Synchronize::NotImplemented
 }
