@@ -13,6 +13,8 @@ mod failure;
 mod force;
 #[cfg(target_os = "linux")]
 mod fresh_control;
+#[cfg(target_os = "linux")]
+mod fresh_volume;
 mod inspect;
 mod invalidate;
 mod kernel;
@@ -37,6 +39,8 @@ mod unmount;
 pub use durable_control::{DurableControlCause, DurableControlConfig, DurableControlFailure};
 #[cfg(target_os = "linux")]
 pub use fresh_control::{FreshControlCause, FreshControlConfig, FreshControlFailure};
+#[cfg(target_os = "linux")]
+pub use fresh_volume::{FreshVolumeCause, FreshVolumeConfig, FreshVolumeFailure};
 pub use kernel::{KernelConfig, KernelServing};
 pub(crate) use observation::{reply_token, request_token};
 #[cfg(target_os = "linux")]

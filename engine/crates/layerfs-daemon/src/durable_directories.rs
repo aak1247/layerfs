@@ -98,6 +98,12 @@ impl FreshDirectories {
     pub fn overlay_path(&self) -> PathBuf {
         self.root_path.join(SHARED).join(&self.name).join(OVERLAYS)
     }
+    pub(crate) fn catalog_descriptor_path(&self) -> PathBuf {
+        descriptor_path(&self.catalog)
+    }
+    pub(crate) fn overlay_descriptor_path(&self) -> PathBuf {
+        descriptor_path(&self.overlays)
+    }
     /// Verifies the original root and each child against its retained parent.
     pub fn verify(&self) -> io::Result<()> {
         check_root(&self.root_path, &self.root, self.device)?;
@@ -271,6 +277,9 @@ fn check_root(path: &Path, root: &File, device: u64) -> io::Result<()> {
         device,
         false,
     )
+}
+fn descriptor_path(directory: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()))
 }
 fn check_child(parent: &File, name: &str, child: &File, device: u64) -> io::Result<()> {
     let path =

@@ -15,11 +15,11 @@ pub(super) struct DurableRoot {
 }
 impl DurableRoot {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let path = path.canonicalize()?;
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-            .open(&path)?;
+            .open(path)?;
+        let path = path.canonicalize()?;
         let root = Self {
             path,
             file: Some(file),
