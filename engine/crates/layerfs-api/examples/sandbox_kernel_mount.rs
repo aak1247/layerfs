@@ -21,7 +21,7 @@ use std::{
     error::Error,
     fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -91,6 +91,18 @@ fn check_host_mount_change(
     wait("restored")?;
     host.verify()?;
     println!("HOST_EXPORT_CHANGE refused=true original_mount_restored=true");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sync_proof_file(directory: &Path, name: &str, contents: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join(name))?;
+    file.write_all(contents)?;
+    file.sync_all()?;
     Ok(())
 }
 /// What `find` must print inside the mount: every path, nothing else.
@@ -214,6 +226,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     source(&directory.join("source"))?;
     let branch = BranchId::from_authority([62; 16]);
     let durable = std::env::var_os("LAYERFS_EXAMPLE_DURABLE").is_some();
+    #[cfg(target_os = "linux")]
+    let crash_probe = std::env::var_os("LAYERFS_EXAMPLE_CRASH_PROBE").map(PathBuf::from);
+    #[cfg(target_os = "linux")]
+    if crash_probe.is_some()
+        && (!durable || std::env::var_os("LAYERFS_EXAMPLE_HOST_EXPORT").is_none())
+    {
+        return Err("crash proof requires a durable host export".into());
+    }
     let profile = if durable {
         SqlitePersistenceProfile::Durable
     } else {
@@ -274,6 +294,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
     let api = SandboxApi::new(Docker::new(&args[1], Duration::from_secs(30))?);
+    #[cfg(target_os = "linux")]
+    let recovery_setup = daemon_setup.clone();
     let mut owner = api
         .create(
             SandboxCreate {
@@ -359,6 +381,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             fs::File::open(host.path())?.sync_all()?;
             assert_eq!(fs::read(&file_path)?, b"host durable acknowledgement");
             drop(file);
+            host.verify()?;
+            if let Some(proof) = &crash_probe {
+                let mut setup = recovery_setup.clone();
+                setup.existing_store = Some(installed.manifest.clone());
+                sync_proof_file(proof, "daemon.setup", &setup.encode()?)?;
+                let receipt = format!(
+                    "{}\n{}\n{}\n{}\n{}\n{}\n",
+                    namespace,
+                    receipt.device_major,
+                    receipt.device_minor,
+                    host.mount_id(),
+                    std::process::id(),
+                    owner.runtime.identity()
+                );
+                sync_proof_file(proof, "original.receipt", receipt.as_bytes())?;
+                sync_proof_file(proof, "ready", b"durable host write acknowledged\n")?;
+                fs::File::open(proof)?.sync_all()?;
+                println!("HOST_DURABLE_CRASH_READY synced=true");
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                return Err("crash proof controller did not terminate the owner".into());
+            }
             fs::remove_file(file_path)?;
             fs::File::open(host.path())?.sync_all()?;
             println!("HOST_DURABLE_SYNC file_and_directory_acknowledged=true");

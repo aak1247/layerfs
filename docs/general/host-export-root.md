@@ -129,6 +129,24 @@ and normally closed the Workspace and Sandbox. Its receipt is
 The export root for that run was on tmpfs. The test does not simulate a crash
 or verify automatic Workspace recovery.
 
+A separate manual recovery test used another dedicated ext4-backed Docker
+volume and two fresh host exports. After the host received file and directory
+sync acknowledgements, its controller killed the exact SDK process through a
+pidfd and the acknowledged original container, verified that container's
+cgroup was empty, and normally unmounted the exact host mount. It waited for
+the original FUSE connection to disappear before explicitly opening the old
+Store and Workspace catalog in a second trusted test container. That container
+claimed the new export, recovered the original Workspace with a new namespace,
+and rejected the old token. The host read the acknowledged original bytes
+through the new export before normal unmount. The first recovery container
+exited before opening storage because its proof directory lacked permission;
+the retry used a root-owned proof directory. Exact fixture containers, volume,
+mounts and temporary credentials were removed after verification. Receipts and
+both attempts are under
+`~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-host-recovery-20261110-eHJoO8r8/`.
+This is one explicitly fenced synthetic Docker recovery, not automatic SDK
+recovery, Pod recreation, or physical host power-loss verification.
+
 This low-level adapter does not yet provide a complete durable lifecycle
 journal and recovery for exported Sandboxes or automatic host guard checks
 around every Workspace operation. A caller must supply and retain those
