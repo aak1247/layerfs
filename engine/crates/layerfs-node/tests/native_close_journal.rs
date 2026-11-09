@@ -113,6 +113,8 @@ enum Mode {
     Lost,
     IntentSync,
     ReplySync,
+    RemoveSync,
+    CompleteSync,
     Dirty,
     DirtyMissing,
     Busy,
@@ -302,14 +304,17 @@ fn run(mode: Mode) {
         }
     });
     let script = match mode {
-        Mode::Lost | Mode::IntentSync | Mode::ReplySync | Mode::AmbiguousBusy => "const a={...args,path:'/workspaces/fixture',discard:true}; const r=await native.call('workspace.unmount',a); assert.equal(r.refused?.code,'Unknown',JSON.stringify(r.refused)); const again=await native.call('workspace.unmount',a); assert.equal(again.refused?.code,'RecoveryRequired',JSON.stringify(again.refused));",
+        Mode::Lost | Mode::IntentSync | Mode::ReplySync | Mode::RemoveSync | Mode::CompleteSync | Mode::AmbiguousBusy => "const a={...args,path:'/workspaces/fixture',discard:true}; const r=await native.call('workspace.unmount',a); assert.equal(r.refused?.code,'Unknown',JSON.stringify(r.refused)); const again=await native.call('workspace.unmount',a); assert.equal(again.refused?.code,'RecoveryRequired',JSON.stringify(again.refused));",
         Mode::Dirty => "const a={...args,path:'/workspaces/fixture'}; const r=await native.call('workspace.unmount',a); assert.equal(r.refused?.code,'Dirty',JSON.stringify(r.refused)); const next=await native.call('workspace.unmount',{...a,discard:true}); assert.equal(next.value?.kind,'Unmounted',JSON.stringify(next.refused));",
         Mode::DirtyMissing => "const r=await native.call('workspace.unmount',{...args,path:'/workspaces/fixture'}); assert.equal(r.refused?.code,'Dirty',JSON.stringify(r.refused));",
         Mode::Busy => "const a={...args,path:'/workspaces/fixture',discard:true}; const r=await native.call('workspace.unmount',a); assert.equal(r.refused?.code,'Busy',JSON.stringify(r.refused)); const next=await native.call('workspace.unmount',a); assert.equal(next.value?.kind,'Unmounted',JSON.stringify(next.refused));",
         Mode::Force => "const a={...args,path:'/workspaces/fixture',discard:true}; const r=await native.call('workspace.unmount',{...a,force:true}); assert.equal(r.refused?.code,'Unsupported',JSON.stringify(r.refused)); const next=await native.call('workspace.unmount',a); assert.equal(next.value?.kind,'Unmounted',JSON.stringify(next.refused));",
         Mode::Closed => "const a={...args,path:'/workspaces/fixture',discard:true}; const r=await native.call('workspace.unmount',a); assert.equal(r.value?.kind,'Unmounted',JSON.stringify(r.refused));",
     };
-    if matches!(mode, Mode::IntentSync | Mode::ReplySync) {
+    if matches!(
+        mode,
+        Mode::IntentSync | Mode::ReplySync | Mode::RemoveSync | Mode::CompleteSync
+    ) {
         let shim = home.0.join("close-fault.so");
         assert!(Command::new("cc")
             .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
@@ -324,10 +329,12 @@ fn run(mode: Mode) {
             Some(&shim),
             &[(
                 "LAYERFS_TEST_CLOSE_FAULT",
-                if mode == Mode::IntentSync {
-                    "intent"
-                } else {
-                    "answer"
+                match mode {
+                    Mode::IntentSync => "intent",
+                    Mode::ReplySync => "answer",
+                    Mode::RemoveSync => "remove",
+                    Mode::CompleteSync => "complete",
+                    _ => unreachable!(),
                 },
             )],
             Duration::from_secs(20),
@@ -340,11 +347,20 @@ fn run(mode: Mode) {
     let saved = intents(&directory);
     if matches!(
         mode,
-        Mode::Lost | Mode::IntentSync | Mode::ReplySync | Mode::AmbiguousBusy
+        Mode::Lost
+            | Mode::IntentSync
+            | Mode::ReplySync
+            | Mode::RemoveSync
+            | Mode::CompleteSync
+            | Mode::AmbiguousBusy
     ) {
         assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].get_text("phase"), Some("beforeUnmount"));
-        assert!(file.exists());
+        let removed = matches!(mode, Mode::RemoveSync | Mode::CompleteSync);
+        assert_eq!(
+            saved[0].get_text("phase"),
+            Some(if removed { "closed" } else { "beforeUnmount" })
+        );
+        assert_eq!(file.exists(), !removed);
         home.node("const r=await native.call('workspace.unmount',{...args,path:'/workspaces/fixture',discard:true}); assert.equal(r.refused?.code,'RecoveryRequired',JSON.stringify(r.refused));", None, Duration::from_secs(20));
     } else if mode == Mode::DirtyMissing {
         assert_eq!(saved[0].get_text("phase"), Some("noEffect"));
@@ -381,6 +397,14 @@ fn failed_intent_sync_never_sends_close() {
 #[test]
 fn failed_reply_sync_retains_the_answer_and_blocks_replay() {
     run(Mode::ReplySync)
+}
+#[test]
+fn failed_workspace_removal_sync_retains_the_close_receipt() {
+    run(Mode::RemoveSync)
+}
+#[test]
+fn failed_completion_sync_never_replays_the_acknowledged_close() {
+    run(Mode::CompleteSync)
 }
 #[test]
 fn dirty_reply_allows_a_new_explicit_close() {

@@ -31,9 +31,10 @@ Neither target needs Docker, FUSE, or a Store. The JavaScript API remains outsid
 the CI lanes under the owner's existing policy; run these targets explicitly.
 
 `native_close_journal` covers durable close intent and correlated receipts,
-including lost replies, injected intent/receipt sync failures, Dirty and the
-specific reversible kernel Busy response. It verifies that a new process
-refuses an unresolved or inconsistent record without replaying Unmount. Its
+including lost replies, injected intent/receipt, record-removal and completion
+sync failures, Dirty and the specific reversible kernel Busy response. It
+verifies that a new process refuses an unresolved or inconsistent record
+without replaying Unmount. Its
 daemon is simulated; it is not a FUSE or crash-recovery proof.
 
 `external_close_reply` is an ignored, read-only check of an explicitly supplied

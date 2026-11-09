@@ -9,6 +9,17 @@
 #include <unistd.h>
 
 static int injected;
+static int removed;
+static int replacements;
+int unlink(const char *name) {
+    int (*original)(const char *) = dlsym(RTLD_NEXT, "unlink");
+    int result = original(name);
+    const char *mode = getenv("LAYERFS_TEST_CLOSE_FAULT");
+    if (result == 0 && mode && strcmp(mode, "remove") == 0 && strstr(name, "/workspace-")) {
+        __sync_lock_test_and_set(&removed, 1);
+    }
+    return result;
+}
 int fsync(int fd) {
     int (*original)(int) = dlsym(RTLD_NEXT, "fsync");
     const char *mode = getenv("LAYERFS_TEST_CLOSE_FAULT");
@@ -17,6 +28,17 @@ int fsync(int fd) {
     ssize_t length = readlink(link, actual, sizeof(actual) - 1);
     if (length < 0 || (size_t)length >= sizeof(actual) - 1) return original(fd);
     actual[length] = '\0';
+    if (strcmp(mode, "remove") == 0 && removed && strstr(actual, "/proj/sandboxes/1") &&
+        __sync_bool_compare_and_swap(&injected, 0, 1)) {
+        errno = EIO;
+        return -1;
+    }
+    if (strcmp(mode, "complete") == 0 && strstr(actual, "/close-intent-") &&
+        strstr(actual, ".record.") && __sync_add_and_fetch(&replacements, 1) == 2 &&
+        __sync_bool_compare_and_swap(&injected, 0, 1)) {
+        errno = EIO;
+        return -1;
+    }
     if (strstr(actual, "/close-intent-") &&
         ((strcmp(mode, "intent") == 0 && strstr(actual, ".record.") == NULL) ||
          (strcmp(mode, "answer") == 0 && strstr(actual, ".record.") != NULL)) &&
