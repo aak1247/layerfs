@@ -59,6 +59,10 @@ requiring an external root, but still requires the independently known file
 path and Workspace identity. The resulting snapshot must pass Store binding
 and the caller's authorization and old-owner fencing checks.
 
+The separate [durable discovery catalog](durable-roster.md) can retain the
+identities and original Branches of multiple Workspaces. It is not yet wired
+into the default daemon's startup or mount lifecycle.
+
 An explicitly assembled daemon `Service` can register already bound durable
 owners and use its ordinary control and FUSE Attach path. The caller may first
 transfer each owner into an in-memory bounded `Owner` roster with

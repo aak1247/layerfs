@@ -53,8 +53,9 @@ The normal daemon application still mounts MEMORY/OFF/EXCLUSIVE Workspaces.
 The Overlay crate provides a Linux durable database and conservative reopen
 boundary; an explicitly assembled daemon Service can adopt multiple durable
 owners and manually remount them after the caller fences the old process and
-mounts. The in-memory roster is not durable discovery or automatic Sandbox
-recovery. A Durable global Store
+mounts. A separate append-only discovery catalog retains Workspace identity
+and Branch intent, but the in-memory roster does not use it automatically and
+it does not recover a Sandbox. A Durable global Store
 alone does not make uncommitted Workspace writes durable. Do not route user
 work to a path that claims full recovery until the overlay, lifecycle and FUSE
 synchronization contracts are implemented and verified together.

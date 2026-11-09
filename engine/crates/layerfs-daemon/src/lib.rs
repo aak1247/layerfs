@@ -26,3 +26,6 @@ pub use layerfs_store_service::{
 pub mod control;
 
 pub mod application;
+
+#[cfg(target_os = "linux")]
+pub mod durable_roster;
