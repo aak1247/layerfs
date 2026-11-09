@@ -30,6 +30,11 @@ daemon has bounded socket waits and stops independently of a test assertion.
 Neither target needs Docker, FUSE, or a Store. The JavaScript API remains outside
 the CI lanes under the owner's existing policy; run these targets explicitly.
 
+`native_mount_journal` exercises concurrent durable mounts and unresolved mount
+intents against an authenticated simulated daemon and a real local Store. A
+fresh process without the Docker socket must refuse an unresolved intent before
+connecting or attempting another mount; it does not prove automatic recovery.
+
 `native_close_journal` covers durable close intent and correlated receipts,
 including lost replies, injected intent/receipt, record-removal and completion
 sync failures, Dirty and the specific reversible kernel Busy response. It

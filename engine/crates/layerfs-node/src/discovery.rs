@@ -594,7 +594,9 @@ pub(crate) fn reopen(args: &SdkValue) -> Result<Arc<SandboxState>> {
     let durable_identity = durable_identity(&value)?;
     #[cfg(target_os = "linux")]
     if let Some(identity) = durable_identity {
+        let _guard = guard(&directory)?;
         crate::close_journal::check_at(&directory, identity)?;
+        crate::mount_journal::check_at(&directory, identity)?;
     }
     let (docker, selector, request) = runtime(&value)?;
     let runtime = Sandbox::reopen(docker, selector, request).map_err(|failure| {

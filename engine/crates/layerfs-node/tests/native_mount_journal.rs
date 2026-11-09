@@ -125,6 +125,7 @@ fn intent(directory: &Path) -> SdkValue {
 enum Mode {
     Ready,
     TwoReady,
+    ConcurrentReady,
     LostReady,
     BoundSync,
     BoundSwap,
@@ -132,7 +133,8 @@ enum Mode {
 fn run(mode: Mode) {
     let lost_ready = mode == Mode::LostReady;
     let incomplete = matches!(mode, Mode::LostReady | Mode::BoundSync | Mode::BoundSwap);
-    let two_ready = mode == Mode::TwoReady;
+    let two_ready = matches!(mode, Mode::TwoReady | Mode::ConcurrentReady);
+    let concurrent = mode == Mode::ConcurrentReady;
     let swapped = mode == Mode::BoundSwap;
     let home = Home::new();
     let binding = setup_project(&home);
@@ -150,18 +152,7 @@ fn run(mode: Mode) {
         );
     let engine = engines(
         &home.0,
-        vec![
-            (200, running.clone());
-            if swapped {
-                2
-            } else if incomplete {
-                5
-            } else if two_ready {
-                3
-            } else {
-                2
-            }
-        ],
+        vec![(200, running.clone()); if two_ready { 3 } else { 2 }],
     );
     let observed_directory = directory.clone();
     let worker = thread::spawn(move || {
@@ -203,6 +194,9 @@ fn run(mode: Mode) {
             intent(&observed_directory).get_text("phase"),
             Some("beforeBind")
         );
+        if concurrent {
+            thread::sleep(Duration::from_millis(500));
+        }
         let token = layerfs_bridge::control::WorkspaceToken {
             workspace,
             namespace: 7,
@@ -317,49 +311,15 @@ fn run(mode: Mode) {
                         )
                         .unwrap();
                 }
-                return;
             }
-        }
-        if swapped {
-            return;
-        }
-        if incomplete {
-            drop(connection);
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut connection = accept(stream, &daemon.private, client.public).unwrap();
-            let hello =
-                layerfs_bridge::control::Call::decode(connection.receive.receive().unwrap())
-                    .unwrap();
-            assert!(matches!(hello.request, Request::Hello(_)));
-            connection
-                .send
-                .send(
-                    &Answer {
-                        id: hello.id,
-                        reply: Reply::Hello(DaemonStatus {
-                            instance: [7; 32],
-                            phase: DaemonPhase::ControlReady,
-                            overlay_sqlite: Some("3.50.4".into()),
-                            store_sqlite: Some("3.50.4".into()),
-                        }),
-                    }
-                    .encode()
-                    .unwrap(),
-                )
-                .unwrap();
-            assert!(
-                connection.receive.receive().is_err(),
-                "reopen must not repeat Mount or Attach"
-            );
         }
     });
     let action = if swapped {
         "const r=await native.call('workspace.mount',a); assert.equal(r.refused?.code,'Unknown',JSON.stringify(r.refused)); const again=await native.call('workspace.mount',a); assert.equal(again.refused?.code,'NoSuchSandbox',JSON.stringify(again.refused));"
     } else if incomplete {
-        "const r=await native.call('workspace.mount',a); assert.equal(r.refused?.code,'Unknown',JSON.stringify(r.refused)); const again=await native.call('workspace.mount',a); assert.equal(again.refused?.code,'RecoveryRequired',JSON.stringify(again.refused));"
+        "const r=await native.call('workspace.mount',a); assert.equal(r.refused?.code,'Unknown',JSON.stringify(r.refused)); const listed=await native.call('sandbox.list_workspaces',a); assert.equal(listed.refused?.code,'RecoveryRequired',JSON.stringify(listed.refused)); const again=await native.call('workspace.mount',a); assert.equal(again.refused?.code,'RecoveryRequired',JSON.stringify(again.refused));"
+    } else if concurrent {
+        "const fs=require('node:fs'); const d=process.env.LAYERFS_HOME+'/durable-project/sandboxes/1'; const first=native.call('workspace.mount',a); let seen=false; for(let i=0;i<200;i++){if(fs.readdirSync(d).some(n=>n.startsWith('mount-intent-'))){seen=true;break;} await new Promise(r=>setTimeout(r,5));} assert.ok(seen,'first mount intent was not observed'); const second=native.call('workspace.mount',a); const [r,next]=await Promise.all([first,second]); assert.equal(r.value?.path,'/workspaces/fixture',JSON.stringify(r.refused)); assert.equal(next.value?.path,'/workspaces/fixture2',JSON.stringify(next.refused));"
     } else if two_ready {
         "const r=await native.call('workspace.mount',a); assert.equal(r.value?.path,'/workspaces/fixture',JSON.stringify(r.refused)); const next=await native.call('workspace.mount',a); assert.equal(next.value?.path,'/workspaces/fixture2',JSON.stringify(next.refused));"
     } else {
@@ -397,21 +357,11 @@ fn run(mode: Mode) {
         home.node(&script, None, Duration::from_secs(20));
     }
     if incomplete && !swapped {
-        home.node("const a={...args,project:'durable-project',branch:'feature',storePath:process.env.LAYERFS_HOME+'/volume/global/store.sqlite'}; const opened=await native.storeOpen(a); assert.ok(!opened.refused,JSON.stringify(opened.refused)); const result=await native.call('workspace.mount',a); assert.equal(result.refused?.code,'RecoveryRequired',JSON.stringify(result.refused));", None, Duration::from_secs(20));
+        fs::remove_file(home.0.join("docker.sock")).unwrap();
+        home.node("const a={...args,project:'durable-project',branch:'feature',storePath:process.env.LAYERFS_HOME+'/volume/global/store.sqlite'}; const opened=await native.storeOpen(a); assert.ok(!opened.refused,JSON.stringify(opened.refused)); const listed=await native.call('sandbox.list_workspaces',a); assert.equal(listed.refused?.code,'RecoveryRequired',JSON.stringify(listed.refused)); const result=await native.call('workspace.mount',a); assert.equal(result.refused?.code,'RecoveryRequired',JSON.stringify(result.refused));", None, Duration::from_secs(20));
     }
     worker.join().unwrap();
-    assert_eq!(
-        engine.join().unwrap().len(),
-        if swapped {
-            2
-        } else if incomplete {
-            5
-        } else if two_ready {
-            3
-        } else {
-            2
-        }
-    );
+    assert_eq!(engine.join().unwrap().len(), if two_ready { 3 } else { 2 });
     if two_ready {
         let intents = directory
             .read_dir()
@@ -472,6 +422,10 @@ fn mount_intent_precedes_both_sends_and_ready_is_recorded() {
 #[test]
 fn completed_receipts_allow_another_distinct_mount() {
     run(Mode::TwoReady)
+}
+#[test]
+fn concurrent_mount_waits_for_an_active_intent() {
+    run(Mode::ConcurrentReady)
 }
 #[test]
 fn lost_ready_keeps_the_original_intent_and_blocks_another_mount() {

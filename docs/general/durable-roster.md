@@ -152,14 +152,19 @@ For a Sandbox record explicitly marked durable, the Node binding records a
 private mount intent before Bind, the original Branch snapshot before Attach,
 and the exact Ready receipt before reporting success. It synchronizes the
 Workspace record and the completed intent relative to the original held
-Sandbox directory. An incomplete or malformed intent blocks a new mount; an
-observer or publication failure retains its original result and directory in
-the running process. Reopening never replays the old request. Completed records
+Sandbox directory. An incomplete or malformed intent blocks Sandbox reopening
+and operations admitted through a cached Sandbox before Docker inspection or
+daemon connection; an observer or publication failure retains its original
+result and directory in the running process. Project inventory can still inspect
+the container separately and is not evidence that the intent completed.
+Checks wait for the Sandbox discovery guard, so another active mount can finish
+before its intent is classified. Reopening never replays the old request. Completed records
 are checked against the Sandbox, Workspace, Branch and receipt identities
 before another mount is admitted. This does not recover an old daemon or prove
 its physical consumers have exited. The native Node tests use an authenticated
 simulated daemon and a real local Store: they cover distinct successful mounts,
-lost Ready, failed intent sync, directory replacement and process reopen. The
+lost Ready, failed intent sync, directory replacement, two concurrent mounts
+and process reopen without access to the Docker socket. The
 separate Docker/FUSE proof above exercises actual SDK-created mounts.
 
 The Linux Node binding also synchronizes a close intent before sending a durable

@@ -102,6 +102,20 @@ fn check_pending(directory: &Directory, sandbox: [u8; 32]) -> Result<(), SdkRefu
     }
     directory.verify().map_err(failed)
 }
+
+/// Refuse unresolved mounts before reopening the Engine or using a cached Sandbox.
+pub(crate) fn check_at(path: &Path, sandbox: [u8; 32]) -> Result<(), SdkRefusal> {
+    if let Some(retained) = lock(&RETAINED)?.get(path) {
+        let _ = (&retained.journal, &retained.result);
+        return Err(refused(
+            "RecoveryRequired",
+            "a durable Workspace mount is retained by this process",
+        ));
+    }
+    let directory = Directory::open(path).map_err(failed)?;
+    check_pending(&directory, sandbox)
+}
+
 impl Journal {
     fn new(
         directory: Directory,

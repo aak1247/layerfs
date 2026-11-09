@@ -92,8 +92,23 @@ pub(crate) fn sandbox(args: &SdkValue) -> Result<Arc<SandboxState>, SdkRefusal> 
             state
         }
     };
-    check_durable_close(&state)?;
+    check_durable_access(&state)?;
     Ok(state)
+}
+
+/// Wait for an active mutation before checking its journal. The narrower close
+/// check below is also used by callers that already hold this guard.
+fn check_durable_access(state: &SandboxState) -> Result<(), SdkRefusal> {
+    if state.durable_identity.is_some() {
+        let _guard = crate::discovery::guard(&state.directory)?;
+        check_durable_close(state)?;
+        #[cfg(target_os = "linux")]
+        crate::mount_journal::check_at(
+            &state.directory,
+            state.durable_identity.expect("durable identity checked"),
+        )?;
+    }
+    Ok(())
 }
 
 /// An unresolved durable close cannot be inferred from a later status call.
@@ -117,7 +132,7 @@ pub(crate) fn sandbox_live(args: &SdkValue) -> Result<Arc<SandboxState>, SdkRefu
     let Some(state) = lock(&SANDBOXES)?.get(&directory).cloned() else {
         return sandbox(args);
     };
-    check_durable_close(&state)?;
+    check_durable_access(&state)?;
     if let Err(failure) = state.runtime.endpoint() {
         lock(&SANDBOXES)?.remove(&directory);
         return Err(if failure.container_gone() || failure.container_stopped() {
