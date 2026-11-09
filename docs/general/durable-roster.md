@@ -171,9 +171,16 @@ reversible `unmount:kernel` Busy refusal is recorded as no effect and permits
 a new, explicit request; other Busy phases do not establish that outcome.
 Forced unmount is refused because it does not use the durable catalog's close
 protocol. The native tests inject lost replies and sync errors against an
-authenticated simulated daemon; this is not automatic Sandbox recovery or a
-real process-crash test of SDK close. The retained close records currently have
-no compaction protocol.
+authenticated simulated daemon. In a separate real Docker/FUSE test, a
+test-only shim stopped the SDK immediately after the daemon's Unmounted reply
+and before syncing its replacement record; the SDK process was then killed.
+An independent read-only verifier decoded the original intent and matching
+unsynced reply, while another fresh Node process without Docker access refused
+to replay the close. The retained fixture, ownership and limits are recorded in
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-close-kill-20261110-khby5hm3/receipt.txt`.
+This establishes that same-host process-kill boundary, not survival of
+unsynced data after power loss or automatic Sandbox recovery. The retained
+close records currently have no compaction protocol.
 
 Automatic directory creation uses the fixed `layerfs-durable/<Sandbox-id>`
 layout. It creates the identity directory exclusively under retained parent

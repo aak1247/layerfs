@@ -35,3 +35,9 @@ including lost replies, injected intent/receipt sync failures, Dirty and the
 specific reversible kernel Busy response. It verifies that a new process
 refuses an unresolved or inconsistent record without replaying Unmount. Its
 daemon is simulated; it is not a FUSE or crash-recovery proof.
+
+`external_close_reply` is an ignored, read-only check of an explicitly supplied
+retained fixture (`LAYERFS_CLOSE_PROOF`). It decodes the original close intent
+and its pre-sync replacement and matches the Unmounted token. The caller must
+separately fence and identify the original process; this test never infers
+process exit or mounts from record contents.
