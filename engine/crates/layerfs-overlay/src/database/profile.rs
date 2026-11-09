@@ -85,7 +85,7 @@ pub(crate) fn initialize_with(
     c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     let (journal, synchronous) = match persistence {
         Persistence::Disposable => ("MEMORY", "OFF"),
-        Persistence::Durable => ("DELETE", "FULL"),
+        Persistence::Durable => ("DELETE", "EXTRA"),
     };
     crate::diagnostics::startup::batch(c, work, &format!(
         "PRAGMA page_size=4096; PRAGMA auto_vacuum=NONE; PRAGMA journal_mode={journal}; PRAGMA synchronous={synchronous};
@@ -137,7 +137,7 @@ pub(crate) fn initialize_with(
     }
     let (expected_journal, expected_sync) = match persistence {
         Persistence::Disposable => ("memory", 0),
-        Persistence::Durable => ("delete", 2),
+        Persistence::Durable => ("delete", 3),
     };
     if p.journal_mode != expected_journal
         || p.locking_mode != "exclusive"

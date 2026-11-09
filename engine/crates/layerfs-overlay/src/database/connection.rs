@@ -377,6 +377,20 @@ impl Overlay {
                 Ok(_) => {
                     self.transaction.set(Transaction::None);
                     self.open.borrow_mut().commit();
+                    if let Some(lease) = &self.durable {
+                        let synced = self
+                            .allocation
+                            .state()
+                            .and_then(|_| lease.sync_directory())
+                            .and_then(|_| self.allocation.state().map(|_| ()));
+                        if let Err(cause) = synced {
+                            self.quarantined.set(true);
+                            return Err(OverlayError::Uncertain {
+                                cause: Box::new(cause),
+                                completion: None,
+                            });
+                        }
+                    }
                     return Ok(value);
                 }
                 Err(cause) if cause.is_sqlite_full() || cause.capacity_io() => cause,

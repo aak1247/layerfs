@@ -58,7 +58,17 @@ Terminal unmount closes the database but retains its files. The current FUSE
 FSYNC and FSYNCDIR handlers still answer ENOSYS, so this is not an `fsync`
 durability claim.
 
-The durable profile is SQLite DELETE/FULL/EXCLUSIVE. Each changed Workspace
+The durable profile is SQLite DELETE/EXTRA/EXCLUSIVE. SQLite documents that
+[FULL alone is not necessarily durable in DELETE mode](https://sqlite.org/pragma.html#pragma_synchronous).
+In this pinned SQLite build, exclusive locking can reuse the journal rather
+than delete it; its first journal-directory sync may ignore an error. The fork
+therefore retains the checked directory handle and explicitly synchronizes it
+after each successful SQLite commit, before acknowledging that transaction.
+Failure or identity replacement quarantines the owner and reports an unknown
+result. This adds a directory sync to each durable writing transaction; its
+throughput and latency have not been qualified. Earlier fork revisions used FULL without this per-commit check;
+reopening selects EXTRA for future transactions and cannot restore a write
+already lost under the former profile. Each changed Workspace
 generation, base root, revision, dirty count and volatile-custody flag is
 written in the **same SQLite transaction** as the associated filesystem rows.
 The parent directory and the initialized database are synchronized before
@@ -89,15 +99,15 @@ internal routes, base-root mismatch, process loss after a service write and a
 panicked service call retaining its original connection. A Store binding test
 checks a moved Branch, identity/root refusals, an explicit merge and recovery
 of its installed snapshot against a live Store; it is not a mount crash proof.
-Test-only sync faults against the
-rollback journal verify that the engine reports an uncertain result and
+Test-only sync faults against the rollback journal and its directory verify
+that the engine reports an uncertain result and
 quarantines the connection, and that a fresh process sees the prior complete
 transaction or an unresolved capture with its matching prior snapshot. The VM
 harness can exercise the overlay with `--probe-kind
 overlay`; this proves only the database path on its guest filesystem, not FUSE
 `fsync`, Sandbox recovery, Kubernetes integration or physical host power loss.
 
-On 2026-11-09 the overlay VM probe passed on QEMU 6.2.0/KVM with a Linux
+On 2026-11-09 the earlier FULL-profile overlay VM probe passed on QEMU 6.2.0/KVM with a Linux
 5.15.0-202 guest and an ext4 raw disk (`cache=none`): the first guest reported
 an acknowledged 86,016-byte overlay and was killed, and the second guest
 reopened that disk and checked the written file bytes. The receipt and serial
@@ -110,7 +120,7 @@ the overlay durable implementation SHA-256 was
 and its connection-owner SHA-256 was
 `43474bdfda377ffef4125c47e27097dfd729ff0047b57aeaff7b8a1818d06cd3`.
 
-The later schema-40 probe on the same guest and disk profile installed a new
+The later FULL-profile schema-40 probe on the same guest and disk profile installed a new
 base and snapshot together, acknowledged an additional file write, killed the
 guest and recovered all three from the disk. Its receipt and serial logs are
 retained under
@@ -124,7 +134,7 @@ source respectively had SHA-256
 `4886c9da03046e9a6dd590955f8c5509e0a60035e482b7055d55674b4f574bbd`, and
 `cf9121d29e851672fc35416e97be97c0d76cf319d2cca95057063d926d2f859b`.
 
-A further probe killed the writer with the receipted generation retirement
+A further FULL-profile probe killed the writer with the receipted generation retirement
 still pending, then reopened the same disk, verified the new bytes and
 snapshot, completed bounded retirement and checked the bytes again. Its
 receipt is retained under
@@ -133,6 +143,16 @@ the probe SHA-256 was
 `d58c9ae5740e5cbce3ae827f5ebcb3d9765110d3076c95388c73e25a9f02420f`
 and `durable.rs` was
 `ac626d9823857db21b4e1622b6a4c7ef1dbddd1d436573903796c2c3bdaadea7`.
+
+The EXTRA-profile and checked-directory implementation was exercised by the
+same pending-retirement VM probe. Its receipt is retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-overlay-vm-20261109-extra-directory/`;
+the probe SHA-256 was
+`326cfef51a8298268ac887d60591082c7b33394b956630aa026ab8dbf0056ead`.
+At that run, `profile.rs`, `durable.rs`, and `connection.rs` respectively had
+SHA-256 `0e0775c1c06c4b1f1262c02d353e012a872f57096c1386c13ff3374f423f52b2`,
+`d91d8f0c0cfbbf5bad2192227e678d54cc37eb7c62ca1a11ef625f7f33ac9538`, and
+`120b9bb6b14cd28ab315595a7bbabf97a1248559157b485145eaadb5b4002cb0`.
 
 An isolated Docker test on 2026-11-09 used a manually assembled daemon
 Service, one durable owner and a disposable test Store. An unprivileged
@@ -144,4 +164,4 @@ and manual remount test, not container recreation, a durable global Store,
 physical power loss, Kubernetes or an `fsync` guarantee. The test runner,
 source and image hashes, kernel version, output and exit status are retained
 under
-`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-process-loss-20261109-final/`.
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-process-loss-extra-20261109/`.

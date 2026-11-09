@@ -453,7 +453,8 @@ fixtures, examples and tools do not contribute to production LOC.
   connection, page cache or memory budget. It is not an implemented distributed Store or a universal
   global-Store rule; reader-pool alternatives need their own proofs.
 - `Overlay::create_durable` and `recover_durable` implement a separate Linux
-  DELETE/FULL database boundary, including transactional lifecycle state and
+  DELETE/EXTRA database boundary, including a checked directory sync before
+  each successful transaction acknowledgement, transactional lifecycle state and
   an exclusive owner lease. Conservative reopen refuses unresolved capture,
   unsafe cleanup or volatile ownership. Ready shrink-cleanup rows and ready
   retirement of an installed generation with a matching durable receipt can

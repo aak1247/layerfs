@@ -53,7 +53,7 @@ impl Drop for Fixture {
 fn create(path: &Path) -> Overlay {
     let db = Overlay::create_durable(path, ProfileConfig::default(), IDENTITY).unwrap();
     assert_eq!(db.profile().journal_mode, "delete");
-    assert_eq!(db.profile().synchronous, 2);
+    assert_eq!(db.profile().synchronous, 3);
     db.open_workspace(ROOT).unwrap();
     db
 }
@@ -128,6 +128,7 @@ fn durable_overlay_fences_live_owner_and_checks_identity() {
     ));
     let reopened =
         Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    assert_eq!(reopened.profile().synchronous, 3);
     assert_recovered(&reopened);
     let source = reopened.acquire_base_source(3).unwrap();
     let mut file = PayloadFile::new(&reopened, source, 9, Vec::new());
@@ -684,6 +685,93 @@ fn failed_install_sync_retains_matching_root_and_binding() {
     );
     drop(connection);
     assert!(Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).is_err());
+}
+
+#[test]
+fn directory_sync_failure_never_acknowledges_the_write() {
+    const CHILD: &str = "LAYERFS_DURABLE_DIR_SYNC_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let directory = PathBuf::from(directory);
+        let db = create(&directory.join("overlay.sqlite"));
+        let source = db.acquire_base_source(1).unwrap();
+        let mut file = PayloadFile::new(&db, source, 9, Vec::new());
+        file.write(0, b"baseline");
+        fs::write(directory.join("inject-directory"), b"1").unwrap();
+        let next: Arc<[u8]> = Arc::from(b"new value".as_slice());
+        let result = db.apply(
+            source,
+            &Changes {
+                inodes: vec![file.inode(next.len() as u64)],
+                write: Some(PayloadWrite {
+                    serial: 9,
+                    offset: 0,
+                    data: next,
+                }),
+                ..Changes::default()
+            },
+        );
+        assert!(
+            matches!(result, Err(OverlayError::Uncertain { .. })),
+            "{result:?}"
+        );
+        assert!(matches!(
+            db.close_database(),
+            Err(OverlayError::Quarantined)
+        ));
+        assert!(Overlay::recover_durable(
+            &directory.join("overlay.sqlite"),
+            ProfileConfig::default(),
+            IDENTITY
+        )
+        .is_err());
+        std::process::exit(0);
+    }
+    let fixture = Fixture::new();
+    let shim = fixture.0.join("directory-sync-failure.so");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/durable_dir_sync_failure.c");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .args(["-ldl", "-o"])
+        .arg(&shim)
+        .status()
+        .unwrap()
+        .success());
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "directory_sync_failure_never_acknowledges_the_write",
+        ])
+        .env(CHILD, &fixture.0)
+        .env("LD_PRELOAD", &shim)
+        .env(
+            "LAYERFS_TEST_DIR_SYNC_TRIGGER",
+            fixture.0.join("inject-directory"),
+        )
+        .env(
+            "LAYERFS_TEST_DIR_SYNC_TARGET",
+            fs::canonicalize(&fixture.0).unwrap(),
+        )
+        .env(
+            "LAYERFS_TEST_DIR_SYNC_RECEIPT",
+            fixture.0.join("directory-sync-failed"),
+        )
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "directory-sync failure child: {status}");
+    assert!(!fs::read(fixture.0.join("directory-sync-failed"))
+        .unwrap()
+        .is_empty());
+    let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    let source = db.acquire_base_source(2).unwrap();
+    let bytes = db.source_read(source, 9, 0, 64).unwrap().unwrap().data;
+    assert!(
+        bytes == b"baseline" || bytes == b"new value",
+        "unknown outcome stays one whole transaction"
+    );
+    db.release_base_source(source).unwrap();
+    db.close_database().unwrap();
 }
 
 #[test]

@@ -19,6 +19,8 @@ pub(crate) struct Lease {
     #[cfg(target_os = "linux")]
     path: std::path::PathBuf,
     #[cfg(target_os = "linux")]
+    directory: Option<std::fs::File>,
+    #[cfg(target_os = "linux")]
     quarantine: Option<super::connection_owner::Quarantine>,
 }
 impl Lease {
@@ -35,6 +37,9 @@ impl Drop for Lease {
                 // Keep another owner out while an uncertain SQLite connection
                 // is retained, even if the caller drops the original error.
                 std::mem::forget(file);
+            }
+            if let Some(directory) = self.directory.take() {
+                std::mem::forget(directory);
             }
         }
     }
@@ -159,6 +164,21 @@ mod linux {
         Ok(())
     }
 
+    fn check_directory_handle(directory: &File, parent: &Path) -> OverlayResult<()> {
+        check_directory(parent)?;
+        let opened = directory.metadata()?;
+        let named = fs::symlink_metadata(parent)?;
+        if !opened.is_dir()
+            || opened.uid() != named.uid()
+            || opened.mode() & 0o077 != 0
+            || opened.dev() != named.dev()
+            || opened.ino() != named.ino()
+        {
+            return Err(OverlayError::Invalid("durable overlay directory identity"));
+        }
+        Ok(())
+    }
+
     fn owner_path(path: &Path) -> PathBuf {
         let mut name = path.as_os_str().to_owned();
         name.push(".owner");
@@ -186,6 +206,9 @@ mod linux {
 
     impl Lease {
         fn acquire(path: &Path, identity: &[u8; 32], create: bool) -> OverlayResult<Self> {
+            let parent = path.parent().ok_or(OverlayError::Invalid("owner parent"))?;
+            let directory = File::open(parent)?;
+            check_directory_handle(&directory, parent)?;
             let owner = owner_path(path);
             let mut options = OpenOptions::new();
             options
@@ -204,8 +227,8 @@ mod linux {
             if create {
                 file.write_all(identity)?;
                 file.sync_all()?;
-                File::open(path.parent().ok_or(OverlayError::Invalid("owner parent"))?)?
-                    .sync_all()?;
+                directory.sync_all()?;
+                check_directory_handle(&directory, parent)?;
             } else {
                 let mut stored = [0; 32];
                 file.read_exact(&mut stored)?;
@@ -216,17 +239,27 @@ mod linux {
             Ok(Self {
                 file: Some(file),
                 path: owner,
+                directory: Some(directory),
                 quarantine: None,
             })
         }
 
         pub(crate) fn verify(&self) -> OverlayResult<()> {
-            check_directory(
-                self.path
-                    .parent()
-                    .ok_or(OverlayError::Invalid("owner parent"))?,
-            )?;
+            let parent = self
+                .path
+                .parent()
+                .ok_or(OverlayError::Invalid("owner parent"))?;
+            check_directory_handle(self.directory.as_ref().expect("owned directory"), parent)?;
             check_file(self.file.as_ref().expect("owned lease"), &self.path)
+        }
+
+        pub(crate) fn sync_directory(&self) -> OverlayResult<()> {
+            self.verify()?;
+            self.directory
+                .as_ref()
+                .expect("owned directory")
+                .sync_all()?;
+            self.verify()
         }
     }
 
@@ -518,6 +551,13 @@ mod linux {
             },
             held,
         ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Lease {
+    pub(crate) fn sync_directory(&self) -> OverlayResult<()> {
+        Err(OverlayError::UnsupportedPlatform)
     }
 }
 
