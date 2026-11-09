@@ -91,6 +91,20 @@ already obtained. This callback does not itself persist a journal or resolve
 unknown Docker outcomes; its caller must do so. The Node binding has not yet
 connected these milestones to durable Sandbox creation.
 
+For a Sandbox record explicitly marked durable, the Node binding records a
+private mount intent before Bind, the original Branch snapshot before Attach,
+and the exact Ready receipt before reporting success. It synchronizes the
+Workspace record and the completed intent relative to the original held
+Sandbox directory. An incomplete or malformed intent blocks a new mount; an
+observer or publication failure retains its original result and directory in
+the running process. Reopening never replays the old request. Completed records
+are checked against the Sandbox, Workspace, Branch and receipt identities
+before another mount is admitted. This does not recover an old daemon or prove
+its physical consumers have exited. The native Node tests use an authenticated
+simulated daemon and a real local Store: they cover distinct successful mounts,
+lost Ready, failed intent sync, directory replacement and process reopen, but
+do not exercise a real FUSE mount through this SDK path.
+
 Automatic directory creation uses the fixed `layerfs-durable/<Sandbox-id>`
 layout. It creates the identity directory exclusively under retained parent
 descriptors and synchronizes the volume, parent and private children before

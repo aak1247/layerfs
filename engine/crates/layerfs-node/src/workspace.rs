@@ -87,11 +87,25 @@ pub(crate) fn mount(args: &SdkValue) -> Outcome {
     let id = WorkspaceId::from_authority(random()?).map_err(failed)?;
     // The Branch is found by name in this process; the daemon binds its id.
     let branch_id = crate::direct::branch_id(args, branch)?;
-    let mounted = {
+    let durable = state.durable_identity.is_some();
+    let mounted = if durable {
+        #[cfg(target_os = "linux")]
+        {
+            crate::mount_journal::mount(&state, id, branch_id, branch)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(crate::job::refused(
+                "Unsupported",
+                "durable Workspace mounts require Linux",
+            ));
+        }
+    } else {
         let mut control = crate::trace::control(&state.controls)?;
-        workspace(&mut control).mount(id, branch_id)
+        workspace(&mut control)
+            .mount(id, branch_id)
+            .map_err(failed)?
     };
-    let mounted = mounted.map_err(failed)?;
     let mut value = values::mounted(&mounted, branch);
     if let SdkValue::Map(fields) = &mut value {
         fields.push(("sandbox".to_owned(), SdkValue::text(state.id.as_str())));
@@ -99,14 +113,16 @@ pub(crate) fn mount(args: &SdkValue) -> Outcome {
         let image = state.runtime.request().image.as_str();
         fields.push(("image".to_owned(), SdkValue::text(image)));
     }
-    crate::discovery::save_workspace(&state, &mounted, branch)?;
-    lock(&state.mounts)?.insert(
-        mounted.ready.directory.clone(),
-        Mount {
-            workspace: mounted,
-            branch: branch.to_owned(),
-        },
-    );
+    if !durable {
+        crate::discovery::save_workspace(&state, &mounted, branch)?;
+        lock(&state.mounts)?.insert(
+            mounted.ready.directory.clone(),
+            Mount {
+                workspace: mounted,
+                branch: branch.to_owned(),
+            },
+        );
+    }
     Ok(value)
 }
 

@@ -223,7 +223,7 @@ pub(crate) fn save(path: &Path, value: SdkValue) -> Result<()> {
     save_with_sync(path, value, false)
 }
 
-fn save_with_sync(path: &Path, value: SdkValue, durable: bool) -> Result<()> {
+pub(crate) fn save_with_sync(path: &Path, value: SdkValue, durable: bool) -> Result<()> {
     let bytes = layerfs_bridge::control::Answer {
         id: 1,
         reply: Reply::Sdk(value),
@@ -275,6 +275,46 @@ fn save_with_sync(path: &Path, value: SdkValue, durable: bool) -> Result<()> {
             })?;
     }
     Ok(())
+}
+
+/// Writes one record relative to a directory already held by the caller.
+#[cfg(target_os = "linux")]
+pub(crate) fn pinned_write(
+    directory: &crate::durable_records::Directory,
+    name: &str,
+    value: SdkValue,
+    create: bool,
+) -> Result<()> {
+    let bytes = layerfs_bridge::control::Answer {
+        id: 1,
+        reply: Reply::Sdk(value),
+    }
+    .encode()
+    .map_err(failed)?;
+    let result = if create {
+        directory.create(std::ffi::OsStr::new(name), &bytes)
+    } else {
+        let temporary = format!(
+            "{name}.{}-{}",
+            std::process::id(),
+            layerfs_bridge::sdk_values::hex(&registry::random()?[..8])
+        );
+        directory.save(
+            std::ffi::OsStr::new(name),
+            std::ffi::OsStr::new(&temporary),
+            &bytes,
+        )
+    };
+    result.map_err(|failure| {
+        refused(
+            if failure.attempted {
+                "Unknown"
+            } else {
+                "Failed"
+            },
+            failure.to_string(),
+        )
+    })
 }
 /// A small private text file, written once (0600, not a symlink).
 pub(crate) fn save_text(path: &Path, text: &str) -> Result<()> {
@@ -663,18 +703,47 @@ pub(crate) fn save_workspace(
     mount: &MountedWorkspace,
     branch: &str,
 ) -> Result<()> {
-    save(
-        &workspace_file(state, mount.bound.token),
-        SdkValue::map([
-            ("path", SdkValue::text(&mount.ready.directory)),
-            ("branch", SdkValue::text(branch)),
-            (
-                "workspace",
-                SdkValue::Bytes(mount.bound.token.workspace.to_bytes().to_vec()),
-            ),
-            ("namespace", SdkValue::Int(mount.bound.token.namespace)),
-        ]),
+    save_workspace_at(
+        &state.directory,
+        state.durable_identity.is_some(),
+        mount,
+        branch,
     )
+}
+pub(crate) fn save_workspace_at(
+    directory: &Path,
+    durable: bool,
+    mount: &MountedWorkspace,
+    branch: &str,
+) -> Result<()> {
+    let file = directory.join(format!(
+        "workspace-{}.record",
+        layerfs_bridge::sdk_values::hex(&mount.bound.token.workspace.to_bytes())
+    ));
+    save_with_sync(&file, workspace_value(mount, branch), durable)
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn save_workspace_pinned(
+    directory: &crate::durable_records::Directory,
+    mount: &MountedWorkspace,
+    branch: &str,
+) -> Result<()> {
+    let name = format!(
+        "workspace-{}.record",
+        layerfs_bridge::sdk_values::hex(&mount.bound.token.workspace.to_bytes())
+    );
+    pinned_write(directory, &name, workspace_value(mount, branch), false)
+}
+fn workspace_value(mount: &MountedWorkspace, branch: &str) -> SdkValue {
+    SdkValue::map([
+        ("path", SdkValue::text(&mount.ready.directory)),
+        ("branch", SdkValue::text(branch)),
+        (
+            "workspace",
+            SdkValue::Bytes(mount.bound.token.workspace.to_bytes().to_vec()),
+        ),
+        ("namespace", SdkValue::Int(mount.bound.token.namespace)),
+    ])
 }
 pub(crate) fn save_process(state: &SandboxState, id: &str, p: &Process) -> Result<()> {
     save(

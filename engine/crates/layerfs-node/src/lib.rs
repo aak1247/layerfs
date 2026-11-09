@@ -7,6 +7,8 @@ mod dispatch;
 mod durable_records;
 mod exec;
 mod job;
+#[cfg(target_os = "linux")]
+mod mount_journal;
 mod output;
 mod pool;
 mod project;
