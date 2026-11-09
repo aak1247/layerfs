@@ -136,6 +136,18 @@ closed. Output and hashes are under
 They share one Branch and were not used for a sustained workload; this is not
 evidence of throughput, recovery at that scale, SDK capacity or Kubernetes.
 
+A separate fresh SDK capacity fixture then used the real Docker/FUSE path with
+capacity 32. It mounted 32 durable Workspaces from one Branch, received
+`Capacity` on the 33rd, and acknowledged all 32 normal discarding closes. A
+new Node process without a Docker socket validated 32 close records and found
+no Workspace records before reporting the absent socket. The host's FUSE
+connections returned to their pre-test baseline. Output, source/binary hashes,
+the exact retained Sandbox and volume, and cleanup ownership are recorded in
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-capacity-20261110-i71_ptdg/receipt.txt`.
+This was an independent fixture; the earlier unknown Docker Create was not
+retried. It does not prove sustained throughput, crash during close, automatic
+recovery or Kubernetes behavior.
+
 For a Sandbox record explicitly marked durable, the Node binding records a
 private mount intent before Bind, the original Branch snapshot before Attach,
 and the exact Ready receipt before reporting success. It synchronizes the
