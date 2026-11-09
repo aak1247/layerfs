@@ -121,6 +121,14 @@ refusal of a mismatched Ready path, token or device and of a stacked host
 mount; it then restored the original mount and closed normally. Its receipt is
 `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sandbox-workspace-identity-20261110-IgKEvEeO/receipt.txt`.
 
+The same topology was also run with a Durable Store and fresh durable
+Workspace on an ext4-backed Docker volume. The host wrote a file, received
+file and directory sync acknowledgements, observed the mount-identity refusal,
+and normally closed the Workspace and Sandbox. Its receipt is
+`~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-host-export-20261110-jK1K0OTj/receipt.txt`.
+The export root for that run was on tmpfs. The test does not simulate a crash
+or verify automatic Workspace recovery.
+
 This low-level adapter does not yet provide a complete durable lifecycle
 journal and recovery for exported Sandboxes or automatic host guard checks
 around every Workspace operation. A caller must supply and retain those

@@ -9,7 +9,7 @@ use layerfs_api::{
 };
 use layerfs_bridge::{
     control::{ControlCode, DaemonPhase, MountPhase, Reply, Request},
-    daemon_setup::{DaemonLimits, DaemonSetup},
+    daemon_setup::{DaemonLimits, DaemonSetup, FreshWorkspaceSetup},
     duplex as transport,
 };
 use layerfs_history::{BranchId, HistoryCatalogConfig, HistoryName, LayerStackId, WorkspaceId};
@@ -20,6 +20,7 @@ use layerfs_telemetry::timer::Timing;
 use std::{
     error::Error,
     fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -212,10 +213,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir(&directory)?;
     source(&directory.join("source"))?;
     let branch = BranchId::from_authority([62; 16]);
+    let durable = std::env::var_os("LAYERFS_EXAMPLE_DURABLE").is_some();
+    let profile = if durable {
+        SqlitePersistenceProfile::Durable
+    } else {
+        SqlitePersistenceProfile::Disposable
+    };
     let request = InitRequest {
         source: directory.join("source"),
         store: PersistenceConfig::sqlite(directory.join("sealed.sqlite"))
-            .with_sqlite_profile(SqlitePersistenceProfile::Disposable),
+            .with_sqlite_profile(profile),
         locator: "/layerfs-store/global/store.sqlite".into(),
         policy: StoragePolicy::frozen_default(),
         catalog: HistoryCatalogConfig {
@@ -236,6 +243,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let keys = transport::generate_keypair()?;
     let daemon = transport::generate_keypair()?;
     let mut daemon_setup = setup(daemon.private, keys.public);
+    if durable {
+        let base = format!("/layerfs-store/layerfs-durable/{}", "4d".repeat(32));
+        daemon_setup.fresh_workspace = Some(FreshWorkspaceSetup {
+            sandbox: [77; 32],
+            catalog_directory: format!("{base}/catalog"),
+            overlay_directory: format!("{base}/overlays"),
+            create_directories: true,
+        });
+    }
     let identity = command_identity();
     daemon_setup.command_uid = identity.uid;
     daemon_setup.command_gid = identity.gid;
@@ -288,7 +304,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         DaemonPhase::ControlReady
     );
     println!(
-        "DIRECT_STORE host_sqlite={} daemon_sqlite={:?} profile=Disposable volume={}",
+        "DIRECT_STORE host_sqlite={} daemon_sqlite={:?} profile={profile:?} volume={}",
         installed.manifest.host_sqlite, installed.manifest.daemon_sqlite, args[3]
     );
 
@@ -332,6 +348,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         host.verify()?;
         check_host_mount_change(&host)?;
         assert_eq!(fs::read(host.path().join("ignored.bin"))?, FILES[2].1);
+        if durable {
+            let file_path = host.path().join("durable-host-proof");
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file_path)?;
+            file.write_all(b"host durable acknowledgement")?;
+            file.sync_all()?;
+            fs::File::open(host.path())?.sync_all()?;
+            assert_eq!(fs::read(&file_path)?, b"host durable acknowledgement");
+            drop(file);
+            fs::remove_file(file_path)?;
+            fs::File::open(host.path())?.sync_all()?;
+            println!("HOST_DURABLE_SYNC file_and_directory_acknowledged=true");
+        }
         host.verify()?;
         println!("HOST_EXPORT_READ verified=true host_mount_id={} device_matches=true wrong_device_refused=true", host.mount_id());
     }
@@ -508,7 +539,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     mark("container_deleted");
     println!("OWNED_CLEANUP container={container} disposition=Deleted_acknowledged_by_close");
     println!(
-        "KERNEL_FULL_TOPOLOGY host_init=true named_volume={} root={:?} kernel_fuse=READ_WRITE mutation=RUN commit=NOT_RUN force_unmount=NOT_RUN durable=NOT_RUN",
+        "KERNEL_FULL_TOPOLOGY host_init=true named_volume={} root={:?} kernel_fuse=READ_WRITE mutation=RUN commit=NOT_RUN force_unmount=NOT_RUN durable_recovery=NOT_RUN",
         args[3], project.initialized.root
     );
     fs::remove_dir_all(directory)?;
