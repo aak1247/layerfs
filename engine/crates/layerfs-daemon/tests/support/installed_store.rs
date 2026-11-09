@@ -10,6 +10,7 @@ use layerfs_project::{init, InitRequest};
 use layerfs_storage::{Storage, StoragePolicy};
 use layerfs_telemetry::timer::Timing;
 use std::{
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -101,11 +102,25 @@ impl Fixture {
             .unwrap();
         drop(storage);
         let sealed = handles.seal().unwrap();
-        let installed = directory.join("store.sqlite");
+        let installed = if profile == SqlitePersistenceProfile::Durable {
+            let private = directory.join("store-private");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&private)
+                .unwrap();
+            private.join("store.sqlite")
+        } else {
+            directory.join("store.sqlite")
+        };
         std::fs::copy(sealed.path, &installed).unwrap();
         if profile == SqlitePersistenceProfile::Durable {
             // This test install is complete before any consumer opens it.
+            std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o600)).unwrap();
             std::fs::File::open(&installed).unwrap().sync_all().unwrap();
+            std::fs::File::open(installed.parent().unwrap())
+                .unwrap()
+                .sync_all()
+                .unwrap();
             std::fs::File::open(&directory).unwrap().sync_all().unwrap();
         }
         // No source or sealed original remains available to the consumer.

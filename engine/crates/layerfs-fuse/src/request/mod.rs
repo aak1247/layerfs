@@ -7,6 +7,7 @@ mod inline;
 mod mutate;
 mod reply;
 mod state;
+mod synchronize;
 mod terminal;
 
 pub(crate) use crate::phase::charge;

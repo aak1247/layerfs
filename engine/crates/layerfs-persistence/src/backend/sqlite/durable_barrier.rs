@@ -3,6 +3,21 @@ use super::connection::Session;
 use crate::backend::records::BackendError;
 
 impl Session {
+    pub(crate) fn supports_durable_barrier(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.writable
+                && self.profile.persistence == crate::SqlitePersistenceProfile::Durable
+                && self
+                    .durable_directory
+                    .as_ref()
+                    .is_some_and(|directory| directory.verify_private().is_ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
     /// Check the original durable Store under its cooperative writer owner.
     /// Durable provisioning must already have synchronized its initial file;
     /// later WAL/FULL writes synchronize each transaction before their reply.
@@ -50,7 +65,15 @@ impl Session {
                 self.finish_writer(&mut state)?;
                 return Err(BackendError::Cancelled);
             }
-            if let Err(cause) = self.sync_durable_directory() {
+            let directory = self
+                .durable_directory
+                .as_ref()
+                .expect("durable writer directory");
+            let result = directory
+                .verify_private()
+                .and_then(|_| directory.sync())
+                .and_then(|_| directory.verify_private());
+            if let Err(cause) = result {
                 state.sync_failure = Some(cause);
                 self.quarantine(&mut state);
                 self.finish_writer(&mut state)?;

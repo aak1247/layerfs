@@ -152,7 +152,19 @@ pub enum SyncCapability {
     Disposable,
     /// A durable mount must not acknowledge sync until the full contract exists.
     DurableUnavailable,
+    /// Both Workspace and Store have checked durable backing.
+    DurableReady,
 }
+/// The Workspace has a known state that cannot currently be recovered. No
+/// overlay synchronization was attempted.
+#[derive(Clone, Copy, Debug)]
+pub struct SyncUnavailable;
+impl fmt::Display for SyncUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("durable Workspace is not ready to synchronize")
+    }
+}
+impl Error for SyncUnavailable {}
 pub trait MountServices: Send + Sync {
     fn request(&self, fence: &Fence) -> Result<Arc<dyn RequestServices>, ServiceError>;
     /// Unknown implementations fail closed rather than claiming durability.
@@ -170,6 +182,17 @@ pub trait MountServices: Send + Sync {
 /// result. The disposal calls are never refused by the fence:
 /// `reply_attempted`, `close_file`, `close_directory` and `forget`.
 pub trait RequestServices: Send + Sync {
+    /// Fence and synchronize one open file or directory. Unknown adapters
+    /// refuse instead of acknowledging a durability guarantee.
+    fn synchronize(
+        &self,
+        _mount: KernelMount,
+        _serial: u64,
+        _handle: u64,
+        _directory: bool,
+    ) -> ServiceFuture<'_, ServiceReply<()>> {
+        Box::pin(async { Err(Box::new(SyncUnavailable) as ServiceError) })
+    }
     /// READDIR's reading visit as one read-only owner job on the open
     /// directory `handle`: the position of the kernel `offset`, one window
     /// of current names (after `after` when it continues an earlier window

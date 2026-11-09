@@ -4,7 +4,7 @@
 mod payload_support;
 
 use layerfs_overlay::{
-    Changes, MaintenanceCursor, Overlay, OverlayError, PayloadWrite, ProfileConfig,
+    Changes, MaintenanceCursor, Overlay, OverlayError, PayloadWrite, ProfileConfig, StatementKind,
 };
 use payload_support::{claims, committed, noise, part, File as PayloadFile};
 use std::{
@@ -245,6 +245,34 @@ fn durable_binding_never_follows_an_unrecorded_install() {
         .unwrap();
     assert_eq!(db.durable_binding().unwrap().unwrap(), b"resolved snapshot");
     db.require_recorded_recovery_ready().unwrap();
+    db.close_database().unwrap();
+}
+
+#[test]
+fn recovery_readiness_does_not_scan_a_large_safe_cleanup_queue() {
+    let fixture = Fixture::new();
+    let db = create(&fixture.path());
+    db.initialize_durable_binding(ROOT, b"original snapshot")
+        .unwrap();
+    db.close_database().unwrap();
+    let mut connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for resource in 1..=10_000 {
+        transaction
+            .execute(
+                "INSERT INTO cleanup_task(kind,resource,target,ready) VALUES(4,?1,1,1)",
+                [resource],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+    let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    let before = db.diagnostics().statements[StatementKind::Frontier as usize];
+    db.require_recorded_recovery_ready().unwrap();
+    let after = db.diagnostics().statements[StatementKind::Frontier as usize];
+    assert!(after.fullscan_steps - before.fullscan_steps < 64);
+    assert!(after.vm_steps - before.vm_steps < 1000);
     db.close_database().unwrap();
 }
 

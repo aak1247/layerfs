@@ -8,6 +8,7 @@ use layerfs_persistence::{DurableBarrierError, Handles, PersistenceConfig, Stora
 use layerfs_storage::{location::PackInfo, port::*, Storage, StoragePolicy};
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::Command,
     sync::{
@@ -82,6 +83,7 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
             &authority(),
         )
         .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         handles.storage.reserve(reserve()).unwrap();
         if mode == "seal-replace-dir" {
             let moved = directory.with_extension("moved");
@@ -126,7 +128,10 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
         } else {
             None
         };
-        let (retained_path, lock_directory) = if mode == "replace" {
+        let (retained_path, lock_directory) = if mode == "privacy" {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            (path, directory.to_owned())
+        } else if mode == "replace" {
             let retained = directory.join("retained.sqlite");
             fs::rename(&path, &retained).unwrap();
             (retained, directory.to_owned())
@@ -147,7 +152,7 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
                 Err(DurableBarrierError::Failed(PersistenceError::Uncertain))
             ));
             Err(PersistenceError::Uncertain)
-        } else if mode == "barrier" {
+        } else if mode == "barrier" || mode == "privacy" {
             handles.storage.durable_barrier()
         } else {
             handles.storage.reserve(reserve()).map(|_| ())
@@ -185,6 +190,7 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
         "lane",
         "barrier",
         "barrier-stop",
+        "privacy",
         "seal",
         "replace",
         "replace-dir",
@@ -193,6 +199,7 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
     ] {
         let directory = temp.join(mode);
         fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -225,7 +232,13 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
             assert!(!directory.join("store.sqlite").exists());
             continue;
         }
-        if mode != "panic" {
+        if mode == "privacy" {
+            fs::set_permissions(
+                directory.join("store.sqlite"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        } else if mode != "panic" {
             assert!(!fs::read(directory.join("failed")).unwrap().is_empty());
         }
         let reopened = Handles::open_writable(
@@ -263,12 +276,14 @@ fn cancel_waiting_barrier(provider: Arc<StorageProvider>) {
 fn barrier_cancels_before_attempt_while_waiting_for_directory_owner() {
     use nix::fcntl::{Flock, FlockArg};
     let temp = support::Temp::new("store-barrier-owner-stop");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let handles = Handles::create(
         PersistenceConfig::sqlite(temp.join("store.sqlite")),
         StoragePolicy::frozen_default(),
         &authority(),
     )
     .unwrap();
+    fs::set_permissions(temp.join("store.sqlite"), fs::Permissions::from_mode(0o600)).unwrap();
     let held = Flock::lock(
         fs::File::open(temp.path()).unwrap(),
         FlockArg::LockExclusiveNonblock,
@@ -283,12 +298,14 @@ fn barrier_cancels_before_attempt_while_waiting_for_directory_owner() {
 #[test]
 fn barrier_cancels_before_attempt_while_queued_for_a_publication_lane() {
     let temp = support::Temp::new("store-barrier-lane-stop");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let handles = Handles::create(
         PersistenceConfig::sqlite(temp.join("store.sqlite")),
         StoragePolicy::frozen_default(),
         &authority(),
     )
     .unwrap();
+    fs::set_permissions(temp.join("store.sqlite"), fs::Permissions::from_mode(0o600)).unwrap();
     std::thread::scope(|scope| {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -311,6 +328,7 @@ fn barrier_cancels_before_attempt_while_queued_for_a_publication_lane() {
 #[test]
 fn only_writable_durable_store_can_establish_a_barrier() {
     let temp = support::Temp::new("store-barrier-profile");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let durable = PersistenceConfig::sqlite(temp.join("durable.sqlite"));
     let handles = Handles::create(
         durable.clone(),
@@ -318,6 +336,9 @@ fn only_writable_durable_store_can_establish_a_barrier() {
         &authority(),
     )
     .unwrap();
+    assert!(!handles.storage.supports_durable_barrier());
+    fs::set_permissions(&durable.path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(handles.storage.supports_durable_barrier());
     handles.storage.durable_barrier().unwrap();
     let reader =
         Handles::open_read_only(durable, &authority().binding_key, authority().cursor_key).unwrap();

@@ -280,19 +280,39 @@ impl Filesystem for KernelFilesystem {
         let _timed = self.accounting.timed(Opcode::Flush);
         self.refuse(Opcode::Flush, reply, ReplyEmpty::error, unsynchronized());
     }
-    fn fsync(&self, _: &Request, _: INodeNo, _: FileHandle, _: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        req: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        data_only: bool,
+        reply: ReplyEmpty,
+    ) {
         let _timed = self.accounting.timed(Opcode::Fsync);
         let errno = match self.services.sync_capability() {
             crate::ports::SyncCapability::Disposable => unsynchronized(),
             crate::ports::SyncCapability::DurableUnavailable => Errno::EOPNOTSUPP,
+            crate::ports::SyncCapability::DurableReady => {
+                return self.synchronize(req, inode, handle, false, data_only, reply);
+            }
         };
         self.refuse(Opcode::Fsync, reply, ReplyEmpty::error, errno);
     }
-    fn fsyncdir(&self, _: &Request, _: INodeNo, _: FileHandle, _: bool, reply: ReplyEmpty) {
+    fn fsyncdir(
+        &self,
+        req: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        data_only: bool,
+        reply: ReplyEmpty,
+    ) {
         let _timed = self.accounting.timed(Opcode::Fsyncdir);
         let errno = match self.services.sync_capability() {
             crate::ports::SyncCapability::Disposable => unsynchronized(),
             crate::ports::SyncCapability::DurableUnavailable => Errno::EOPNOTSUPP,
+            crate::ports::SyncCapability::DurableReady => {
+                return self.synchronize(req, inode, handle, true, data_only, reply);
+            }
         };
         self.refuse(Opcode::Fsyncdir, reply, ReplyEmpty::error, errno);
     }

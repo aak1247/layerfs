@@ -9,7 +9,7 @@ use layerfs_daemon::{
     bootstrap::open_store,
     control::{KernelConfig, KernelServing, Service},
     store::BindRequest,
-    Owner,
+    Owner, ServiceClass,
 };
 use layerfs_history::WorkspaceId;
 use layerfs_overlay::ProfileConfig;
@@ -166,6 +166,58 @@ fn concrete_durable_store_exposes_its_checked_barrier_to_a_bound_owner() {
     fixture.cleanup();
 }
 
+#[test]
+fn nonprivate_durable_store_cannot_enable_mount_synchronization() {
+    let fixture = support::Fixture::new_durable(1, "nonprivate-store-barrier");
+    fs::set_permissions(
+        fixture.config.path.parent().unwrap(),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let snapshot = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let owner = Owner::create_durable(spec(
+        &directory.join("overlay.sqlite"),
+        47,
+        1,
+        snapshot.effective_root.to_bytes(),
+    ))
+    .unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: WorkspaceId::from_authority([47; 32]).unwrap(),
+                branch: fixture.branch,
+            },
+            snapshot,
+        )
+        .unwrap()
+        .workspace;
+    assert!(!workspace.has_durable_store());
+    assert!(workspace.operation().unwrap().durable_barrier().is_err());
+    workspace.close().unwrap();
+    drop(workspace);
+    owner.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
 /// The container owns this test mount; always tear it down if an assertion fails.
 struct MountGuard(Option<PathBuf>);
 impl Drop for MountGuard {
@@ -211,6 +263,31 @@ fn assert_durable_sync_unavailable(file: &Path, directory: &Path) {
         directory.sync_all().unwrap_err().raw_os_error(),
         Some(nix::libc::EOPNOTSUPP)
     );
+}
+
+#[test]
+fn durable_sync_unprivileged_probe() {
+    let Some(directory) = std::env::var_os("LAYERFS_DURABLE_SYNC_PROBE") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let file = fs::File::open(directory.join("file-000000")).unwrap();
+    file.sync_all().unwrap();
+    file.sync_data().unwrap();
+    fs::File::open(directory).unwrap().sync_all().unwrap();
+}
+
+fn assert_durable_sync_ready(file: &Path, directory: &Path) {
+    fs::File::open(file).unwrap().sync_all().unwrap();
+    fs::File::open(directory).unwrap().sync_all().unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "durable_sync_unprivileged_probe"])
+        .env("LAYERFS_DURABLE_SYNC_PROBE", directory)
+        .uid(65534)
+        .gid(65534)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]
@@ -276,13 +353,45 @@ fn disposable_mount_keeps_existing_sync_behavior() {
 #[test]
 #[ignore = "requires a dedicated Linux container with CAP_SYS_ADMIN and /dev/fuse"]
 fn real_fuse_write_survives_daemon_process_loss() {
+    fuse_write_survives_daemon_process_loss(false, None);
+}
+
+#[test]
+#[ignore = "requires a dedicated Linux container with CAP_SYS_ADMIN and /dev/fuse"]
+fn real_fuse_durable_sync_survives_daemon_process_loss() {
+    fuse_write_survives_daemon_process_loss(true, None);
+}
+
+#[test]
+#[ignore = "requires a dedicated FUSE container and LAYERFS_TEST_SYNC_SHIM"]
+fn real_fuse_sync_error_retains_original_workspace() {
+    fuse_write_survives_daemon_process_loss(true, Some("overlay"));
+}
+
+#[test]
+#[ignore = "requires a dedicated FUSE container and LAYERFS_TEST_SYNC_SHIM"]
+fn real_fuse_store_sync_error_retains_original_workspace() {
+    fuse_write_survives_daemon_process_loss(true, Some("store"));
+}
+
+fn fuse_write_survives_daemon_process_loss(durable_store: bool, inject_fault: Option<&str>) {
     const CHILD: &str = "LAYERFS_DURABLE_MOUNT_CHILD";
     const BYTES: &str = "workspace bytes after process loss\n";
     let identity = WorkspaceId::from_authority([42; 32]).unwrap();
     if let Some(directory) = std::env::var_os(CHILD) {
         let directory = PathBuf::from(directory);
-        let config = layerfs_persistence::PersistenceConfig::sqlite(directory.join("store.sqlite"))
-            .with_sqlite_profile(layerfs_persistence::SqlitePersistenceProfile::Disposable)
+        let profile = if durable_store {
+            layerfs_persistence::SqlitePersistenceProfile::Durable
+        } else {
+            layerfs_persistence::SqlitePersistenceProfile::Disposable
+        };
+        let store_path = if durable_store {
+            directory.join("store-private/store.sqlite")
+        } else {
+            directory.join("store.sqlite")
+        };
+        let config = layerfs_persistence::PersistenceConfig::sqlite(store_path)
+            .with_sqlite_profile(profile)
             .with_sqlite_acquisition(layerfs_persistence::SqliteAcquisitionSchema::Tables);
         let store = open_store(
             config,
@@ -332,29 +441,99 @@ fn real_fuse_write_survives_daemon_process_loss() {
             .status()
             .unwrap();
         assert!(status.success());
-        assert_durable_sync_unavailable(&file, Path::new(&ready.directory));
+        if inject_fault.is_some() {
+            let opened = fs::File::open(&file).unwrap();
+            fs::write(directory.join("inject"), b"1").unwrap();
+            assert_eq!(
+                opened.sync_all().unwrap_err().raw_os_error(),
+                Some(nix::libc::EIO)
+            );
+            assert!(!fs::read(directory.join("sync-failed")).unwrap().is_empty());
+            drop(opened);
+        } else if durable_store {
+            assert_durable_sync_ready(&file, Path::new(&ready.directory));
+            let client = owner.client();
+            let route = client.bound_route().unwrap();
+            // No Store publication is attempted by this test capture. A
+            // transient unresolved capture must refuse sync without freezing
+            // the mount, and the definite local resolution makes it ready.
+            let capture = client
+                .call(route, ServiceClass::General, None, |db| db.capture())
+                .unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    fs::File::open(&file)
+                        .unwrap()
+                        .sync_all()
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(nix::libc::EAGAIN)
+                );
+            }
+            client
+                .call(route, ServiceClass::General, None, move |db| {
+                    db.resolve_failed_capture(capture)
+                })
+                .unwrap();
+            assert_durable_sync_ready(&file, Path::new(&ready.directory));
+        } else {
+            assert_durable_sync_unavailable(&file, Path::new(&ready.directory));
+        }
         fs::write(directory.join("ack"), &ready.directory).unwrap();
         std::thread::sleep(Duration::from_secs(60));
         panic!("parent did not fence the old daemon");
     }
 
-    let fixture = support::Fixture::new(1, "durable-fuse-loss");
+    let fixture = if inject_fault == Some("store") {
+        support::Fixture::new_durable(1, "durable-fuse-store-sync-fault")
+    } else if inject_fault.is_some() {
+        support::Fixture::new_durable(1, "durable-fuse-sync-fault")
+    } else if durable_store {
+        support::Fixture::new_durable(1, "durable-fuse-sync-loss")
+    } else {
+        support::Fixture::new(1, "durable-fuse-loss")
+    };
     assert_eq!(fixture.count, 1);
     let directory = &fixture.directory;
     fs::create_dir(directory.join("durable")).unwrap();
     fs::set_permissions(directory.join("durable"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(directory.join("mounts")).unwrap();
     fs::set_permissions(directory.join("mounts"), fs::Permissions::from_mode(0o755)).unwrap();
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "real_fuse_write_survives_daemon_process_loss",
-            "--ignored",
-        ])
+    let child_test = if inject_fault == Some("store") {
+        "real_fuse_store_sync_error_retains_original_workspace"
+    } else if inject_fault.is_some() {
+        "real_fuse_sync_error_retains_original_workspace"
+    } else if durable_store {
+        "real_fuse_durable_sync_survives_daemon_process_loss"
+    } else {
+        "real_fuse_write_survives_daemon_process_loss"
+    };
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", child_test, "--ignored"])
         .env(CHILD, directory)
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stdout(Stdio::null());
+    if let Some(fault) = inject_fault {
+        let shim = std::env::var_os("LAYERFS_TEST_SYNC_SHIM")
+            .expect("the isolated FUSE test needs its test-only sync shim");
+        command
+            .env("LD_PRELOAD", shim)
+            .env("LAYERFS_TEST_DIR_SYNC_TRIGGER", directory.join("inject"))
+            .env(
+                "LAYERFS_TEST_DIR_SYNC_TARGET",
+                fs::canonicalize(directory.join(if fault == "store" {
+                    "store-private"
+                } else {
+                    "durable"
+                }))
+                .unwrap(),
+            )
+            .env(
+                "LAYERFS_TEST_DIR_SYNC_RECEIPT",
+                directory.join("sync-failed"),
+            );
+    }
+    let child = command.spawn().unwrap();
     let mut child = ChildGuard(child);
     let deadline = Instant::now() + Duration::from_secs(15);
     while !directory.join("ack").exists() {
@@ -424,7 +603,11 @@ fn real_fuse_write_survives_daemon_process_loss() {
     let mut recovered_mount = MountGuard(Some(PathBuf::from(&ready.directory)));
     let recovered_file = Path::new(&ready.directory).join("file-000000");
     assert_eq!(fs::read_to_string(&recovered_file).unwrap(), BYTES);
-    assert_durable_sync_unavailable(&recovered_file, Path::new(&ready.directory));
+    if durable_store {
+        assert_durable_sync_ready(&recovered_file, Path::new(&ready.directory));
+    } else {
+        assert_durable_sync_unavailable(&recovered_file, Path::new(&ready.directory));
+    }
     let reader = Command::new("/bin/cat")
         .arg(&recovered_file)
         .uid(65534)

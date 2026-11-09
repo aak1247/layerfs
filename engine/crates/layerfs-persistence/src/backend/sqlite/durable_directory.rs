@@ -67,4 +67,23 @@ impl DurableDirectory {
         self.directory.sync_all()?;
         self.verify()
     }
+
+    pub(super) fn verify_private(&self) -> io::Result<()> {
+        self.verify()?;
+        let owner = fs::metadata("/proc/self")?.uid();
+        let directory = fs::symlink_metadata(&self.parent)?;
+        let database = fs::symlink_metadata(&self.database)?;
+        if !directory.is_dir()
+            || directory.uid() != owner
+            || directory.mode() & 0o077 != 0
+            || database.uid() != owner
+            || database.mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "durable Store directory or database is not private",
+            ));
+        }
+        Ok(())
+    }
 }

@@ -5,7 +5,7 @@ use crate::{
 };
 use layerfs_fuse::ports::{
     BaseDemandFailed, Fence, Fenced, MountServices, RequestServices, ServiceError, ServiceFuture,
-    ServiceReply, SyncCapability,
+    ServiceReply, SyncCapability, SyncUnavailable,
 };
 use layerfs_history::HistoryError;
 use layerfs_overlay::{KernelCookieOffer, KernelMount, Publication};
@@ -36,11 +36,20 @@ impl MountServices for Mounted {
     }
     fn sync_capability(&self) -> SyncCapability {
         if self.0.has_durable_overlay() {
-            SyncCapability::DurableUnavailable
+            if self.0.has_durable_store() {
+                SyncCapability::DurableReady
+            } else {
+                SyncCapability::DurableUnavailable
+            }
         } else {
             SyncCapability::Disposable
         }
     }
+}
+enum SyncStep {
+    Complete,
+    Stopped,
+    Unavailable,
 }
 /// One kernel request's services over `workspace`, under `fence`.
 pub fn request(
@@ -106,6 +115,61 @@ impl FilesystemPort {
     }
 }
 impl RequestServices for FilesystemPort {
+    fn synchronize(
+        &self,
+        mount: KernelMount,
+        serial: u64,
+        handle: u64,
+        directory: bool,
+    ) -> ServiceFuture<'_, ServiceReply<()>> {
+        Box::pin(async move {
+            self.fenced(true)?;
+            let fence = self.1.clone();
+            match self.0.durable_barrier_cancellable(&|| fence.stopped()) {
+                Ok(()) => {}
+                Err(layerfs_persistence::DurableBarrierError::Cancelled) if fence.stopped() => {
+                    return Err(Box::new(Fenced) as ServiceError);
+                }
+                Err(error) => return Err(Box::new(error) as ServiceError),
+            }
+            self.fenced(true)?;
+            let client = self.0.overlay().clone();
+            let route = self.0.workspace().route();
+            let waiting = fence.clone();
+            let action_fence = fence.clone();
+            let result =
+                client.call_cancellable(route, Arc::new(move || waiting.stopped()), move |db| {
+                    if action_fence.stopped() {
+                        return Ok(SyncStep::Stopped);
+                    }
+                    match db.require_recorded_recovery_ready() {
+                        Ok(()) => {}
+                        Err(layerfs_overlay::OverlayError::Invalid(
+                            "durable binding profile"
+                            | "durable binding is absent"
+                            | "durable binding requires reconciliation"
+                            | "durable overlay requires reconciliation",
+                        )) => {
+                            return Ok(SyncStep::Unavailable);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    db.synchronize_kernel(mount, serial, handle, directory)?;
+                    Ok(SyncStep::Complete)
+                });
+            match result {
+                Ok(SyncStep::Complete) => Ok(ServiceReply::new((), client)),
+                Ok(SyncStep::Stopped) => Err(Box::new(Fenced) as ServiceError),
+                Ok(SyncStep::Unavailable) => Err(Box::new(SyncUnavailable) as ServiceError),
+                Err(OwnerError::Unattempted { cause, .. })
+                    if matches!(*cause, OwnerError::Cancelled) && fence.stopped() =>
+                {
+                    Err(Box::new(Fenced) as ServiceError)
+                }
+                Err(error) => Err(Box::new(error) as ServiceError),
+            }
+        })
+    }
     fn directory_visit(
         &self,
         mount: KernelMount,

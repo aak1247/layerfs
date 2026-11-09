@@ -26,6 +26,12 @@ pub enum KernelInput {
         handle: u64,
         directory: bool,
     },
+    Synchronize {
+        inode: u64,
+        handle: u64,
+        directory: bool,
+        data_only: bool,
+    },
     Forget {
         inode: u64,
         count: u64,

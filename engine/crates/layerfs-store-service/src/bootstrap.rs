@@ -128,9 +128,9 @@ pub fn open_store_observed(
     reservations.validate()?;
     let writer = Handles::open_writable(config.clone(), binding, cursor_key)?;
     let sqlite_version = writer.profile().sqlite_version.clone();
-    let durable_writer = (cfg!(target_os = "linux")
-        && writer.profile().persistence == layerfs_persistence::SqlitePersistenceProfile::Durable)
-        .then(|| writer.storage.clone());
+    let durable_writer = (writer.storage.supports_durable_barrier()
+        && crate::kernel_guard::check(&config.path).is_ok())
+    .then(|| writer.storage.clone());
     let observations = Arc::new(Mutex::new(ReaderObservations {
         live: BTreeMap::new(),
         retired: Some(SqlWork::default()),

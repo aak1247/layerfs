@@ -37,6 +37,11 @@ pub struct StorageProvider {
     pub(crate) session: Arc<Session>,
 }
 impl StorageProvider {
+    /// Whether the concrete Linux writer has a private Durable Store at the
+    /// time of this check; the barrier rechecks it under writer ownership.
+    pub fn supports_durable_barrier(&self) -> bool {
+        self.session.supports_durable_barrier()
+    }
     /// Check a Linux Durable Store under its original cooperative writer
     /// ownership. Its initial installed file must already be durable.
     pub fn durable_barrier(&self) -> Result<(), PersistenceError> {

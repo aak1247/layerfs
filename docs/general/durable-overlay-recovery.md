@@ -55,9 +55,13 @@ checks the exact owner and Store, and a refusal returns the original binding.
 The caller selects a fresh control namespace and fences the prior process,
 mount and consumers; this path is not a durable roster or automatic restart.
 Terminal unmount closes the database but retains its files. Until the full
-barrier is implemented, durable mounts explicitly reject FUSE FSYNC and
-FSYNCDIR with EOPNOTSUPP; they do not use ENOSYS, which Linux would cache as a
-successful synchronization. This is not an `fsync` durability claim.
+barrier is available, a durable mount rejects FUSE FSYNC and FSYNCDIR with
+EOPNOTSUPP; it does not use ENOSYS, which Linux would cache as successful
+synchronization. A durable owner backed by a concrete Durable Store on a
+supported local filesystem and in a private directory serves FSYNC and
+FSYNCDIR through the Store and Overlay barriers. The Store's initial installed
+file must already have been synchronized; durable installation does that
+before acknowledging it. FLUSH and disposable mounts keep their prior behavior.
 
 The Overlay provides a separate `synchronize_kernel` primitive: it validates
 the live mount and the exact file or directory handle, then synchronizes the
@@ -65,8 +69,13 @@ durable overlay file and its original checked directory. A file or directory
 sync failure quarantines the owner and retains its connection and lease; a
 disposable database or a nested atomic job cannot claim this barrier. Tests
 inject failures into each sync and exercise stale and mismatched handles. This
-primitive does not establish that the Store or its base is durable and is not
-wired to a successful FUSE reply.
+primitive alone does not establish that the Store or its base is durable. The
+FUSE request checks the concrete Store separately, then applies the recorded
+recovery check and this barrier under the exact Workspace owner. Unresolved
+local custody returns EAGAIN without attempting the Overlay sync; failed
+sync returns EIO and retains its original failure. A stop may cancel waiting
+for the Store or Workspace owner before an attempt, while an attempted sync
+retains its original result.
 The service-owner variant also requires a recorded root-matched binding and
 applies reopening's capture, volatile-custody, operation-record and cleanup
 refusals. Its checks use the existing generation and cleanup indexes; they do
@@ -181,9 +190,25 @@ source and image hashes, kernel version, output and exit status are retained
 under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-process-loss-extra-20261109/`.
 
-The subsequent isolated FUSE run checked both profiles: on a durable mount,
+The earlier isolated FUSE run checked both profiles before the request barrier
+was connected: on a durable mount,
 file `fsync` and directory `fsync` returned EOPNOTSUPP before and after the
 manual recovery path; a disposable mount retained its prior successful
 ENOSYS behavior. The test output, executable and source hashes, image and
 kernel facts are retained under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-sync-refusal-20261109-final/`.
+
+A later isolated FUSE run exercised the connected barriers with a synchronized
+Durable Store and durable Workspace. An unprivileged process successfully
+called file `fsync`, `fdatasync` and directory `fsync`; an unresolved test
+capture returned EAGAIN until its known local resolution. Injected directory
+sync errors in the Store and Overlay each returned EIO. In each case the
+test killed and reaped the original daemon, detached its old mount, reopened
+the original files under a fresh namespace and read the written bytes. A
+Disposable Store still made the durable mount refuse synchronization. The
+test-only container used `/dev/fuse`, CAP_SYS_ADMIN and unconfined AppArmor and
+seccomp, with no network or Docker socket. This is a manual, single-Workspace
+process-loss test, not container/Pod recreation, automatic mount recovery,
+physical power loss or a performance qualification. The output, exit status,
+executable/source hashes, test-only fault shim, image and kernel facts are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-sync-verified-20261109/`.

@@ -61,7 +61,8 @@ have synchronized the file and directory. A caller may cancel while waiting
 for the FIFO publication lane or another process's directory lock; after the
 sync starts, the caller gets its original success or uncertainty. Tests cover
 both waits and an injected failure whose stop signal arrives during the sync.
-This is not yet a successful FUSE `fsync` acknowledgement.
+The single-owner FUSE service combines this with its recorded Overlay barrier;
+automatic Workspace discovery and recovery remain separate prerequisites.
 
 Injected `EIO` tests cover ordinary writes, writes inside a publication lane,
 and the post-close seal. They verify no success acknowledgement, retained

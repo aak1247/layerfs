@@ -10,8 +10,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
     },
     time::{Duration, Instant},
 };
@@ -97,6 +97,86 @@ fn read(client: &OwnerClient, route: Route) -> Vec<u8> {
             Ok(bytes)
         })
         .unwrap()
+}
+
+#[test]
+fn stopped_owner_wait_returns_the_unattempted_action() {
+    let fixture = Fixture::new();
+    let owner = Owner::create_durable(spec(&fixture.path())).unwrap();
+    let client = owner.client();
+    let route = client.bound_route().unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder = {
+        let client = client.clone();
+        std::thread::spawn(move || {
+            client.call(route, ServiceClass::General, None, move |_| {
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+        })
+    };
+    held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let attempted = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = {
+        let client = client.clone();
+        let stop = stopped.clone();
+        let tried = attempted.clone();
+        std::thread::spawn(move || {
+            let check = Arc::new(move || stop.load(Ordering::Acquire));
+            let result = client.call_cancellable(route, check, move |_| {
+                tried.store(true, Ordering::Release);
+                Ok(())
+            });
+            done_tx.send(result).unwrap();
+        })
+    };
+    let premature = done_rx.recv_timeout(Duration::from_millis(100)).ok();
+    stopped.store(true, Ordering::Release);
+    let early = premature.is_some();
+    let result = premature.unwrap_or_else(|| done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    release_tx.send(()).unwrap();
+    waiter.join().unwrap();
+    holder.join().unwrap().unwrap();
+    assert!(!early);
+    assert!(
+        matches!(result, Err(OwnerError::Unattempted { cause, .. }) if matches!(*cause, OwnerError::Cancelled))
+    );
+    assert!(!attempted.load(Ordering::Acquire));
+    owner.stop().unwrap();
+}
+
+#[test]
+fn stopping_after_owner_admission_keeps_the_original_result() {
+    let fixture = Fixture::new();
+    let owner = Owner::create_durable(spec(&fixture.path())).unwrap();
+    let client = owner.client();
+    let route = client.bound_route().unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker = {
+        let stop = stopped.clone();
+        std::thread::spawn(move || {
+            client.call_cancellable(
+                route,
+                Arc::new(move || stop.load(Ordering::Acquire)),
+                move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(73)
+                },
+            )
+        })
+    };
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    stopped.store(true, Ordering::Release);
+    release_tx.send(()).unwrap();
+    assert_eq!(worker.join().unwrap().unwrap(), 73);
+    owner.stop().unwrap();
 }
 
 #[test]

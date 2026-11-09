@@ -31,6 +31,8 @@ pub enum OwnerError {
     Randomness(layerfs_bridge::duplex::ChannelError),
     BindingCodec(layerfs_bridge::control::ControlError),
     Stopped,
+    /// A cancellable owner wait ended before the action was attempted.
+    Cancelled,
     Retained(Arc<OwnerError>),
     Attempted(Box<WorkspaceCallFailure>),
     AdmissionFull,
@@ -243,12 +245,46 @@ impl OwnerClient {
     where
         F: FnOnce(&Overlay, Option<Route>) -> Result<T, OwnerError> + Send + 'static,
     {
+        self.call_observed_with(route, class, ready, None, action)
+    }
+    /// Wait for a general owner turn while `stopped` is false. Cancellation
+    /// retains the original action as an unattempted input; a submitted job
+    /// always returns its original outcome.
+    pub fn call_cancellable<T, F>(
+        &self,
+        route: Route,
+        stopped: Arc<dyn Fn() -> bool + Send + Sync>,
+        action: F,
+    ) -> Result<T, OwnerError>
+    where
+        F: FnOnce(&Overlay) -> layerfs_overlay::OverlayResult<T> + Send + 'static,
+    {
+        self.call_observed_with(
+            Some(route),
+            ServiceClass::General,
+            None,
+            Some(stopped),
+            move |db, _| action(db).map_err(OwnerError::Overlay),
+        )
+        .map(|(value, _)| value)
+    }
+    fn call_observed_with<T, F>(
+        &self,
+        route: Option<Route>,
+        class: ServiceClass,
+        ready: Option<Readiness>,
+        stopped: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        action: F,
+    ) -> Result<(T, JobWork), OwnerError>
+    where
+        F: FnOnce(&Overlay, Option<Route>) -> Result<T, OwnerError> + Send + 'static,
+    {
         if let Some(pool) = self.roster() {
             let client = route
                 .ok_or(OwnerError::InvalidAdmission)
                 .and_then(|route| pool.client(route.namespace()));
             return match client {
-                Ok(client) => client.call_observed(route, class, ready, action),
+                Ok(client) => client.call_observed_with(route, class, ready, stopped, action),
                 Err(cause) => Err(OwnerError::Unattempted {
                     cause: Box::new(cause),
                     input: OriginalInput::new(action),
@@ -267,10 +303,30 @@ impl OwnerClient {
             return Err(refuse(OwnerError::Overlay(OverlayError::Stale), action));
         }
         let requested = Instant::now();
-        let mut state = match shared.state.lock() {
-            Ok(state) => state,
-            Err(_) => return Err(refuse(OwnerError::Stopped, action)),
+        let mut state = if let Some(stopped) = &stopped {
+            loop {
+                if stopped() {
+                    return Err(refuse(OwnerError::Cancelled, action));
+                }
+                match shared.state.try_lock() {
+                    Ok(state) => break state,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(refuse(OwnerError::Stopped, action));
+                    }
+                }
+            }
+        } else {
+            match shared.state.lock() {
+                Ok(state) => state,
+                Err(_) => return Err(refuse(OwnerError::Stopped, action)),
+            }
         };
+        if stopped.as_ref().is_some_and(|check| check()) {
+            return Err(refuse(OwnerError::Cancelled, action));
+        }
         let mut wait = elapsed(requested);
         // A waiting Capture or known install owns a finite frontier: mutations
         // and source acquisitions that arrive later wait behind it here, before
