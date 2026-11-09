@@ -62,7 +62,7 @@ impl Service {
         roster: &mut Roster,
         control: UnmountControl,
     ) -> Result<Success, RecordedCloseFailure> {
-        if self.durable.is_some() {
+        if self.durable.is_some() || self.fresh_failed {
             return Err(RecordedCloseFailure::Invalid(
                 "durable control owns admission",
             ));

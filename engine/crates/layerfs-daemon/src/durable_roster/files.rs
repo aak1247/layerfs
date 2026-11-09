@@ -85,8 +85,19 @@ impl Roster {
     /// Initializes an empty directory without replacing or deleting any entry.
     /// The caller creates and synchronizes the directory and its parent first.
     pub fn create(path: &Path, authority: Authority) -> Result<Self, RosterError> {
-        let expected = owner_bytes(authority)?;
         let (path, directory) = open_directory(path)?;
+        Self::create_opened(path, directory, authority)
+    }
+
+    /// Creates through an already checked directory descriptor. This prevents
+    /// a pathname swap from redirecting the initial writes to another inode.
+    pub(crate) fn create_opened(
+        path: PathBuf,
+        directory: File,
+        authority: Authority,
+    ) -> Result<Self, RosterError> {
+        let expected = owner_bytes(authority)?;
+        check_directory(&path, &directory)?;
         if fs::read_dir(fd_path(&directory))?
             .next()
             .transpose()?

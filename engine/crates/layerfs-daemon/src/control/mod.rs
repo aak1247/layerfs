@@ -11,6 +11,8 @@ mod durable_control;
 mod durable_root;
 mod failure;
 mod force;
+#[cfg(target_os = "linux")]
+mod fresh_control;
 mod inspect;
 mod invalidate;
 mod kernel;
@@ -33,6 +35,8 @@ mod types;
 mod unmount;
 #[cfg(target_os = "linux")]
 pub use durable_control::{DurableControlCause, DurableControlConfig, DurableControlFailure};
+#[cfg(target_os = "linux")]
+pub use fresh_control::{FreshControlCause, FreshControlConfig, FreshControlFailure};
 pub use kernel::{KernelConfig, KernelServing};
 pub(crate) use observation::{reply_token, request_token};
 #[cfg(target_os = "linux")]

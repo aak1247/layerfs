@@ -82,7 +82,7 @@ impl Service {
         minimum_namespace: i64,
     ) -> Result<Vec<WorkspaceToken>, Box<CatalogRecoveryFailure>> {
         let mut completed = Vec::new();
-        if self.durable.is_some() {
+        if self.durable.is_some() || self.fresh_failed {
             return Err(failed(
                 CatalogRecoveryCause::Invalid("durable control owns admission"),
                 completed,

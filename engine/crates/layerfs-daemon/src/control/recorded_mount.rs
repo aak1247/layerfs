@@ -173,7 +173,7 @@ impl Service {
         overlay_directory: &Path,
         request: RecordedMountRequest,
     ) -> Result<Success, Box<RecordedMountFailure>> {
-        if self.durable.is_some() {
+        if self.durable.is_some() || self.fresh_failed {
             return Err(Box::new(RecordedMountFailure::Invalid(
                 "durable control owns admission",
             )));

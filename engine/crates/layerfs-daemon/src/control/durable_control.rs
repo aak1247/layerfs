@@ -112,7 +112,31 @@ fn checked_result(
 }
 
 impl Service {
+    pub(super) fn install_fresh_control(
+        &mut self,
+        catalog: Roster,
+        root: DurableRoot,
+        sandbox: [u8; 32],
+        profile: ProfileConfig,
+    ) {
+        self.durable = Some(DurableControl {
+            state: Mutex::new(DurableState {
+                catalog,
+                root,
+                failure: None,
+            }),
+            sandbox,
+            profile,
+        });
+    }
+
     pub(super) fn check_durable_state(&self) -> Result<(), Failure> {
+        if self.fresh_failed {
+            return Err(Failure::Rejected(
+                layerfs_bridge::control::ControlCode::Unknown,
+                "fresh durable control initialization failed",
+            ));
+        }
         match &self.durable {
             None => Ok(()),
             Some(control) => control.state.lock().map_err(|_| Failure::Poisoned)?.check(),
@@ -178,7 +202,7 @@ impl Service {
         owner: &Owner,
         mut config: DurableControlConfig,
     ) -> Result<Vec<WorkspaceToken>, Box<DurableControlFailure>> {
-        let invalid = if self.durable.is_some() {
+        let invalid = if self.durable.is_some() || self.fresh_failed {
             Some("durable control already installed")
         } else if !self.store.has_durable_writer() {
             Some("durable control requires a Durable Store")

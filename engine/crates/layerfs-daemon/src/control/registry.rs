@@ -37,6 +37,9 @@ pub struct Service {
     pub(super) kernel: Option<Arc<KernelServing>>,
     #[cfg(target_os = "linux")]
     pub(super) durable: Option<super::durable_control::DurableControl>,
+    /// A selected fresh durable startup failed; never fall back to temporary workspaces.
+    #[cfg(target_os = "linux")]
+    pub(super) fresh_failed: bool,
 }
 /// A failed pre-effect registration retains the original bound Workspace.
 pub struct DurableRegistrationFailure {
@@ -72,6 +75,8 @@ impl Service {
             kernel: None,
             #[cfg(target_os = "linux")]
             durable: None,
+            #[cfg(target_os = "linux")]
+            fresh_failed: false,
         }
     }
     /// Binds control and kernel serving to the same Store and overlay owner.
@@ -90,7 +95,7 @@ impl Service {
         workspace: BoundWorkspace,
     ) -> Result<WorkspaceToken, Box<DurableRegistrationFailure>> {
         #[cfg(target_os = "linux")]
-        if self.durable.is_some() {
+        if self.durable.is_some() || self.fresh_failed {
             return Err(Box::new(DurableRegistrationFailure {
                 cause: Failure::Rejected(ControlCode::Invalid, "durable control owns admission"),
                 workspace: Box::new(workspace),

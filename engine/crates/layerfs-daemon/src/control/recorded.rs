@@ -57,7 +57,7 @@ impl Service {
                 workspace: Box::new(workspace),
             })
         };
-        if self.durable.is_some() {
+        if self.durable.is_some() || self.fresh_failed {
             return Err(reject(
                 RecordedRegistrationError::Control(Failure::Rejected(
                     layerfs_bridge::control::ControlCode::Invalid,
