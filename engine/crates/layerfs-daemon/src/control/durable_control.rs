@@ -132,7 +132,7 @@ impl Service {
         if let Err(cause) = state.check() {
             return Some(Err(cause));
         }
-        let path = state.root.path.clone();
+        let path = state.root.retained_path();
         let result = self
             .mount_recorded_on_roster(
                 &mut state.catalog,
@@ -202,10 +202,11 @@ impl Service {
                 }))
             }
         };
+        let path = root.retained_path();
         let recovery = self.recover_catalog(
             &mut config.catalog,
             owner,
-            &root.path,
+            &path,
             config.sandbox,
             config.profile,
             config.minimum_namespace,

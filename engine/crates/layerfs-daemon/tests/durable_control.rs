@@ -560,23 +560,26 @@ fn root_replacement_during_mount_retains_each_original_outcome() {
         ));
         fs::rename(root.join("overlays"), root.join("replacement")).unwrap();
         fs::rename(root.join("original"), root.join("overlays")).unwrap();
+        if denied {
+            fs::set_permissions(root.join("overlays"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         assert!(matches!(
             service.execute_control(&Request::Attach(token)),
             Err(Failure::DurableRoot(_))
         ));
         drop(service);
         assert!(Roster::open(&root.join("catalog"), authority).is_err());
-        assert!(fs::read_dir(root.join("overlays"))
-            .unwrap()
-            .next()
-            .is_none());
         assert_eq!(
-            fs::read_dir(root.join("replacement"))
+            fs::read_dir(root.join("overlays"))
                 .unwrap()
                 .next()
                 .is_none(),
             denied
         );
+        assert!(fs::read_dir(root.join("replacement"))
+            .unwrap()
+            .next()
+            .is_none());
         fs::write(
             root.join("ack"),
             b"original result, directory and catalog retained",

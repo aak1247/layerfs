@@ -28,7 +28,7 @@ int fsync(int fd) {
     actual[length] = '\0';
     if (strcmp(actual, target) || !__sync_bool_compare_and_swap(&swapped, 0, 1)) goto done;
     int changed = rename(source, backup) == 0 && mkdir(source, 0700) == 0;
-    if (changed && getenv("LAYERFS_TEST_SWAP_DENY")) changed = chmod(source, 0755) == 0;
+    if (changed && getenv("LAYERFS_TEST_SWAP_DENY")) changed = chmod(backup, 0755) == 0;
     const char *outcome = changed ? "swapped\n" : "failed\n";
     int out = open(receipt, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (out >= 0) { (void)write(out, outcome, strlen(outcome)); close(out); }

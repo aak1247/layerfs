@@ -3,6 +3,7 @@ use nix::sys::statfs;
 use std::{
     fs::{self, File, OpenOptions},
     io,
+    os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -61,6 +62,13 @@ impl DurableRoot {
             ));
         }
         Ok(())
+    }
+    /// Resolve each Overlay through the retained inode, not a replaceable name.
+    pub fn retained_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            self.file.as_ref().expect("root retained").as_raw_fd()
+        ))
     }
     pub fn quarantine(&mut self) {
         self.quarantined = true;

@@ -43,7 +43,8 @@ An explicitly activated, manually assembled Service can own the catalog and
 route its existing Mount and Unmount control requests through those operations.
 Activation requires a concrete Durable Store, verifies the private local Overlay
 directory and performs one complete catalog recovery before admitting calls.
-The directory inode is retained and checked before and after each creation or
+The directory inode is retained, each Overlay path is resolved through that
+held directory, and its original name is checked before and after creation or
 close; replacement or loss of privacy quarantines the original directory and
 catalog lock. After that quarantine, Attach, Commit and other effectful
 controls are refused even if a token was already exposed; read-only status and
@@ -212,7 +213,8 @@ failure to verify an Unknown reply with its original custody retained. A
 separate isolated FUSE test used the same request dispatch for two Workspaces,
 then killed and manually fenced the original owner before recovery; its output
 is in
-`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-control-exclusive-fuse-20261109/`.
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-control-pinned-root-fuse-20261109/`.
 Additional injected directory replacement during creation covered both a
 completed binding and a creation refusal: each kept the original outcome and
-the replaced-root failure, and neither allowed a later Attach.
+the replaced-root failure, neither wrote into the replacement directory, and
+neither allowed a later Attach.
