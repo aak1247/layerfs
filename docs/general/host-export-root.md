@@ -48,6 +48,15 @@ normal exit; a caller must preserve it until an independently verified
 retirement or recovery protocol says what can be done. Its physical-crash
 durability depends on the export filesystem; a tmpfs test is not such proof.
 
+An owned KVM guest additionally wrote and synchronized a claim on a new ext4
+disk (`cache=none`), then was killed immediately after the acknowledgement.
+A second guest on the same disk read the original boot ID and public key,
+checked mode and ownership, and refused to treat the claimed root as fresh.
+The receipt and both serial logs are retained in
+`~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/export-claim-vm-rerun-20261110-2rAHnfWx/vm-secure-root/`.
+This models guest memory loss on that disk, not physical host power loss,
+automatic recovery, or proof that the old consumers have exited.
+
 The kernel serving owner retains this daemon-side guard. It rechecks the root
 before an Attach, and checks both the root and the exact child mount ID and
 device before acknowledging Ready. Normal and forced teardown also check the

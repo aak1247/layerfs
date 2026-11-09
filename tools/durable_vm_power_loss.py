@@ -82,13 +82,21 @@ poweroff -f
 """
     )
     init.chmod(0o755)
+    # Host umasks may leave bootstrap directories group-writable. The guest
+    # export guard requires a root-owned, non-writable ancestor chain.
+    root.chmod(0o755)
+    for directory in root.rglob("*"):
+        if directory.is_dir() and not directory.is_symlink():
+            directory.chmod(0o755)
     entries = [b".\0"]
     for path in sorted(root.rglob("*")):
         entries.append(os.fsencode("./" + str(path.relative_to(root))) + b"\0")
     archive = output / "initramfs.cpio.gz"
     with gzip.open(archive, "wb", compresslevel=6) as compressed:
         cpio = subprocess.Popen(
-            ["cpio", "--null", "--create", "--format=newc", "--quiet"],
+            # Guest bootstrap paths must be owned by guest root, independent
+            # of the host user's uid; the export guard checks every ancestor.
+            ["cpio", "--null", "--create", "--format=newc", "--owner=0:0", "--quiet"],
             cwd=root,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -150,7 +158,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True, help="new owned artifact directory")
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--probe", type=Path, required=True, help="prebuilt Rust test binary")
-    parser.add_argument("--probe-kind", choices=("store", "overlay", "roster"), default="store")
+    parser.add_argument("--probe-kind", choices=("store", "overlay", "roster", "export"), default="store")
     parser.add_argument("--busybox", type=Path, default=Path("/bin/busybox"))
     args = parser.parse_args()
     output = args.output.absolute()
@@ -167,6 +175,7 @@ def main() -> int:
             "store": "guest power loss after acknowledged Durable Store save; not Workspace recovery",
             "overlay": "guest power loss after acknowledged durable overlay transaction; not mount recovery",
             "roster": "guest power loss after acknowledged discovery records; not mount recovery",
+            "export": "guest power loss after acknowledged export owner claim; not mount recovery",
         }[args.probe_kind],
         "disk": "256 MiB raw ext4, QEMU IDE cache=none",
     }
@@ -208,6 +217,7 @@ def main() -> int:
             "store": rb"LAYERFS_VM_ACK wal_bytes=[1-9][0-9]*\r?\n",
             "overlay": rb"LAYERFS_VM_ACK overlay_bytes=[1-9][0-9]*\r?\n",
             "roster": rb"LAYERFS_VM_ACK roster_bytes=[1-9][0-9]*\r?\n",
+            "export": rb"LAYERFS_VM_ACK export_bytes=[1-9][0-9]*\r?\n",
         }[args.probe_kind]
         receipt["write"] = boot_until(
             common + ["-append", "console=ttyS0 panic=-1 quiet layerfs.mode=write"],
