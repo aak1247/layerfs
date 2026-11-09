@@ -6,6 +6,8 @@ mod commit;
 pub(crate) mod create;
 #[cfg(unix)]
 pub(crate) mod exec;
+#[cfg(target_os = "linux")]
+mod host_workspace;
 mod mount;
 mod mount_observed;
 mod status;

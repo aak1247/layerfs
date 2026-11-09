@@ -318,8 +318,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         assert!(export
             .observe_workspace(namespace, receipt.device_major, receipt.device_minor ^ 1)
             .is_err());
-        let host =
-            export.observe_workspace(namespace, receipt.device_major, receipt.device_minor)?;
+        let mut other = mounted.clone();
+        other.ready.directory.push_str("-wrong");
+        assert!(owner.observe_host_workspace(&other).is_err());
+        let mut other = mounted.clone();
+        other.ready.token.namespace += 1;
+        assert!(owner.observe_host_workspace(&other).is_err());
+        let mut other = mounted.clone();
+        other.ready.receipt.device_minor ^= 1;
+        assert!(owner.observe_host_workspace(&other).is_err());
+        let host = owner.observe_host_workspace(&mounted)?;
         assert_ne!(host.mount_id(), 0);
         host.verify()?;
         check_host_mount_change(&host)?;

@@ -300,6 +300,35 @@ fn mounted() -> layerfs_api::MountedWorkspace {
     }
 }
 #[test]
+#[cfg(target_os = "linux")]
+fn host_workspace_refuses_mismatched_receipts_and_absent_export_without_effects() {
+    let mut fixture = Fixture::new(vec![fixed(204, b""), fixed(204, b"")]);
+    let owner = fixture.owner.as_mut().unwrap();
+    let before = layerfs_api::internal::control(owner).channel_work();
+    let mut workspace = mounted();
+    assert!(owner
+        .observe_host_workspace(&workspace)
+        .unwrap_err()
+        .to_string()
+        .contains("binding and Ready receipt disagree"));
+    workspace.ready.directory = "/workspaces/7".into();
+    workspace.ready.token.namespace = 8;
+    assert!(owner
+        .observe_host_workspace(&workspace)
+        .unwrap_err()
+        .to_string()
+        .contains("binding and Ready receipt disagree"));
+    workspace.ready.token.namespace = 7;
+    assert!(owner
+        .observe_host_workspace(&workspace)
+        .unwrap_err()
+        .to_string()
+        .contains("no host export lease"));
+    assert_eq!(layerfs_api::internal::control(owner).channel_work(), before);
+    fixture.api.close(fixture.owner.take().unwrap()).unwrap();
+    assert_eq!(fixture.calls().len(), 8);
+}
+#[test]
 fn workspace_exec_returns_original_runtime_owner_at_the_mount_with_no_daemon_registration() {
     const EID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let mut fixture = Fixture::new(vec![

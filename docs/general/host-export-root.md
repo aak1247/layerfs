@@ -109,6 +109,18 @@ over the Workspace and observed refusal, then removed that exact test bind and
 verified the original mount before normal use and close. Its receipt is
 `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/host-workspace-identity-20261110-jdx5FVHU/receipt.txt`.
 
+`ManagedSandbox::observe_host_workspace` obtains this guard through the
+Sandbox's own retained lease. It first checks that the acknowledged runtime
+has not been stopped or deleted and that the original binding, Ready token
+and container path agree. A recorded start does not prove the daemon remains
+alive. The caller remains responsible for preserving the
+original authenticated acknowledgement; the method does not reconstruct or
+authenticate a receipt supplied from an unrelated source.
+An isolated Docker/FUSE run exercised the Sandbox-owned method, including
+refusal of a mismatched Ready path, token or device and of a stacked host
+mount; it then restored the original mount and closed normally. Its receipt is
+`~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sandbox-workspace-identity-20261110-IgKEvEeO/receipt.txt`.
+
 This low-level adapter does not yet provide a complete durable lifecycle
 journal and recovery for exported Sandboxes or automatic host guard checks
 around every Workspace operation. A caller must supply and retain those
