@@ -274,6 +274,7 @@ pub(crate) fn commit(args: &SdkValue) -> Outcome {
 pub(crate) fn unmount(args: &SdkValue) -> Outcome {
     let state = sandbox_refreshed(args)?;
     let _guard = crate::discovery::guard(&state.directory)?;
+    crate::registry::check_durable_close(&state)?;
     let path = text(args, "path")?;
     let token = state.token(path)?;
     // The runtime owner knows its own processes; the daemon's kernel probe
@@ -292,6 +293,15 @@ pub(crate) fn unmount(args: &SdkValue) -> Outcome {
                 SdkValue::List(running.into_iter().map(SdkValue::Text).collect()),
             )]),
         });
+    }
+    if state.durable_identity.is_some() {
+        #[cfg(target_os = "linux")]
+        return crate::close_journal::unmount(&state, path, token, args);
+        #[cfg(not(target_os = "linux"))]
+        return Err(crate::job::refused(
+            "Unsupported",
+            "durable Sandboxes require Linux",
+        ));
     }
     let value = {
         let mut control = crate::trace::control(&state.controls)?;

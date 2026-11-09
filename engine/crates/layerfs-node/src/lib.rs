@@ -1,4 +1,6 @@
 //! Node entry points for the public SDK and its backend table (#428).
+#[cfg(target_os = "linux")]
+mod close_journal;
 mod convert;
 mod direct;
 mod discovery;

@@ -147,8 +147,21 @@ are checked against the Sandbox, Workspace, Branch and receipt identities
 before another mount is admitted. This does not recover an old daemon or prove
 its physical consumers have exited. The native Node tests use an authenticated
 simulated daemon and a real local Store: they cover distinct successful mounts,
-lost Ready, failed intent sync, directory replacement and process reopen, but
-do not exercise a real FUSE mount through this SDK path.
+lost Ready, failed intent sync, directory replacement and process reopen. The
+separate Docker/FUSE proof above exercises actual SDK-created mounts.
+
+The Linux Node binding also synchronizes a close intent before sending a durable
+Workspace's ordinary Unmount. It records the correlated terminal reply before
+removing and synchronizing the original Workspace record, then records the
+completed close. A lost reply, failed sync or inconsistent record blocks later
+operations and is not replayed on reopen. A Dirty reply or the daemon's exact
+reversible `unmount:kernel` Busy refusal is recorded as no effect and permits
+a new, explicit request; other Busy phases do not establish that outcome.
+Forced unmount is refused because it does not use the durable catalog's close
+protocol. The native tests inject lost replies and sync errors against an
+authenticated simulated daemon; this is not automatic Sandbox recovery or a
+real process-crash test of SDK close. The retained close records currently have
+no compaction protocol.
 
 Automatic directory creation uses the fixed `layerfs-durable/<Sandbox-id>`
 layout. It creates the identity directory exclusively under retained parent

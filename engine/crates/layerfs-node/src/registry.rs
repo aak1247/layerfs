@@ -84,14 +84,27 @@ pub(crate) fn text<'a>(args: &'a SdkValue, name: &str) -> Result<&'a str, SdkRef
 pub(crate) fn sandbox(args: &SdkValue) -> Result<Arc<SandboxState>, SdkRefusal> {
     let directory = crate::discovery::sandbox_dir(args, text(args, "sandbox")?)?;
     let existing = lock(&SANDBOXES)?.get(&directory).cloned();
-    match existing {
-        Some(state) => Ok(state),
+    let state = match existing {
+        Some(state) => state,
         None => {
             let state = crate::discovery::reopen(args)?;
             lock(&SANDBOXES)?.insert(directory, state.clone());
-            Ok(state)
+            state
         }
+    };
+    check_durable_close(&state)?;
+    Ok(state)
+}
+
+/// An unresolved durable close cannot be inferred from a later status call.
+pub(crate) fn check_durable_close(state: &SandboxState) -> Result<(), SdkRefusal> {
+    if state.durable_identity.is_some() {
+        #[cfg(target_os = "linux")]
+        crate::close_journal::check(state)?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(refused("Unsupported", "durable Sandboxes require Linux"));
     }
+    Ok(())
 }
 
 /// The Sandbox `args` name when its container still runs it: this
@@ -104,6 +117,7 @@ pub(crate) fn sandbox_live(args: &SdkValue) -> Result<Arc<SandboxState>, SdkRefu
     let Some(state) = lock(&SANDBOXES)?.get(&directory).cloned() else {
         return sandbox(args);
     };
+    check_durable_close(&state)?;
     if let Err(failure) = state.runtime.endpoint() {
         lock(&SANDBOXES)?.remove(&directory);
         return Err(if failure.container_gone() || failure.container_stopped() {

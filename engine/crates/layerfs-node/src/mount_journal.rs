@@ -242,6 +242,7 @@ pub(crate) fn mount(
     branch_id: BranchId,
     branch_name: &str,
 ) -> Result<MountedWorkspace, SdkRefusal> {
+    crate::registry::check_durable_close(state)?;
     if let Some(retained) = lock(&RETAINED)?.get(&state.directory) {
         let _ = (&retained.journal, &retained.result);
         return Err(refused(

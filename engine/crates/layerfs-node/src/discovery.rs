@@ -592,6 +592,10 @@ pub(crate) fn reopen(args: &SdkValue) -> Result<Arc<SandboxState>> {
     let project = registry::text(&value, "project")?;
     let container = registry::text(&value, "container")?;
     let durable_identity = durable_identity(&value)?;
+    #[cfg(target_os = "linux")]
+    if let Some(identity) = durable_identity {
+        crate::close_journal::check_at(&directory, identity)?;
+    }
     let (docker, selector, request) = runtime(&value)?;
     let runtime = Sandbox::reopen(docker, selector, request).map_err(|failure| {
         if failure.container_gone() || failure.container_stopped() {
@@ -632,6 +636,7 @@ pub(crate) fn reopen(args: &SdkValue) -> Result<Arc<SandboxState>> {
 }
 /// Refresh shared executor/mount metadata without repeating an operation.
 pub(crate) fn refresh(state: &SandboxState) -> Result<()> {
+    registry::check_durable_close(state)?;
     let mut mounts = std::collections::BTreeMap::new();
     let mut processes = std::collections::BTreeMap::new();
     for item in fs::read_dir(&state.directory).map_err(failed)? {
