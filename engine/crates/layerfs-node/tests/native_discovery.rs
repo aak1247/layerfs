@@ -91,6 +91,77 @@ fn a_gone_container_is_reclaimed_by_removing_its_records() {
 }
 
 #[test]
+fn a_gone_durable_sandbox_keeps_its_records_for_recovery() {
+    let home = Home::new();
+    home.record_with_durability(
+        CID,
+        [1; 32],
+        [2; 32],
+        None,
+        Some(SdkValue::Bytes(vec![8; 32])),
+    );
+    let engine = engine(
+        &home.0,
+        404,
+        &format!(r#"{{"message":"No such container: {CID}"}}"#),
+    );
+    home.node(
+        "assert.equal((await reclaim()).refused.code, 'RecoveryRequired');",
+        None,
+        Duration::from_secs(5),
+    );
+    assert!(engine
+        .join()
+        .unwrap()
+        .starts_with(&format!("GET /v1.54/containers/{CID}/json")));
+    assert!(home.0.join("proj/sandboxes/1/sandbox.record").exists());
+}
+
+#[test]
+fn a_stopped_durable_sandbox_is_neither_reported_as_disposable_nor_deleted() {
+    let home = Home::new();
+    home.record_with_durability(
+        CID,
+        [1; 32],
+        [2; 32],
+        None,
+        Some(SdkValue::Bytes(vec![8; 32])),
+    );
+    let engine = engines(&home.0, vec![(200, exited()), (200, exited())]);
+    home.node(
+        "assert.equal((await native.call('sandbox.list_workspaces', args)).refused.code, 'RecoveryRequired'); assert.equal((await reclaim()).refused.code, 'RecoveryRequired');",
+        None,
+        Duration::from_secs(5),
+    );
+    assert_eq!(engine.join().unwrap().len(), 2);
+    assert!(home.0.join("proj/sandboxes/1/sandbox.record").exists());
+}
+
+#[test]
+fn a_malformed_durable_marker_does_not_fall_back_to_reclamation() {
+    let home = Home::new();
+    home.record_with_durability(
+        CID,
+        [1; 32],
+        [2; 32],
+        None,
+        Some(SdkValue::Bytes(vec![0; 32])),
+    );
+    let engine = engine(
+        &home.0,
+        404,
+        &format!(r#"{{"message":"No such container: {CID}"}}"#),
+    );
+    home.node(
+        "assert.equal((await reclaim()).refused.code, 'InvalidInput');",
+        None,
+        Duration::from_secs(5),
+    );
+    engine.join().unwrap();
+    assert!(home.0.join("proj/sandboxes/1/sandbox.record").exists());
+}
+
+#[test]
 fn another_404_is_a_failure_that_removes_nothing() {
     let home = Home::new();
     let engine = engine(&home.0, 404, r#"{"message":"page not found"}"#);

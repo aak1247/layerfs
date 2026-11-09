@@ -46,6 +46,8 @@ pub(crate) struct SandboxState {
     pub(crate) name: String,
     /// Fixed when this Sandbox starts and shared by every client reopening it.
     pub(crate) max_workspaces: u32,
+    /// Durable Workspace Sandbox identity; absent in legacy disposable records.
+    pub(crate) durable_identity: Option<[u8; 32]>,
     pub(crate) directory: std::path::PathBuf,
     pub(crate) runtime: Sandbox,
     pub(crate) identity: CommandIdentity,
@@ -109,6 +111,7 @@ pub(crate) fn sandbox_live(args: &SdkValue) -> Result<Arc<SandboxState>, SdkRefu
                 &state.id,
                 &state.runtime.identity().to_string(),
                 failure.container_stopped(),
+                state.durable_identity.is_some(),
             )
         } else {
             crate::job::failed(failure)

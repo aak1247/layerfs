@@ -74,6 +74,14 @@ requested directories are on the named Store volume, but does not yet select
 the new setup or prove an old container and its consumers exited.
 This fresh path refuses existing contents and is not recovery.
 
+SDK discovery recognizes a durable Sandbox identity in its private record.
+If the Engine reports that container stopped or missing, it retains the
+container and records and returns `RecoveryRequired`; malformed identities
+are refused rather than treated as disposable. Explicit Sandbox close also
+refuses until durable catalog ownership can be resolved. Legacy records with
+no durable identity keep their prior disposable behavior. The SDK does not
+yet create such records on its normal Sandbox creation path.
+
 Automatic directory creation uses the fixed `layerfs-durable/<Sandbox-id>`
 layout. It creates the identity directory exclusively under retained parent
 descriptors and synchronizes the volume, parent and private children before

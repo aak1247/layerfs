@@ -58,6 +58,17 @@ impl Home {
         peer: [u8; 32],
         capacity: Option<SdkValue>,
     ) {
+        self.record_with_durability(container, secret, peer, capacity, None);
+    }
+
+    pub fn record_with_durability(
+        &self,
+        container: &str,
+        secret: [u8; 32],
+        peer: [u8; 32],
+        capacity: Option<SdkValue>,
+        durable: Option<SdkValue>,
+    ) {
         let bytes = |n: [u8; 32]| SdkValue::Bytes(n.to_vec());
         let mut value = SdkValue::map([
             ("id", SdkValue::text("1")),
@@ -78,6 +89,9 @@ impl Home {
         ]);
         if let (Some(capacity), SdkValue::Map(fields)) = (capacity, &mut value) {
             fields.push(("maxWorkspaces".to_owned(), capacity));
+        }
+        if let (Some(durable), SdkValue::Map(fields)) = (durable, &mut value) {
+            fields.push(("durableSandbox".to_owned(), durable));
         }
         let path = self.0.join("proj/sandboxes/1/sandbox.record");
         let mut file = std::fs::OpenOptions::new()

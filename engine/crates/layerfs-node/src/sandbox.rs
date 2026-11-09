@@ -259,6 +259,7 @@ fn start_claimed(
         project: name.to_owned(),
         name: container_name,
         max_workspaces,
+        durable_identity: None,
         directory: saved_directory.to_owned(),
         runtime,
         identity,
@@ -415,6 +416,9 @@ pub(crate) fn close(args: &SdkValue) -> Outcome {
         });
     }
     let value = crate::discovery::load(&record)?;
+    if crate::discovery::durable_identity(&value)?.is_some() {
+        return Err(refused("RecoveryRequired", format!("Sandbox {id} has durable Workspace state; its catalog and ownership must be resolved before closing it")));
+    }
     let (docker, selector, request) = crate::discovery::runtime(&value)?;
     let mut owner = layerfs_sandbox::backend::docker::Sandbox::reopen(docker, selector, request)
         .map_err(failed)?;
@@ -460,7 +464,12 @@ pub(crate) fn get_log(args: &SdkValue) -> Outcome {
     let bytes = match sandbox.log_tail(lines, GET_LOG_BYTES) {
         Ok(bytes) => bytes,
         Err(failure) if failure.container_gone() => {
-            return Err(crate::discovery::gone(&id, &container, false))
+            return Err(crate::discovery::gone(
+                &id,
+                &container,
+                false,
+                crate::discovery::durable_identity(&value)?.is_some(),
+            ))
         }
         Err(failure) => return Err(failed(failure)),
     };
@@ -479,8 +488,8 @@ const GET_LOG_BYTES: usize = 64 * 1024;
 const STOP_S: u16 = 5;
 
 /// Reclaims Sandbox `id`, whose container a reopen found gone or stopped
-/// (`container`, `stopped`): one unforced Delete of a stopped container, then
-/// its records, so its number is free again. Called under the project's
+/// (`container`, `stopped`): one unforced Delete of a stopped disposable
+/// container, then its records. Durable records are retained. Called under the project's
 /// guard; the Sandbox's own guard is taken too. The record is read again
 /// under them: a Sandbox started again under the number meanwhile has
 /// another container and is left alone (`Busy`). A Delete the Engine refuses
@@ -501,6 +510,9 @@ pub(crate) fn reclaim(args: &SdkValue, id: &str, container: &str, stopped: bool)
             "Busy",
             format!("Sandbox {id} was started again while it was reclaimed; nothing was removed"),
         ));
+    }
+    if crate::discovery::durable_identity(&value)?.is_some() {
+        return Err(refused("RecoveryRequired", format!("Sandbox {id} has durable Workspace state; its original container and records are retained for recovery")));
     }
     if stopped {
         let (docker, selector, request) = crate::discovery::runtime(&value)?;

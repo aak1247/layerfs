@@ -4,9 +4,8 @@
 //! takes no project lock; `sandbox.create` is the only start. A Workspace is
 //! `{ sandbox, path }`; status, Commit and unmount go to its Sandbox's
 //! daemon. Nothing is retried: a refused or failed step is the call's answer.
-//! A Sandbox whose daemon ended itself when idle is refused `NoSuchSandbox`
-//! by a mount and reclaimed by the next `sandbox.create` or
-//! `runtime.sandbox.reclaim`.
+//! An idle-closed disposable Sandbox is refused `NoSuchSandbox` and reclaimed
+//! by the next create or explicit reclaim. Durable records are retained.
 use crate::job::{failed, Outcome};
 use crate::registry::{
     lock, naming, random, sandbox, sandbox_live, sandbox_refreshed, text, Mount,
@@ -149,8 +148,8 @@ fn records(args: &SdkValue) -> Result<Vec<(String, std::path::PathBuf, SdkValue)
 }
 
 /// Reclaims every recorded Sandbox of the project found gone or stopped (an
-/// idle-closed one), so its number is free again. `sandbox.create` calls it
-/// under the project's guard before it starts one.
+/// idle-closed one), so its number is free again. Durable records refuse this
+/// path. `sandbox.create` calls it under the project's guard before a start.
 pub(crate) fn reclaim_gone(args: &SdkValue) -> Result<(), SdkRefusal> {
     for (id, directory, value) in records(args)? {
         if let Some((container, stopped)) = observed(&value, &directory)? {

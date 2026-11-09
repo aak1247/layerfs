@@ -301,6 +301,23 @@ fn bytes<const N: usize>(value: &SdkValue, key: &str) -> Result<[u8; N]> {
         _ => Err(refused("InvalidInput", format!("discovery {key}"))),
     }
 }
+/// Missing means a legacy disposable Sandbox; malformed markers never do.
+pub(crate) fn durable_identity(value: &SdkValue) -> Result<Option<[u8; 32]>> {
+    match value.get("durableSandbox") {
+        None => Ok(None),
+        Some(SdkValue::Bytes(raw)) => {
+            let identity: [u8; 32] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| refused("InvalidInput", "invalid durable Sandbox identity"))?;
+            if identity == [0; 32] {
+                return Err(refused("InvalidInput", "invalid durable Sandbox identity"));
+            }
+            Ok(Some(identity))
+        }
+        Some(_) => Err(refused("InvalidInput", "invalid durable Sandbox identity")),
+    }
+}
 pub(crate) fn save_project(path: &Path, project: &Project) -> Result<()> {
     save_with_sync(
         &path.join("project.record"),
@@ -369,51 +386,65 @@ pub(crate) fn save_sandbox(
     let deploy = args
         .get("deploy")
         .ok_or_else(|| refused("InvalidInput", "deploy"))?;
-    save(
+    let mut value = SdkValue::map([
+        ("id", SdkValue::text(&state.id)),
+        ("project", SdkValue::text(&state.project)),
+        ("name", SdkValue::text(&state.name)),
+        (
+            "maxWorkspaces",
+            SdkValue::Int(i64::from(state.max_workspaces)),
+        ),
+        (
+            "container",
+            SdkValue::text(state.runtime.identity().to_string()),
+        ),
+        ("docker", SdkValue::text(registry::text(deploy, "docker")?)),
+        ("image", SdkValue::text(&state.runtime.request().image)),
+        (
+            "volume",
+            SdkValue::text(&state.runtime.request().store_volume),
+        ),
+        (
+            "labels",
+            SdkValue::List(
+                (state.runtime.request().labels.iter())
+                    .map(|(key, value)| {
+                        SdkValue::map([
+                            ("key", SdkValue::text(key)),
+                            ("value", SdkValue::text(value)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("secret", SdkValue::Bytes(secret.to_vec())),
+        ("peer", SdkValue::Bytes(peer.to_vec())),
+        ("instance", SdkValue::Bytes(instance.to_vec())),
+    ]);
+    if let (Some(identity), SdkValue::Map(fields)) = (state.durable_identity, &mut value) {
+        fields.push(("durableSandbox".into(), SdkValue::Bytes(identity.to_vec())));
+    }
+    save_with_sync(
         &directory.join("sandbox.record"),
-        SdkValue::map([
-            ("id", SdkValue::text(&state.id)),
-            ("project", SdkValue::text(&state.project)),
-            ("name", SdkValue::text(&state.name)),
-            (
-                "maxWorkspaces",
-                SdkValue::Int(i64::from(state.max_workspaces)),
-            ),
-            (
-                "container",
-                SdkValue::text(state.runtime.identity().to_string()),
-            ),
-            ("docker", SdkValue::text(registry::text(deploy, "docker")?)),
-            ("image", SdkValue::text(&state.runtime.request().image)),
-            (
-                "volume",
-                SdkValue::text(&state.runtime.request().store_volume),
-            ),
-            (
-                "labels",
-                SdkValue::List(
-                    (state.runtime.request().labels.iter())
-                        .map(|(key, value)| {
-                            SdkValue::map([
-                                ("key", SdkValue::text(key)),
-                                ("value", SdkValue::text(value)),
-                            ])
-                        })
-                        .collect(),
-                ),
-            ),
-            ("secret", SdkValue::Bytes(secret.to_vec())),
-            ("peer", SdkValue::Bytes(peer.to_vec())),
-            ("instance", SdkValue::Bytes(instance.to_vec())),
-        ]),
+        value,
+        state.durable_identity.is_some(),
     )
 }
-/// A Sandbox whose container no longer runs it: the Engine no longer has the
-/// container, or has it stopped (it closed when idle, or Docker restarted),
-/// which lost its daemon and every mount in it. Only its records, and a
-/// stopped container, hold its number; the next mount reclaims them.
-pub(crate) fn gone(id: &str, container: &str, stopped: bool) -> SdkRefusal {
+/// A Sandbox whose container the Engine reports gone or stopped. Disposable
+/// records may be reclaimed; durable records need separate recovery evidence.
+pub(crate) fn gone(id: &str, container: &str, stopped: bool, durable: bool) -> SdkRefusal {
     let state = if stopped { "stopped" } else { "gone" };
+    if durable {
+        return SdkRefusal {
+            code: "RecoveryRequired".to_owned(),
+            message: format!("the container of durable Sandbox {id} is reported {state}; its original Workspace records are retained for recovery"),
+            detail: SdkValue::map([
+                ("sandbox", SdkValue::text(id)),
+                ("container", SdkValue::text(container)),
+                ("containerStopped", SdkValue::Bool(stopped)),
+            ]),
+        };
+    }
     SdkRefusal {
         code: "NoSuchSandbox".to_owned(),
         message: format!(
@@ -481,10 +512,16 @@ pub(crate) fn reopen(args: &SdkValue) -> Result<Arc<SandboxState>> {
     }
     let project = registry::text(&value, "project")?;
     let container = registry::text(&value, "container")?;
+    let durable_identity = durable_identity(&value)?;
     let (docker, selector, request) = runtime(&value)?;
     let runtime = Sandbox::reopen(docker, selector, request).map_err(|failure| {
         if failure.container_gone() || failure.container_stopped() {
-            gone(id, container, failure.container_stopped())
+            gone(
+                id,
+                container,
+                failure.container_stopped(),
+                durable_identity.is_some(),
+            )
         } else {
             failed(failure)
         }
@@ -503,6 +540,7 @@ pub(crate) fn reopen(args: &SdkValue) -> Result<Arc<SandboxState>> {
         // a record from before #373 has no name
         name: value.get_text("name").unwrap_or_default().to_owned(),
         max_workspaces: crate::sandbox::workspace_capacity(&value)?,
+        durable_identity,
         directory,
         runtime,
         identity: CommandIdentity { uid: 501, gid: 20 },
