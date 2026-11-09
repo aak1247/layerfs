@@ -24,3 +24,4 @@ blake3 = { version = "=1.8.5", default-features = false }
 
 [dev-dependencies]
 layerfs-project = { path = "../layerfs-project" }
+rusqlite = { version = "=0.40.2" }

@@ -210,6 +210,7 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     discovery.visit(|record| records.push(record)).unwrap();
     records.sort_by_key(|record| record.workspace.to_bytes());
     assert_eq!(records.len(), ITEMS.len());
+    let mut minimum_namespace = 3;
     for record in records {
         let workspace_id = record.workspace;
         let identity = workspace_id.to_bytes()[0];
@@ -227,13 +228,16 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
             old_namespace,
         )
         .is_err());
-        let (owner, snapshot) = Owner::recover_recorded(
+        let (owner, snapshot) = Owner::recover_recorded_next(
             &path,
             ProfileConfig::default(),
             [identity; 32],
-            old_namespace + 2,
+            minimum_namespace,
         )
         .unwrap();
+        let recovered_namespace = owner.client().bound_route().unwrap().namespace();
+        assert!(recovered_namespace >= minimum_namespace && recovered_namespace > old_namespace);
+        minimum_namespace = recovered_namespace.checked_add(1).unwrap();
         let client = roster.adopt_durable(owner).unwrap();
         let workspace = store
             .bind_durable(

@@ -8,10 +8,10 @@ use layerfs_content::filesystem::PathName;
 use layerfs_daemon::{
     bootstrap::open_store,
     store::{BindRequest, BoundWorkspace, CommitOptions},
-    Owner, OwnerConfig,
+    Owner, OwnerConfig, OwnerError,
 };
 use layerfs_history::WorkspaceId;
-use layerfs_overlay::ProfileConfig;
+use layerfs_overlay::{OverlayError, ProfileConfig};
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
 use layerfs_workspace::{Operation, Outcome, Position, Time};
@@ -216,14 +216,95 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
         Owner::recover_recorded(&path, ProfileConfig::default(), [42; 32], 3).unwrap();
     assert_eq!(recorded, installed);
     let reopened = store
-        .bind_durable(reopened_owner.client(), request, recorded)
+        .bind_durable(reopened_owner.client(), request.clone(), recorded)
         .unwrap()
         .workspace;
     assert_eq!(read(&reopened, "file-000000"), ours);
     assert_eq!(read(&reopened, "file-000001"), theirs);
-    reopened.close().unwrap();
     drop(reopened);
+    store.close_reader(identity).unwrap();
     reopened_owner.stop().unwrap();
+    assert!(Owner::recover_recorded_next(&path, ProfileConfig::default(), [42; 32], 0).is_err());
+    let (later, snapshot) =
+        Owner::recover_recorded_next(&path, ProfileConfig::default(), [42; 32], 10).unwrap();
+    assert_eq!(later.client().bound_route().unwrap().namespace(), 10);
+    assert_eq!(snapshot, installed);
+    later.stop().unwrap();
+    let (last, snapshot) =
+        Owner::recover_recorded_next(&path, ProfileConfig::default(), [42; 32], 1).unwrap();
+    assert_eq!(last.client().bound_route().unwrap().namespace(), 11);
+    let final_binding = store
+        .bind_durable(last.client(), request, snapshot)
+        .unwrap()
+        .workspace;
+    assert_eq!(read(&final_binding, "file-000000"), ours);
+    final_binding.close().unwrap();
+    drop(final_binding);
+    last.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn legacy_binding_requires_external_namespace_freshness() {
+    let fixture = support::Fixture::new(1, "durable-bind-legacy");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let snapshot = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let identity = WorkspaceId::from_authority([42; 32]).unwrap();
+    let owner = Owner::create_durable(spec(&path, snapshot.effective_root.to_bytes())).unwrap();
+    let binding = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: identity,
+                branch: fixture.branch,
+            },
+            snapshot.clone(),
+        )
+        .unwrap()
+        .workspace;
+    drop(binding);
+    store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch("DROP TABLE durable_route; PRAGMA user_version=40;")
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        Owner::recover_recorded_next(&path, ProfileConfig::default(), [42; 32], 2),
+        Err(OwnerError::Overlay(OverlayError::Invalid(
+            "durable namespace freshness is not recorded"
+        )))
+    ));
+    let (legacy, recovered) =
+        Owner::recover_recorded(&path, ProfileConfig::default(), [42; 32], 2).unwrap();
+    assert_eq!(recovered, snapshot);
+    assert_eq!(legacy.client().bound_route().unwrap().namespace(), 2);
+    legacy.stop().unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 40);
+    drop(connection);
     drop(store);
     fixture.cleanup();
 }

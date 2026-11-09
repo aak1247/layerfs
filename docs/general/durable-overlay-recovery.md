@@ -58,6 +58,10 @@ authority and scope.
 requiring an external root, but still requires the independently known file
 path and Workspace identity. The resulting snapshot must pass Store binding
 and the caller's authorization and old-owner fencing checks.
+`Owner::recover_recorded_next` also selects a namespace greater than the
+schema-41 high-water mark while holding the original file lease. Its caller
+supplies a minimum and must serialize it with all other live Workspace routes;
+legacy schemas lack this evidence and are refused by that method.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. It is not yet wired

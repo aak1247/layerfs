@@ -67,10 +67,11 @@ their overlays, mounted both, wrote different bytes as an unprivileged user and
 synchronized them. It killed and reaped the original daemon, detached its old
 mounts, reopened the catalog against the same Store catalog identity and
 incarnation, discovered the two overlay filenames from its records and manually
-rebound and remounted them. The old tokens were rejected and the separate bytes
-survived. The test-only container used `/dev/fuse`, CAP_SYS_ADMIN and unconfined
-AppArmor and seccomp, without network or a Docker socket. The runner output,
+selected fresh namespaces, rebound and remounted them. The old tokens were
+rejected and the separate bytes survived. The test-only container used
+`/dev/fuse`, CAP_SYS_ADMIN and unconfined AppArmor and seccomp, without network
+or a Docker socket. The runner output,
 exit status, image and source hashes are under
-`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-multi-fuse-final-20261109/`.
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-multi-next-20261109/`.
 This is a manually fenced, single-host process-loss test, not automatic daemon
 startup, container/Pod reconstruction, physical host power loss or scale qualification.

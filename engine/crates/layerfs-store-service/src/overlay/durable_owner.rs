@@ -100,6 +100,30 @@ impl Owner {
         identity: [u8; 32],
         namespace: i64,
     ) -> Result<(Self, layerfs_history::BranchSnapshot), OwnerError> {
+        Self::recover_recorded_with(path, profile, identity, namespace, false)
+    }
+
+    /// Consumes a namespace greater than this Workspace's durable high-water
+    /// and no smaller than `minimum_namespace`. The caller serializes this
+    /// choice with other live owners and still fences old mounts and consumers.
+    /// An uncertain persistence result retains its original owner and cannot
+    /// be automatically retried. Legacy formats require an external proof.
+    pub fn recover_recorded_next(
+        path: &Path,
+        profile: ProfileConfig,
+        identity: [u8; 32],
+        minimum_namespace: i64,
+    ) -> Result<(Self, layerfs_history::BranchSnapshot), OwnerError> {
+        Self::recover_recorded_with(path, profile, identity, minimum_namespace, true)
+    }
+
+    fn recover_recorded_with(
+        path: &Path,
+        profile: ProfileConfig,
+        identity: [u8; 32],
+        namespace: i64,
+        choose_next: bool,
+    ) -> Result<(Self, layerfs_history::BranchSnapshot), OwnerError> {
         let spec = DurableWorkspace {
             path,
             profile,
@@ -109,6 +133,11 @@ impl Owner {
         };
         let incarnation = admission(&spec)?;
         let db = Overlay::recover_durable(path, profile, identity).map_err(OwnerError::Overlay)?;
+        if choose_next && db.profile().schema_version != 41 {
+            return Err(OwnerError::Overlay(OverlayError::Invalid(
+                "durable namespace freshness is not recorded",
+            )));
+        }
         let bytes =
             db.durable_binding()
                 .map_err(OwnerError::Overlay)?
@@ -123,6 +152,18 @@ impl Owner {
                 "durable binding root",
             )));
         }
+        let namespace =
+            if choose_next {
+                let previous = db.durable_namespace().map_err(OwnerError::Overlay)?.ok_or(
+                    OwnerError::Overlay(OverlayError::Invalid("durable namespace is absent")),
+                )?;
+                previous
+                    .checked_add(1)
+                    .ok_or(OwnerError::IdentityExhausted)?
+                    .max(namespace)
+            } else {
+                namespace
+            };
         if db.profile().schema_version == 41 {
             db.advance_durable_namespace(namespace)
                 .map_err(OwnerError::Overlay)?;
