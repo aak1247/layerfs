@@ -455,8 +455,9 @@ fixtures, examples and tools do not contribute to production LOC.
 - `Overlay::create_durable` and `recover_durable` implement a separate Linux
   DELETE/FULL database boundary, including transactional lifecycle state and
   an exclusive owner lease. Conservative reopen refuses unresolved capture,
-  unsafe cleanup or volatile ownership. Ready shrink-cleanup rows can resume
-  through ordinary bounded maintenance. This is not daemon/FUSE mount recovery; the
+  unsafe cleanup or volatile ownership. Ready shrink-cleanup rows and ready
+  retirement of an installed generation with a matching durable receipt can
+  resume through ordinary bounded maintenance. This is not daemon/FUSE mount recovery; the
   caller must fence the old execution and reconcile external outcomes. See
   [durable overlay](../docs/general/durable-overlay-recovery.md).
 - Sync is permitted for an explicitly durable database. Do not add

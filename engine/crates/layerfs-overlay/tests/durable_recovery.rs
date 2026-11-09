@@ -243,6 +243,93 @@ fn durable_binding_never_follows_an_unrecorded_install() {
 }
 
 #[test]
+fn durable_overlay_resumes_receipted_retirement_without_losing_new_writes() {
+    for partial in [false, true] {
+        let fixture = Fixture::new();
+        let db = create(&fixture.path());
+        db.initialize_durable_binding(ROOT, b"original snapshot")
+            .unwrap();
+        let source = db.acquire_base_source(1).unwrap();
+        let mut file = PayloadFile::new(&db, source, 9, Vec::new());
+        file.write(0, b"the captured generation");
+        db.release_base_source(source).unwrap();
+        let capture = db.capture().unwrap();
+        db.install_recorded(capture, [18; 32], b"installed snapshot")
+            .unwrap();
+        put(&db);
+        assert!(!db.maintenance_idle().unwrap());
+        if partial {
+            assert!(db.maintain(MaintenanceCursor::default()).unwrap().is_some());
+        }
+        db.close_database().unwrap();
+
+        let db =
+            Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+        assert_eq!(
+            db.durable_binding().unwrap().unwrap(),
+            b"installed snapshot"
+        );
+        let mut cursor = MaintenanceCursor::default();
+        for _ in 0..64 {
+            match db.maintain(cursor).unwrap() {
+                Some(step) => cursor = step.cursor,
+                None => break,
+            }
+        }
+        assert!(db.maintenance_idle().unwrap());
+        assert_recovered_at(&db, [18; 32]);
+        db.close_database().unwrap();
+    }
+}
+
+#[test]
+fn durable_overlay_keeps_unreceipted_retirement_for_reconciliation() {
+    let fixture = Fixture::new();
+    let db = create(&fixture.path());
+    db.initialize_durable_binding(ROOT, b"original snapshot")
+        .unwrap();
+    let capture = db.capture().unwrap();
+    db.install(capture, [18; 32]).unwrap();
+    assert!(!db.maintenance_idle().unwrap());
+    db.close_database().unwrap();
+    assert!(matches!(
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY),
+        Err(OverlayError::Invalid(
+            "durable overlay requires reconciliation"
+        ))
+    ));
+    assert!(fixture.path().is_file());
+}
+
+#[test]
+fn durable_overlay_refuses_parked_or_wrong_retirement_targets() {
+    for update in [
+        "UPDATE cleanup_task SET ready=0 WHERE kind=3",
+        "UPDATE cleanup_task SET target=2 WHERE kind=3",
+        "UPDATE cleanup_task SET resource=1 WHERE kind=3",
+    ] {
+        let fixture = Fixture::new();
+        let db = create(&fixture.path());
+        db.initialize_durable_binding(ROOT, b"original snapshot")
+            .unwrap();
+        let capture = db.capture().unwrap();
+        db.install_recorded(capture, [18; 32], b"installed snapshot")
+            .unwrap();
+        db.close_database().unwrap();
+        let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+        assert_eq!(connection.execute(update, []).unwrap(), 1);
+        drop(connection);
+        assert!(matches!(
+            Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY),
+            Err(OverlayError::Invalid(
+                "durable overlay requires reconciliation"
+            ))
+        ));
+        assert!(fixture.path().is_file());
+    }
+}
+
+#[test]
 fn durable_overlay_retains_uncertain_capture_and_volatile_owners() {
     for capture in [false, true] {
         let fixture = Fixture::new();
@@ -619,15 +706,8 @@ fn durable_save_survives_vm_power_loss() {
             let capture = db.capture().unwrap();
             db.install_recorded(capture, [18; 32], b"vm installed snapshot")
                 .unwrap();
-            let mut cursor = MaintenanceCursor::default();
-            for _ in 0..32 {
-                match db.maintain(cursor).unwrap() {
-                    Some(step) => cursor = step.cursor,
-                    None => break,
-                }
-            }
-            assert!(db.maintenance_idle().unwrap());
             put(&db);
+            assert!(!db.maintenance_idle().unwrap());
             let size = fs::metadata(&path).unwrap().len();
             assert!(size > 0);
             eprintln!("LAYERFS_VM_ACK overlay_bytes={size}");
@@ -640,6 +720,15 @@ fn durable_save_survives_vm_power_loss() {
                 db.durable_binding().unwrap().unwrap(),
                 b"vm installed snapshot"
             );
+            assert_recovered_at(&db, [18; 32]);
+            let mut cursor = MaintenanceCursor::default();
+            for _ in 0..32 {
+                match db.maintain(cursor).unwrap() {
+                    Some(step) => cursor = step.cursor,
+                    None => break,
+                }
+            }
+            assert!(db.maintenance_idle().unwrap());
             assert_recovered_at(&db, [18; 32]);
             eprintln!("LAYERFS_VM_RECOVERED");
             std::thread::sleep(Duration::from_secs(60));

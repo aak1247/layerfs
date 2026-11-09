@@ -372,17 +372,39 @@ mod linux {
             return Err(OverlayError::Invalid("durable overlay integrity check"));
         }
         let (state, held) = read_state(&connection, &work)?;
-        let pending: bool = super::super::profile::readback(
-            &connection,
-            &work,
+        // Ready retirement is safe only for an installed generation with a
+        // matching recorded receipt. The caller still fences the old mount and
+        // validates that receipt against the same authorized Store first.
+        let bound = if profile.schema_version == 40 {
+            super::super::profile::readback(
+                &connection,
+                &work,
+                "SELECT EXISTS(SELECT 1 FROM durable_binding b JOIN durable_state s ON s.id=1 \
+                 WHERE b.id=1 AND b.recoverable=1 AND b.root=s.base_root)",
+                |r| r.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        let pending_sql = if bound {
             "SELECT EXISTS(SELECT 1 FROM fs_inode WHERE generation=-1)\
              OR EXISTS(SELECT 1 FROM fs_data WHERE generation=-1)\
              OR EXISTS(SELECT 1 FROM fs_data_ref WHERE generation=-1)\
              OR EXISTS(SELECT 1 FROM fs_truncate WHERE generation=-1)\
              OR EXISTS(SELECT 1 FROM commit_record)\
-             OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind NOT IN(4,5,12) OR ready<>1)",
-            |r| r.get(0),
-        )?;
+             OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind NOT IN(3,4,5,12) OR ready<>1 \
+                OR (kind=3 AND (resource<>0 OR target<=0 OR \
+                    target>(SELECT installed FROM durable_state WHERE id=1))))"
+        } else {
+            "SELECT EXISTS(SELECT 1 FROM fs_inode WHERE generation=-1)\
+             OR EXISTS(SELECT 1 FROM fs_data WHERE generation=-1)\
+             OR EXISTS(SELECT 1 FROM fs_data_ref WHERE generation=-1)\
+             OR EXISTS(SELECT 1 FROM fs_truncate WHERE generation=-1)\
+             OR EXISTS(SELECT 1 FROM commit_record)\
+             OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind NOT IN(4,5,12) OR ready<>1)"
+        };
+        let pending: bool =
+            super::super::profile::readback(&connection, &work, pending_sql, |r| r.get(0))?;
         if state.closed
             || state.captured.is_some()
             || state.consolidating.is_some()
@@ -393,7 +415,7 @@ mod linux {
                 "durable overlay requires reconciliation",
             ));
         }
-        // These ready shrink-cleanup rows are self-contained in the database;
+        // Only ready shrink cleanup and receipt-qualified retirement resume;
         // all other cleanup kinds remain fenced until separately qualified.
         let maintenance: bool = super::super::profile::readback(
             &connection,

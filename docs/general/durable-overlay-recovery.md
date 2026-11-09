@@ -66,8 +66,9 @@ Reopen checks the owner and database identities, SQLite profile, schema and
 `quick_check`. Process-local base-reader windows are not recreated. Reopen
 conservatively refuses a closed Workspace, an unresolved capture or fold, an
 orphan, volatile operation ownership, operation records or cleanup other than
-ready stale-cell/step/piece cleanup; all files remain in place. The safe
-shrink-cleanup rows remain available to ordinary bounded maintenance. The caller
+ready stale-cell/step/piece cleanup and ready retirement of an installed
+generation with a matching durable receipt; all files remain in place. These
+qualified cleanup rows remain available to ordinary bounded maintenance. The caller
 must separately prove the old mount and consumers have stopped, validate the
 base root against its authorized Store, and reconcile any unknown external operation before exposing
 the returned state. A released file lock alone does not establish those facts.
@@ -114,3 +115,13 @@ source respectively had SHA-256
 `c29c7c9bf6ccae38ea5b8cbdfd9d4bfca017c102b9ae12bc74542d6505c14b40`,
 `4886c9da03046e9a6dd590955f8c5509e0a60035e482b7055d55674b4f574bbd`, and
 `cf9121d29e851672fc35416e97be97c0d76cf319d2cca95057063d926d2f859b`.
+
+A further probe killed the writer with the receipted generation retirement
+still pending, then reopened the same disk, verified the new bytes and
+snapshot, completed bounded retirement and checked the bytes again. Its
+receipt is retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-overlay-vm-20261109-pending-retire/`;
+the probe SHA-256 was
+`d58c9ae5740e5cbce3ae827f5ebcb3d9765110d3076c95388c73e25a9f02420f`
+and `durable.rs` was
+`ac626d9823857db21b4e1622b6a4c7ef1dbddd1d436573903796c2c3bdaadea7`.
