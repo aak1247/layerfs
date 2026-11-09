@@ -21,7 +21,7 @@ mod types;
 mod unmount;
 pub use kernel::{KernelConfig, KernelServing};
 pub(crate) use observation::{reply_token, request_token};
-pub use registry::Service;
+pub use registry::{DurableRegistrationFailure, Service};
 pub(crate) use serve::answer_call;
 pub use serve::{ServeCause, ServeFailure, Served};
 pub use types::{Failure, KernelEvidence, KernelFailure, Success};

@@ -52,6 +52,8 @@ impl Owner {
     /// Reopens from the persisted snapshot when no external root is available.
     /// The returned snapshot still needs Store authorization and validation,
     /// and the caller must fence old mounts and reconcile unknown operations.
+    /// `namespace` must be fresh across daemon restarts, so an old control
+    /// token cannot address the recovered Workspace.
     pub fn recover_recorded(
         path: &Path,
         profile: ProfileConfig,

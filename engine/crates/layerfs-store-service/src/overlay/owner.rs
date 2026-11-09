@@ -528,10 +528,25 @@ impl OwnerClient {
             None => Ok(self.clone()),
         }
     }
+    pub(crate) fn same_workspace(&self, other: &Self) -> bool {
+        match (&self.context, &other.context) {
+            (Context::Workspace(left), Context::Workspace(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
     pub fn retire_namespace(&self, namespace: i64) -> Result<(), OwnerError> {
-        self.roster()
-            .ok_or(OwnerError::InvalidAdmission)?
-            .retire(namespace)
+        if let Some(pool) = self.roster() {
+            return pool.retire(namespace);
+        }
+        let shared = self.connection()?;
+        let route = self.bound_route()?;
+        if shared.durable_identity.is_none()
+            || route.namespace() != namespace
+            || !self.state(route)?.closed
+        {
+            return Err(OwnerError::InvalidAdmission);
+        }
+        self.close_connection()
     }
     /// One short hold of the Workspace lock with no SQL: the reply ticket
     /// validates engine, incarnation, generation and revision, and the release

@@ -57,6 +57,14 @@ impl BoundWorkspace {
     pub fn route(&self) -> layerfs_workspace::Route {
         self.workspace.route()
     }
+    /// True only for the exact in-process owner of this binding.
+    pub fn owned_by(&self, owner: &OwnerClient) -> bool {
+        self.owner.same_workspace(owner)
+    }
+    /// True only for the exact Store that authenticated this binding.
+    pub fn belongs_to(&self, store: &Arc<Store>) -> bool {
+        Arc::ptr_eq(&self.store, store)
+    }
 }
 impl StoreOperation {
     pub fn client_handle(&self) -> Arc<CanonicalClient> {

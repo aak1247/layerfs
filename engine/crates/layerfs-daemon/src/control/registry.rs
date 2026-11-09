@@ -34,6 +34,29 @@ pub struct Service {
     /// Absent for a control-only Service: Attach is then refused before effects.
     pub(super) kernel: Option<Arc<KernelServing>>,
 }
+/// A failed pre-effect registration retains the original bound Workspace.
+pub struct DurableRegistrationFailure {
+    pub cause: Failure,
+    pub workspace: Box<BoundWorkspace>,
+}
+impl std::fmt::Debug for DurableRegistrationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableRegistrationFailure")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for DurableRegistrationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "durable Workspace registration: {:?}",
+            self.cause
+        )
+    }
+}
+impl std::error::Error for DurableRegistrationFailure {}
 impl Service {
     /// Binds control to the already initialized owner and its configured capacity.
     pub fn new(store: Arc<Store>, owner: &Owner) -> Self {
@@ -51,6 +74,63 @@ impl Service {
             kernel: Some(kernel),
             ..Self::new(store, owner)
         }
+    }
+    /// Admits one already-authorized durable binding to ordinary control and
+    /// Attach. The caller must fence the old mount and consumers, reconcile
+    /// unknown operations, and use a namespace fresh across daemon restarts.
+    /// A refusal retains the original binding and creates no registry entry.
+    pub fn register_durable(
+        &self,
+        workspace: BoundWorkspace,
+    ) -> Result<WorkspaceToken, Box<DurableRegistrationFailure>> {
+        let refuse = |cause, workspace| {
+            Box::new(DurableRegistrationFailure {
+                cause,
+                workspace: Box::new(workspace),
+            })
+        };
+        if !workspace.owned_by(&self.owner) || !workspace.belongs_to(&self.store) {
+            return Err(refuse(
+                Failure::Rejected(ControlCode::Invalid, "Workspace authority mismatch"),
+                workspace,
+            ));
+        }
+        let snapshot = match workspace.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(cause) => return Err(refuse(Failure::Workspace(cause), workspace)),
+        };
+        let token = WorkspaceToken {
+            workspace: workspace.identity(),
+            namespace: workspace.route().namespace(),
+        };
+        let mut entries = match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(_) => return Err(refuse(Failure::Poisoned, workspace)),
+        };
+        if entries.contains_key(&token.workspace) {
+            return Err(refuse(
+                Failure::Rejected(ControlCode::Busy, "Workspace already admitted"),
+                workspace,
+            ));
+        }
+        if entries.len() >= self.capacity {
+            return Err(refuse(
+                Failure::Rejected(ControlCode::Capacity, "daemon Workspace capacity"),
+                workspace,
+            ));
+        }
+        entries.insert(
+            token.workspace,
+            Entry::Bound(Box::new(Binding {
+                kernel: Kernel::Unattached,
+                workspace: Arc::new(workspace),
+                snapshot,
+                activity: Activity::Idle,
+                epoch: 1,
+                published: None,
+            })),
+        );
+        Ok(token)
     }
     /// Retains the selected binding for ordinary local projection/operations.
     /// Terminal admission prevents new transfers; stale tokens never redirect.

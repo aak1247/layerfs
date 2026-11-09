@@ -2,9 +2,9 @@
 
 The Overlay crate exposes `Overlay::create_durable(path, config, identity)`
 and `Overlay::recover_durable(path, config, identity)` on Linux. This is a
-single-Workspace database primitive. The current daemon, SDK and mounted FUSE
-Workspaces still use the disposable overlay; these methods do not start a
-Sandbox or recover a mount.
+single-Workspace database primitive. The normal daemon application and SDK
+still mount disposable Workspaces; these methods do not start a Sandbox or
+automatically recover a mount.
 
 The caller supplies a stable, nonzero 32-byte Workspace identity and a private
 directory owned by the calling user. The directory must be on ext4, XFS or
@@ -24,7 +24,7 @@ fresh random internal route incarnation so a route from the old owner cannot
 select the recovered connection. Stopping the owner retains the files. These
 APIs do not persist a roster, authenticate the caller, fence old FUSE mounts,
 reconcile Commit outcomes or recover an SDK control token. They do not yet
-replace the disposable owner used for a mounted Workspace.
+replace the normal disposable roster used for mounted Workspaces.
 
 `Store::bind_durable` attaches such an owner to its exact Branch snapshot. It
 checks the Workspace identity, the original Layer and Commit roots against the
@@ -48,6 +48,15 @@ scope.
 requiring an external root, but still requires the independently known file
 path and Workspace identity. The resulting snapshot must pass Store binding
 and the caller's authorization and old-owner fencing checks.
+
+An explicitly assembled daemon `Service` can register one already bound
+durable owner and use its ordinary control and FUSE Attach path. Registration
+checks the exact owner and Store, and a refusal returns the original binding.
+The caller selects a fresh control namespace and fences the prior process,
+mount and consumers; this path is not a durable roster or automatic restart.
+Terminal unmount closes the database but retains its files. The current FUSE
+FSYNC and FSYNCDIR handlers still answer ENOSYS, so this is not an `fsync`
+durability claim.
 
 The durable profile is SQLite DELETE/FULL/EXCLUSIVE. Each changed Workspace
 generation, base root, revision, dirty count and volatile-custody flag is
@@ -86,8 +95,7 @@ quarantines the connection, and that a fresh process sees the prior complete
 transaction or an unresolved capture with its matching prior snapshot. The VM
 harness can exercise the overlay with `--probe-kind
 overlay`; this proves only the database path on its guest filesystem, not FUSE
-`fsync`, mount recovery, Docker/Kubernetes integration or physical host power
-loss.
+`fsync`, Sandbox recovery, Kubernetes integration or physical host power loss.
 
 On 2026-11-09 the overlay VM probe passed on QEMU 6.2.0/KVM with a Linux
 5.15.0-202 guest and an ext4 raw disk (`cache=none`): the first guest reported
@@ -125,3 +133,15 @@ the probe SHA-256 was
 `d58c9ae5740e5cbce3ae827f5ebcb3d9765110d3076c95388c73e25a9f02420f`
 and `durable.rs` was
 `ac626d9823857db21b4e1622b6a4c7ef1dbddd1d436573903796c2c3bdaadea7`.
+
+An isolated Docker test on 2026-11-09 used a manually assembled daemon
+Service, one durable owner and a disposable test Store. An unprivileged
+command wrote through a real FUSE mount; the test killed and reaped the daemon
+process, detached its old mount, recovered the recorded binding under a new
+namespace and remounted it. An unprivileged command read the original bytes and
+appended new bytes. The old control token was rejected. This is a process-loss
+and manual remount test, not container recreation, a durable global Store,
+physical power loss, Kubernetes or an `fsync` guarantee. The test runner,
+source and image hashes, kernel version, output and exit status are retained
+under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-process-loss-20261109-final/`.

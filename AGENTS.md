@@ -49,11 +49,13 @@ explicitly and preserve historical receipts and their original verdicts. Never
 infer that an old Disposable Store became Durable just by opening it under a
 different connection setting.
 
-Mounted Workspaces still use the separate MEMORY/OFF/EXCLUSIVE overlay. The
-Overlay crate also provides a Linux durable database and conservative reopen
-boundary; it is not yet connected to mount or daemon recovery. A Durable global
-Store alone does not make uncommitted Workspace writes durable. Do not route
-user work to a path that claims recovery until the overlay, lifecycle and FUSE
+The normal daemon application still mounts MEMORY/OFF/EXCLUSIVE Workspaces.
+The Overlay crate provides a Linux durable database and conservative reopen
+boundary; an explicitly assembled single-owner daemon Service can attach and
+manually remount it after the caller fences the old process and mount. This is
+not a durable roster or automatic Sandbox recovery. A Durable global Store
+alone does not make uncommitted Workspace writes durable. Do not route user
+work to a path that claims full recovery until the overlay, lifecycle and FUSE
 synchronization contracts are implemented and verified together.
 
 ## LayerFS mental model

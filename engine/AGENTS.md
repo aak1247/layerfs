@@ -457,8 +457,10 @@ fixtures, examples and tools do not contribute to production LOC.
   an exclusive owner lease. Conservative reopen refuses unresolved capture,
   unsafe cleanup or volatile ownership. Ready shrink-cleanup rows and ready
   retirement of an installed generation with a matching durable receipt can
-  resume through ordinary bounded maintenance. This is not daemon/FUSE mount recovery; the
-  caller must fence the old execution and reconcile external outcomes. See
+  resume through ordinary bounded maintenance. A manually assembled
+  single-owner Service can register and attach a recovered binding, but normal
+  daemon/Sandbox recovery is not wired. The caller must fence the old execution
+  and reconcile external outcomes. See
   [durable overlay](../docs/general/durable-overlay-recovery.md).
 - Sync is permitted for an explicitly durable database. Do not add
   fsync/fdatasync/sync_data/sync_all on disposable Workspace backing. Memory
