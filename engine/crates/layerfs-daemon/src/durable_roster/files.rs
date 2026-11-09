@@ -225,7 +225,16 @@ impl Roster {
             }
             None => return Err(RosterError::Invalid("unknown roster Workspace")),
         };
-        let closing = Closing { record, token };
+        let attempt = self
+            .head
+            .count
+            .checked_add(1)
+            .ok_or(RosterError::Invalid("roster sequence exhausted"))?;
+        let closing = Closing {
+            record,
+            token,
+            attempt,
+        };
         if self
             .checked_marker(&Event::Closed(closing).file_name())?
             .is_some()
@@ -252,6 +261,24 @@ impl Roster {
             _ => return Err(self.retain(RosterError::Invalid("roster close intent"), false)),
         }
         self.append(Event::Closed(closing))?;
+        self.pending_close = None;
+        Ok(())
+    }
+
+    /// Cancel only after the Service has proven the original attempt had no
+    /// terminal effect; this is not an authorization to retry an unknown one.
+    pub(crate) fn cancel_close(&mut self, closing: Closing) -> Result<(), RosterError> {
+        self.ensure()?;
+        if self.pending_close != Some(closing) {
+            return Err(RosterError::Invalid(
+                "close cancellation does not match intent",
+            ));
+        }
+        match self.checked_marker(&Event::Closing(closing).file_name())? {
+            Some((_, Event::Closing(saved))) if saved == closing => {}
+            _ => return Err(self.retain(RosterError::Invalid("roster close intent"), false)),
+        }
+        self.append(Event::Cancelled(closing))?;
         self.pending_close = None;
         Ok(())
     }
@@ -413,14 +440,17 @@ impl Roster {
                 Event::Created(_) => {}
                 Event::Closing(closing) => {
                     let created = self.marker(&Event::Created(closing.record).file_name())?;
+                    let terminal = self.marker(&Event::Closed(closing).file_name())?;
                     if pending.is_some()
+                        || (closing.attempt != 0 && closing.attempt != next.count)
                         || !matches!(created, Some((sequence, Event::Created(record))) if sequence < next.count && record == closing.record)
+                        || matches!(terminal, Some((sequence, _)) if sequence < next.count)
                     {
                         return Err(RosterError::Invalid("roster close ordering"));
                     }
                     pending = Some(closing);
                 }
-                Event::Closed(closing) => {
+                Event::Closed(closing) | Event::Cancelled(closing) => {
                     let intent = self.marker(&Event::Closing(closing).file_name())?;
                     if pending != Some(closing)
                         || !matches!(intent, Some((sequence, Event::Closing(saved))) if sequence < next.count && saved == closing)
@@ -447,7 +477,9 @@ impl Roster {
             if !text.starts_with("workspace-")
                 || !(text.ends_with(".record")
                     || text.ends_with(".closing")
-                    || text.ends_with(".closed"))
+                    || text.ends_with(".closed")
+                    || text.contains(".closing-")
+                    || text.contains(".cancelled-"))
             {
                 return Err(RosterError::Invalid("roster record name"));
             }

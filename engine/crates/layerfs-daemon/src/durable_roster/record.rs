@@ -8,6 +8,9 @@ const OWNER_MAGIC: &[u8; 8] = b"LFSROST1";
 const RECORD_MAGIC: &[u8; 8] = b"LFSWORK1";
 const CLOSING_MAGIC: &[u8; 8] = b"LFSCLSG1";
 const CLOSED_MAGIC: &[u8; 8] = b"LFSCLOS1";
+const CLOSING_V2: &[u8; 8] = b"LFSCLSG2";
+const CLOSED_V2: &[u8; 8] = b"LFSCLOS2";
+const CANCELLED_V2: &[u8; 8] = b"LFSCANC2";
 pub(super) const OWNER_LEN: usize = 8 + 32 + 32 + 32;
 pub(super) const RECORD_LEN: usize = 8 + 32 + 32 + 32 + 17 + 32;
 
@@ -60,6 +63,8 @@ impl WorkspaceRecord {
 pub struct Closing {
     pub record: WorkspaceRecord,
     pub token: WorkspaceToken,
+    /// Original intent sequence; zero identifies a legacy v1 close.
+    pub attempt: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,16 +72,28 @@ pub(super) enum Event {
     Created(WorkspaceRecord),
     Closing(Closing),
     Closed(Closing),
+    Cancelled(Closing),
 }
 
 impl Event {
     pub(super) fn file_name(self) -> String {
-        let (workspace, suffix) = match self {
-            Self::Created(record) => (record.workspace, "record"),
-            Self::Closing(closing) => (closing.record.workspace, "closing"),
-            Self::Closed(closing) => (closing.record.workspace, "closed"),
-        };
-        format!("{}.{suffix}", identity_name(workspace))
+        match self {
+            Self::Created(record) => format!("{}.record", identity_name(record.workspace)),
+            Self::Closing(closing) if closing.attempt == 0 => {
+                format!("{}.closing", identity_name(closing.record.workspace))
+            }
+            Self::Closing(closing) => format!(
+                "{}.closing-{:016x}",
+                identity_name(closing.record.workspace),
+                closing.attempt
+            ),
+            Self::Closed(closing) => format!("{}.closed", identity_name(closing.record.workspace)),
+            Self::Cancelled(closing) => format!(
+                "{}.cancelled-{:016x}",
+                identity_name(closing.record.workspace),
+                closing.attempt
+            ),
+        }
     }
 }
 
@@ -102,25 +119,43 @@ pub(super) fn owner_bytes(authority: Authority) -> Result<Vec<u8>, RosterError> 
 
 pub(super) fn record_bytes(authority: Authority, event: Event) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(RECORD_LEN);
-    let (magic, record, namespace) = match event {
-        Event::Created(record) => (RECORD_MAGIC, record, None),
-        Event::Closing(closing) => (CLOSING_MAGIC, closing.record, Some(closing.token.namespace)),
-        Event::Closed(closing) => (CLOSED_MAGIC, closing.record, Some(closing.token.namespace)),
+    let (magic, record, closing, v2) = match event {
+        Event::Created(record) => (RECORD_MAGIC, record, None, false),
+        Event::Closing(closing) if closing.attempt == 0 => {
+            (CLOSING_MAGIC, closing.record, Some(closing), false)
+        }
+        Event::Closed(closing) if closing.attempt == 0 => {
+            (CLOSED_MAGIC, closing.record, Some(closing), false)
+        }
+        Event::Closing(closing) => (CLOSING_V2, closing.record, Some(closing), true),
+        Event::Closed(closing) => (CLOSED_V2, closing.record, Some(closing), true),
+        Event::Cancelled(closing) => (CANCELLED_V2, closing.record, Some(closing), true),
     };
     bytes.extend_from_slice(magic);
-    if let Some(namespace) = namespace {
+    if let Some(closing) = closing {
+        let namespace = closing.token.namespace;
         // Lifecycle events retain the original fixed width and bind the exact
         // namespace to both authorities and the immutable Workspace/Branch.
         bytes.extend_from_slice(&namespace.to_be_bytes());
+        if v2 {
+            bytes.extend_from_slice(&closing.attempt.to_be_bytes());
+        }
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"layerfs/durable-roster-close/v1\0");
+        hasher.update(if v2 {
+            b"layerfs/durable-roster-close/v2\0"
+        } else {
+            b"layerfs/durable-roster-close/v1\0"
+        });
         hasher.update(magic);
         hasher.update(&authority.sandbox);
         hasher.update(&authority.store);
         hasher.update(record.workspace.as_slice());
         hasher.update(record.branch.as_slice());
         hasher.update(&namespace.to_be_bytes());
-        bytes.extend_from_slice(&hasher.finalize().as_bytes()[..24]);
+        if v2 {
+            hasher.update(&closing.attempt.to_be_bytes());
+        }
+        bytes.extend_from_slice(&hasher.finalize().as_bytes()[..if v2 { 16 } else { 24 }]);
     } else {
         bytes.extend_from_slice(&authority.sandbox);
     }
@@ -154,17 +189,30 @@ pub(super) fn decode_record(authority: Authority, bytes: &[u8]) -> Result<Event,
         if namespace <= 0 {
             return Err(RosterError::Invalid("roster closing namespace"));
         }
+        let legacy = &bytes[..8] == CLOSING_MAGIC || &bytes[..8] == CLOSED_MAGIC;
+        let attempt = if legacy {
+            0
+        } else {
+            u64::from_be_bytes(bytes[16..24].try_into().expect("fixed attempt"))
+        };
         let closing = Closing {
             record,
             token: WorkspaceToken {
                 workspace,
                 namespace,
             },
+            attempt,
         };
         if &bytes[..8] == CLOSING_MAGIC {
             Event::Closing(closing)
         } else if &bytes[..8] == CLOSED_MAGIC {
             Event::Closed(closing)
+        } else if &bytes[..8] == CLOSING_V2 && attempt != 0 {
+            Event::Closing(closing)
+        } else if &bytes[..8] == CLOSED_V2 && attempt != 0 {
+            Event::Closed(closing)
+        } else if &bytes[..8] == CANCELLED_V2 {
+            Event::Cancelled(closing)
         } else {
             return Err(RosterError::Invalid("roster record version"));
         }

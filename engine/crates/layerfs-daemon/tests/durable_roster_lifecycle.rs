@@ -114,13 +114,55 @@ fn pending_close_blocks_discovery_until_the_exact_receipt_is_recorded() {
     ));
     roster.record(record(3)).unwrap();
     drop(roster);
-    for suffix in [".record", ".closing", ".closed"] {
+    for suffix in [".record", ".closed"] {
         assert!(marker(&fixture.0, record(1), suffix).is_file());
     }
+    assert!(marker(
+        &fixture.0,
+        record(1),
+        &format!(".closing-{:016x}", closing.attempt)
+    )
+    .is_file());
     let mut roster = Roster::open(&fixture.0, AUTHORITY).unwrap();
     let mut active = Vec::new();
     roster.visit(|value| active.push(value)).unwrap();
     assert_eq!(active, vec![record(2), record(3)]);
+}
+
+#[test]
+fn legacy_pending_close_remains_readable_before_new_attempts() {
+    let fixture = Fixture::new();
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/durable_roster_v1_pending");
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() || entry.file_name() == "README.md" {
+            continue;
+        }
+        let destination = fixture.0.join(entry.file_name());
+        fs::copy(entry.path(), &destination).unwrap();
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut roster = Roster::open(&fixture.0, AUTHORITY).unwrap();
+    let legacy = roster.pending_close().unwrap().unwrap();
+    assert_eq!(legacy.record, record(4));
+    assert_eq!(legacy.token, token(4, 88));
+    assert_eq!(legacy.attempt, 0);
+    roster
+        .finish_close(&Reply::Unmounted(legacy.token))
+        .unwrap();
+    roster.record(record(5)).unwrap();
+    let current = roster.begin_close(token(5, 89)).unwrap();
+    assert!(current.attempt > 0);
+    roster
+        .finish_close(&Reply::Unmounted(current.token))
+        .unwrap();
+    drop(roster);
+    let mut roster = Roster::open(&fixture.0, AUTHORITY).unwrap();
+    assert_eq!(roster.pending_close().unwrap(), None);
+    roster
+        .visit(|_| panic!("both Workspaces were terminally closed"))
+        .unwrap();
 }
 
 #[test]
@@ -266,10 +308,16 @@ fn failed_close_intent_directory_sync_retains_unknown_write_and_lock() {
         .unwrap();
     assert!(status.success());
     assert!(!fs::read(fixture.0.join("sync-failed")).unwrap().is_empty());
-    assert!(marker(&catalog, record(6), ".closing").is_file());
     assert!(!marker(&catalog, record(6), ".closed").exists());
     let mut roster = Roster::open(&catalog, AUTHORITY).unwrap();
-    assert_eq!(roster.pending_close().unwrap().unwrap().token, token(6, 9));
+    let pending = roster.pending_close().unwrap().unwrap();
+    assert_eq!(pending.token, token(6, 9));
+    assert!(marker(
+        &catalog,
+        record(6),
+        &format!(".closing-{:016x}", pending.attempt)
+    )
+    .is_file());
     assert!(matches!(
         roster.visit(|_| panic!("must not recover")),
         Err(RosterError::PendingClose(_))

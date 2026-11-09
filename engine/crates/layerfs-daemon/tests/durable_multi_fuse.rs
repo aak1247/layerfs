@@ -10,9 +10,7 @@ use layerfs_bridge::control::{
 };
 use layerfs_daemon::{
     bootstrap::open_store,
-    control::{
-        CatalogRecoveryCause, Failure, KernelConfig, KernelServing, RecordedCloseFailure, Service,
-    },
+    control::{Failure, KernelConfig, KernelServing, RecordedCloseFailure, Service},
     durable_roster::{Authority, Roster, RosterError, WorkspaceRecord},
     store::BindRequest,
     Owner, OwnerConfig,
@@ -33,6 +31,7 @@ use std::{
 
 const CHILD: &str = "LAYERFS_DURABLE_MULTI_CHILD";
 const BUSY_CHILD: &str = "LAYERFS_DURABLE_CLOSE_BUSY_CHILD";
+const CANCEL_FAIL: &str = "LAYERFS_DURABLE_CLOSE_CANCEL_FAIL";
 const ITEMS: [(u8, i64, &str); 2] = [(51, 1, "first"), (52, 2, "second")];
 
 struct ChildGuard(Child);
@@ -192,19 +191,59 @@ fn busy_child(directory: &Path) {
     let token = service.register_recorded(&mut discovery, binding).unwrap();
     let mount = attach(&service, token);
     let held = fs::File::open(mount.join("file-000000")).unwrap();
-    let failure = service
-        .unmount_recorded(
-            &mut discovery,
-            UnmountControl {
-                token,
-                discard: true,
-            },
+    if std::env::var_os(CANCEL_FAIL).is_some() {
+        let failure = service
+            .unmount_recorded(
+                &mut discovery,
+                UnmountControl {
+                    token,
+                    discard: true,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(failure, RecordedCloseFailure::Cancellation { cause: RosterError::Uncertain(_), original }
+            if matches!(*original, Failure::Kernel(ref cause) if cause.code == ControlCode::Busy && cause.phase == "unmount:kernel"))
+        );
+        let Reply::Status(status) = service
+            .execute_control(&Request::Status(token))
+            .unwrap()
+            .reply
+        else {
+            panic!("missing status")
+        };
+        assert_eq!(status.activity, Activity::Closing);
+        assert!(service.operation(token).is_err());
+        assert!(matches!(
+            discovery.pending_close(),
+            Err(RosterError::Retained(_))
+        ));
+        drop(held);
+        fs::write(
+            directory.join("busy-ack"),
+            b"cancellation sync uncertain; original Busy retained",
         )
-        .unwrap_err();
-    assert!(
-        matches!(failure, RecordedCloseFailure::Control { token: saved, cause: Failure::Kernel(ref cause) }
-        if saved == token && cause.code == ControlCode::Busy && cause.phase == "unmount:kernel")
-    );
+        .unwrap();
+        std::thread::sleep(Duration::from_secs(90));
+        panic!("parent did not terminate the old owner");
+    }
+    for _ in 0..2 {
+        let failure = service
+            .unmount_recorded(
+                &mut discovery,
+                UnmountControl {
+                    token,
+                    discard: true,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(failure, RecordedCloseFailure::Refused(Failure::Kernel(ref cause))
+            if cause.code == ControlCode::Busy && cause.phase == "unmount:kernel")
+        );
+        assert_eq!(discovery.pending_close().unwrap(), None);
+        assert_eq!(discovery.lookup(workspace).unwrap(), Some(record));
+    }
     let Reply::Status(status) = service
         .execute_control(&Request::Status(token))
         .unwrap()
@@ -212,25 +251,28 @@ fn busy_child(directory: &Path) {
     else {
         panic!("missing status")
     };
-    assert_eq!(status.activity, Activity::Closing);
-    assert!(service.operation(token).is_err());
-    assert_eq!(discovery.pending_close().unwrap().unwrap().token, token);
-    assert!(matches!(
-        service.unmount_recorded(
+    assert_eq!(status.activity, Activity::Idle);
+    drop(service.operation(token).unwrap());
+    let cancellations = fs::read_dir(directory.join("catalog"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".cancelled-"))
+        .count();
+    assert_eq!(cancellations, 2);
+    drop(held);
+    let done = service
+        .unmount_recorded(
             &mut discovery,
             UnmountControl {
                 token,
-                discard: true
-            }
-        ),
-        Err(RecordedCloseFailure::Discovery(RosterError::PendingClose(
-            _
-        )))
-    ));
-    drop(held);
+                discard: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(done.reply, Reply::Unmounted(token));
     fs::write(
         directory.join("busy-ack"),
-        b"original close and owner retained",
+        b"busy refusals cancelled and explicit close completed",
     )
     .unwrap();
     std::thread::sleep(Duration::from_secs(90));
@@ -239,7 +281,7 @@ fn busy_child(directory: &Path) {
 
 #[test]
 #[ignore = "requires a dedicated Linux container with CAP_SYS_ADMIN and /dev/fuse"]
-fn recorded_busy_close_keeps_its_original_intent_after_process_loss() {
+fn recorded_busy_close_allows_a_later_explicit_close() {
     if let Some(directory) = std::env::var_os(BUSY_CHILD) {
         busy_child(Path::new(&directory));
         return;
@@ -260,7 +302,7 @@ fn recorded_busy_close_keeps_its_original_intent_after_process_loss() {
         Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "recorded_busy_close_keeps_its_original_intent_after_process_loss",
+                "recorded_busy_close_allows_a_later_explicit_close",
                 "--ignored",
             ])
             .env(BUSY_CHILD, directory)
@@ -276,18 +318,16 @@ fn recorded_busy_close_keeps_its_original_intent_after_process_loss() {
     }
     old.0.kill().unwrap();
     assert!(!old.0.wait().unwrap().success());
-    nix::mount::umount2(&mount, nix::mount::MntFlags::MNT_DETACH).unwrap();
-    fs::remove_dir(&mount).unwrap();
     cleanup.0.clear();
     let store = open(fixture.config.clone());
     let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
     let mut discovery = Roster::open(&directory.join("catalog"), authority).unwrap();
-    let pending = discovery.pending_close().unwrap().unwrap();
-    assert_eq!(pending.token.workspace.to_bytes(), [53; 32]);
-    assert_eq!(pending.token.namespace, 1);
+    assert_eq!(discovery.pending_close().unwrap(), None);
+    let workspace = WorkspaceId::from_authority([53; 32]).unwrap();
+    assert_eq!(discovery.lookup(workspace).unwrap(), None);
     let roster = roster(&directory.join("busy-reader.sqlite"));
     let service = Service::new(store.clone(), &roster);
-    let failure = service
+    let recovered = service
         .recover_catalog(
             &mut discovery,
             &roster,
@@ -296,11 +336,106 @@ fn recorded_busy_close_keeps_its_original_intent_after_process_loss() {
             ProfileConfig::default(),
             2,
         )
-        .unwrap_err();
-    assert!(
-        matches!(failure.cause, CatalogRecoveryCause::Discovery(RosterError::PendingClose(saved)) if saved == pending)
+        .unwrap();
+    assert!(recovered.is_empty());
+    drop(service);
+    roster.stop().unwrap();
+    drop(discovery);
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+#[ignore = "requires a dedicated FUSE container and LAYERFS_TEST_SYNC_SHIM"]
+fn recorded_busy_cancellation_sync_failure_retains_the_original_refusal() {
+    if let Some(directory) = std::env::var_os(BUSY_CHILD) {
+        busy_child(Path::new(&directory));
+        return;
+    }
+    let shim = std::env::var_os("LAYERFS_TEST_SYNC_SHIM").expect("test-only sync shim");
+    let fixture = support::Fixture::new_durable(1, "durable-cancel-sync-failure");
+    let directory = &fixture.directory;
+    for name in ["durable", "catalog", "mounts"] {
+        fs::create_dir(directory.join(name)).unwrap();
+        fs::set_permissions(
+            directory.join(name),
+            fs::Permissions::from_mode(if name == "mounts" { 0o755 } else { 0o700 }),
+        )
+        .unwrap();
+    }
+    let mount = directory.join("mounts/1");
+    let mut cleanup = Mounts(vec![mount.clone()]);
+    let workspace = WorkspaceId::from_authority([53; 32]).unwrap();
+    let record = WorkspaceRecord {
+        workspace,
+        branch: fixture.branch,
+    };
+    let trigger = directory.join("catalog").join(
+        record
+            .overlay_name()
+            .replace(".sqlite", ".cancelled-0000000000000002"),
     );
-    assert!(failure.completed.is_empty());
+    let receipt = directory.join("sync-failed");
+    let mut old = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "recorded_busy_cancellation_sync_failure_retains_the_original_refusal",
+                "--ignored",
+            ])
+            .env(BUSY_CHILD, directory)
+            .env(CANCEL_FAIL, "1")
+            .env("LD_PRELOAD", shim)
+            .env(
+                "LAYERFS_TEST_DIR_SYNC_TARGET",
+                fs::canonicalize(directory.join("catalog")).unwrap(),
+            )
+            .env("LAYERFS_TEST_DIR_SYNC_TRIGGER", trigger)
+            .env("LAYERFS_TEST_DIR_SYNC_RECEIPT", &receipt)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !directory.join("busy-ack").exists() {
+        assert!(old.0.try_wait().unwrap().is_none(), "writer exited early");
+        assert!(Instant::now() < deadline, "writer did not acknowledge");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!fs::read(&receipt).unwrap().is_empty());
+    old.0.kill().unwrap();
+    assert!(!old.0.wait().unwrap().success());
+    nix::mount::umount2(&mount, nix::mount::MntFlags::MNT_DETACH).unwrap();
+    fs::remove_dir(&mount).unwrap();
+    cleanup.0.clear();
+    let store = open(fixture.config.clone());
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    let mut discovery = Roster::open(&directory.join("catalog"), authority).unwrap();
+    assert_eq!(discovery.pending_close().unwrap(), None);
+    assert_eq!(discovery.lookup(workspace).unwrap(), Some(record));
+    let roster = roster(&directory.join("cancel-reader.sqlite"));
+    let service = Service::new(store.clone(), &roster);
+    let recovered = service
+        .recover_catalog(
+            &mut discovery,
+            &roster,
+            &directory.join("durable"),
+            [8; 32],
+            ProfileConfig::default(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    let done = service
+        .unmount_recorded(
+            &mut discovery,
+            UnmountControl {
+                token: recovered[0],
+                discard: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(done.reply, Reply::Unmounted(recovered[0]));
     drop(service);
     roster.stop().unwrap();
     drop(discovery);

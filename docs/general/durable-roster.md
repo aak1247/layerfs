@@ -76,10 +76,13 @@ the provenance of that exact unmount's `Reply::Unmounted`, the caller may pass
 the reply to `Roster::finish_close`. Status, a disconnected process or a reply
 for another namespace is not a receipt. An interrupted or unknown close must
 be reconciled with independent evidence, never automatically retried or
-declared complete. A kernel Busy refusal is known to have made no terminal
-change, but currently still leaves an unresolved intent; safe cancellation and
-an explicit subsequent close are not implemented yet. The normal application
-daemon does not yet register catalog-backed bindings or call this close path.
+declared complete. A kernel Busy refusal proves that this attempt made no
+terminal change. The Service records that exact attempt's cancellation before
+making the Workspace available again; a subsequent unmount requires a new
+explicit request. If cancellation synchronization fails, the original Busy
+receipt and binding remain in custody. No other failure is treated as proof of
+no effect. The normal application daemon does not yet register catalog-backed
+bindings or call this close path.
 The caller must authenticate the Sandbox and physical Store, serialize access
 to the catalog, and retain the original Service and failure on an uncertain
 attempt. A terminal reply that cannot be recorded is returned with the exact
@@ -87,10 +90,12 @@ original `Success`, including its kernel receipt.
 
 A completed close removes the Workspace from the active discovery set while
 keeping the original creation, intent and terminal event files. The same
-Workspace identity cannot be reused. The event chain validates both ordering
-and the exact namespace. Create-only catalogs remain readable; older binaries
-reject the new event tags and must not open a catalog after lifecycle events
-have been added. The catalog has no automatic cleanup or migration.
+Workspace identity cannot be reused. Cancelled attempts remain in the event
+chain and every later attempt has its own sequence. The chain validates their
+ordering and exact namespace. Create-only catalogs and v1 lifecycle events
+remain readable; older binaries reject the new event tags and must not open a
+catalog after lifecycle events they do not support have been added. The
+catalog has no automatic cleanup or migration.
 
 On 2026-11-09 an owned QEMU/KVM guest wrote two records to a raw ext4 disk
 (`cache=none`) and acknowledged them. The harness killed that guest, booted
@@ -147,3 +152,15 @@ two recovered mounts through the new Service method. Its test output, hashes
 and container exit are under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-close-fuse-20261109/`.
 This is not automatic daemon startup or an end-to-end AutoTask integration.
+
+The v2 attempt format was checked against a catalog created by the previous
+implementation. A separate owned VM probe verified completed and pending v2
+records after guest power loss; its evidence is under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-roster-attempt-v2-vm-20261109/`.
+An isolated FUSE run verified two Busy refusals, distinct durable cancellation
+records, an explicit later unmount, and injected cancellation-sync failure. Its
+runner and test results are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-close-cancellation-fuse-v2-20261109/`.
+The first run retained its failed evidence separately: the test killed its FUSE
+owner while it still held a file descriptor, leaving a blocked kernel flush;
+the owned test connection was aborted and the fixture was corrected.

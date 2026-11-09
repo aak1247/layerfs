@@ -23,6 +23,17 @@ pub enum RecordedCloseFailure {
         cause: RosterError,
         reservation_retained: bool,
     },
+    /// A known no-effect refusal was durably cancelled; a new request may be made.
+    Refused(Failure),
+    /// The no-effect refusal is known, but cancellation could not be acknowledged.
+    Cancellation {
+        cause: RosterError,
+        original: Box<Failure>,
+    },
+    /// Cancellation is durable, but releasing the original reservation failed.
+    AfterCancellation {
+        original: Box<Failure>,
+    },
     /// The durable intent exists; the attempted unmount must not be replayed.
     Control {
         token: WorkspaceToken,
@@ -76,14 +87,18 @@ impl Service {
         }
         self.reserve_recorded_unmount(control.token, record.branch)
             .map_err(RecordedCloseFailure::Before)?;
-        if let Err(cause) = roster.begin_close(control.token) {
-            let uncertain = matches!(&cause, RosterError::Uncertain(_) | RosterError::Retained(_));
-            let released = !uncertain && self.release_recorded_unmount(control.token);
-            return Err(RecordedCloseFailure::Intent {
-                cause,
-                reservation_retained: !released,
-            });
-        }
+        let closing = match roster.begin_close(control.token) {
+            Ok(closing) => closing,
+            Err(cause) => {
+                let uncertain =
+                    matches!(&cause, RosterError::Uncertain(_) | RosterError::Retained(_));
+                let released = !uncertain && self.release_recorded_unmount(control.token);
+                return Err(RecordedCloseFailure::Intent {
+                    cause,
+                    reservation_retained: !released,
+                });
+            }
+        };
         let (workspace, departure) = match self.take_recorded_unmount(control.token) {
             Ok(value) => value,
             Err(cause) => {
@@ -102,6 +117,22 @@ impl Service {
         let success = match outcome {
             Ok(success) => success,
             Err(cause) => {
+                let refused = matches!(&cause, Failure::Kernel(failure)
+                    if failure.code == ControlCode::Busy && failure.phase == "unmount:kernel");
+                if refused {
+                    if let Err(error) = roster.cancel_close(closing) {
+                        return Err(RecordedCloseFailure::Cancellation {
+                            cause: error,
+                            original: Box::new(cause),
+                        });
+                    }
+                    if !self.release_recorded_unmount(control.token) {
+                        return Err(RecordedCloseFailure::AfterCancellation {
+                            original: Box::new(cause),
+                        });
+                    }
+                    return Err(RecordedCloseFailure::Refused(cause));
+                }
                 self.hold_recorded_unmount(control.token);
                 return Err(RecordedCloseFailure::Control {
                     token: control.token,
