@@ -3,7 +3,7 @@ use crate::{
     metrics, DatabaseProfile, DatabaseWork, OverlayError, OverlayResult, ProfileConfig,
     StatementKind,
 };
-use rusqlite::{Connection, ToSql};
+use rusqlite::ToSql;
 use std::{
     cell::{Cell, RefCell},
     path::Path,
@@ -14,11 +14,11 @@ use std::{
 /// at a time, each on its calling thread under the Workspace lock.
 pub struct Overlay {
     pub(crate) identity: u64,
-    pub(crate) connection: Connection,
-    pub(crate) open: RefCell<crate::open::OpenState>,
+    pub(crate) connection: crate::database::connection_owner::ConnectionOwner,
+    pub(crate) open: crate::database::connection_owner::OpenOwner,
     pub(crate) work: RefCell<DatabaseWork>,
     pub(crate) payload_work: Cell<crate::PayloadWork>,
-    pub(crate) quarantined: Cell<bool>,
+    pub(crate) quarantined: crate::database::connection_owner::Quarantine,
     /// Connection-local readiness hints, never namespace/owner data. False is
     /// established only by an exact empty ready query; enqueue/release marks
     /// possible work. A rolled-back enqueue can leave only a false positive.
@@ -116,6 +116,11 @@ impl Overlay {
     /// Checked close retaining only the physical file identity, for an immutable
     /// template observed after readiness. The returned handle has no connection.
     pub fn close_database_file(self) -> OverlayResult<crate::ClosedFile> {
+        if self.durable.is_some() && self.quarantined.get() {
+            // Drop retains the uncertain connection and its lease for this
+            // process, rather than asking SQLite to roll it back implicitly.
+            return Err(OverlayError::Quarantined);
+        }
         self.connection.flush_prepared_statement_cache();
         let open = self.open.into_inner();
         let durable = self.durable;

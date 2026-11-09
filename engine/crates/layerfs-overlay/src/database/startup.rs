@@ -172,13 +172,20 @@ fn initialize(path: &Path, config: ProfileConfig, template: Option<&Path>) -> Cr
         // bytes or operations.
         connection.set_prepared_statement_cache_capacity(256);
         let identity = next_engine()?;
+        let quarantine = super::connection_owner::Quarantine::default();
         Ok(Overlay {
             identity,
-            connection,
-            open: RefCell::new(crate::open::OpenState::default()),
+            connection: super::connection_owner::ConnectionOwner::new(
+                connection,
+                quarantine.clone(),
+            ),
+            open: super::connection_owner::OpenOwner::new(
+                crate::open::OpenState::default(),
+                quarantine.clone(),
+            ),
             work: RefCell::new(*sql.borrow()),
             payload_work: Cell::new(crate::PayloadWork::default()),
-            quarantined: Cell::new(false),
+            quarantined: quarantine,
             workspace: Cell::new(None),
             maintenance_ready: Cell::new(false),
             orphan_seen: Cell::new(false),

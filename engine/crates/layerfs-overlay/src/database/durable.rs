@@ -15,9 +15,29 @@ const APPLICATION_ID: i64 = 1_279_676_211;
 /// The separate owner file is never deleted or replaced by this engine.
 pub(crate) struct Lease {
     #[cfg(target_os = "linux")]
-    file: nix::fcntl::Flock<std::fs::File>,
+    file: Option<nix::fcntl::Flock<std::fs::File>>,
     #[cfg(target_os = "linux")]
     path: std::path::PathBuf,
+    #[cfg(target_os = "linux")]
+    quarantine: Option<super::connection_owner::Quarantine>,
+}
+impl Lease {
+    #[cfg(target_os = "linux")]
+    fn track(&mut self, quarantine: super::connection_owner::Quarantine) {
+        self.quarantine = Some(quarantine);
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.quarantine.as_ref().is_some_and(|state| state.get()) {
+            if let Some(file) = self.file.take() {
+                // Keep another owner out while an uncertain SQLite connection
+                // is retained, even if the caller drops the original error.
+                std::mem::forget(file);
+            }
+        }
+    }
 }
 
 /// Runtime custody that cannot yet be reconstructed after process loss.
@@ -193,7 +213,11 @@ mod linux {
                     return Err(OverlayError::Invalid("durable overlay owner identity"));
                 }
             }
-            Ok(Self { file, path: owner })
+            Ok(Self {
+                file: Some(file),
+                path: owner,
+                quarantine: None,
+            })
         }
 
         pub(crate) fn verify(&self) -> OverlayResult<()> {
@@ -202,7 +226,7 @@ mod linux {
                     .parent()
                     .ok_or(OverlayError::Invalid("owner parent"))?,
             )?;
-            check_file(&self.file, &self.path)
+            check_file(self.file.as_ref().expect("owned lease"), &self.path)
         }
     }
 
@@ -218,7 +242,7 @@ mod linux {
             Err(error) => return Err(error.into()),
             Ok(_) => return Err(OverlayError::Invalid("durable overlay already exists")),
         }
-        let lease = Lease::acquire(&path, &identity, true)?;
+        let mut lease = Lease::acquire(&path, &identity, true)?;
         let mut db = Overlay::create(&path, config)?;
         let mut calls = 0;
         let mut profile = super::super::profile::initialize_with(
@@ -230,6 +254,9 @@ mod linux {
         )?;
         profile.schema_version = db.profile.schema_version;
         db.profile = profile;
+        lease.track(db.quarantined.clone());
+        db.quarantined.set_durable();
+        db.durable = Some(lease);
         db.atomic(|| {
             db.execute(
                 StatementKind::Startup,
@@ -262,12 +289,12 @@ mod linux {
             .map_err(OverlayError::Io)
         });
         if let Err(cause) = sync {
+            db.quarantined.set(true);
             return Err(OverlayError::Uncertain {
                 cause: Box::new(cause),
                 completion: None,
             });
         }
-        db.durable = Some(lease);
         Ok(db)
     }
 
@@ -277,7 +304,7 @@ mod linux {
         identity: [u8; 32],
     ) -> OverlayResult<Overlay> {
         let path = validate(path, config, &identity)?;
-        let lease = Lease::acquire(&path, &identity, false)?;
+        let mut lease = Lease::acquire(&path, &identity, false)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -366,13 +393,22 @@ mod linux {
         lease.verify()?;
         connection.set_prepared_statement_cache_capacity(256);
         let engine = super::super::startup::next_engine()?;
+        let quarantine = super::super::connection_owner::Quarantine::default();
+        quarantine.set_durable();
+        lease.track(quarantine.clone());
         Ok(Overlay {
             identity: engine,
-            connection,
-            open: RefCell::new(crate::open::OpenState::default()),
+            connection: super::super::connection_owner::ConnectionOwner::new(
+                connection,
+                quarantine.clone(),
+            ),
+            open: super::super::connection_owner::OpenOwner::new(
+                crate::open::OpenState::default(),
+                quarantine.clone(),
+            ),
             work,
             payload_work: Cell::new(crate::PayloadWork::default()),
-            quarantined: Cell::new(false),
+            quarantined: quarantine,
             workspace: Cell::new(Some(state)),
             maintenance_ready: Cell::new(maintenance),
             orphan_seen: Cell::new(false),

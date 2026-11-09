@@ -292,28 +292,93 @@ fn durable_overlay_refuses_nonprivate_directory_and_unaccounted_quota() {
 
 #[test]
 fn durable_overlay_quarantines_replaced_owner_or_database_path() {
-    for owner in [false, true] {
-        let fixture = Fixture::new();
-        let db = create(&fixture.path());
-        let target = if owner {
-            fixture.0.join("overlay.sqlite.owner")
-        } else {
-            fixture.path()
-        };
-        let saved = fixture.0.join("displaced");
-        fs::rename(&target, &saved).unwrap();
+    const CHILD: &str = "LAYERFS_DURABLE_QUARANTINE_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let directory = PathBuf::from(directory);
+        for owner in [false, true] {
+            let path = directory.join(if owner {
+                "owner.sqlite"
+            } else {
+                "database.sqlite"
+            });
+            let db = create(&path);
+            let target = if owner {
+                directory.join("owner.sqlite.owner")
+            } else {
+                path.clone()
+            };
+            let saved = directory.join("displaced");
+            fs::rename(&target, &saved).unwrap();
+            assert!(matches!(db.state(), Err(OverlayError::Uncertain { .. })));
+            fs::rename(saved, target).unwrap();
+            assert!(matches!(db.state(), Err(OverlayError::Quarantined)));
+            if owner {
+                assert!(matches!(
+                    db.close_database(),
+                    Err(OverlayError::Quarantined)
+                ));
+            } else {
+                drop(db);
+            }
+            assert!(Overlay::recover_durable(&path, ProfileConfig::default(), IDENTITY).is_err());
+        }
+        let path = directory.join("private.sqlite");
+        let db = create(&path);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(db.state(), Err(OverlayError::Uncertain { .. })));
-        fs::rename(saved, target).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(db.state(), Err(OverlayError::Quarantined)));
-        db.close_database().unwrap();
+        assert!(matches!(
+            db.close_database(),
+            Err(OverlayError::Quarantined)
+        ));
+        assert!(Overlay::recover_durable(&path, ProfileConfig::default(), IDENTITY).is_err());
+        let path = directory.join("panic.sqlite");
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(|| {
+            let _db = create(&path);
+            panic!("test owner unwind");
+        });
+        std::panic::set_hook(hook);
+        assert!(unwound.is_err());
+        assert!(Overlay::recover_durable(&path, ProfileConfig::default(), IDENTITY).is_err());
+        return;
     }
     let fixture = Fixture::new();
-    let db = create(&fixture.path());
-    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(matches!(db.state(), Err(OverlayError::Uncertain { .. })));
-    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(matches!(db.state(), Err(OverlayError::Quarantined)));
-    db.close_database().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durable_overlay_quarantines_replaced_owner_or_database_path",
+        ])
+        .env(CHILD, &fixture.0)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "quarantined owner: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("quarantined owner did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for name in [
+        "database.sqlite",
+        "owner.sqlite",
+        "private.sqlite",
+        "panic.sqlite",
+    ] {
+        let db =
+            Overlay::recover_durable(&fixture.0.join(name), ProfileConfig::default(), IDENTITY)
+                .unwrap();
+        db.close_database().unwrap();
+    }
 }
 
 #[test]
@@ -344,8 +409,18 @@ fn durable_overlay_quarantines_failed_journal_sync_and_recovers_prior_state() {
             "{result:?}"
         );
         assert!(matches!(db.state(), Err(OverlayError::Quarantined)));
-        // Leave the uncertain SQLite connection untouched; process termination
-        // releases it without an application-level rollback or replay.
+        assert!(matches!(
+            db.close_database(),
+            Err(OverlayError::Quarantined)
+        ));
+        assert!(Overlay::recover_durable(
+            &directory.join("overlay.sqlite"),
+            ProfileConfig::default(),
+            IDENTITY,
+        )
+        .is_err());
+        // Neither explicit close nor dropping its error may release the
+        // uncertain connection or its lease. Process exit releases both.
         std::process::exit(0);
     }
     let fixture = Fixture::new();

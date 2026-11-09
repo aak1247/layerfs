@@ -21,7 +21,11 @@ generation, base root, revision, dirty count and volatile-custody flag is
 written in the **same SQLite transaction** as the associated filesystem rows.
 The parent directory and the initialized database are synchronized before
 creation returns. A storage sync error on a transaction quarantines its owner
-and reports an uncertain result; it is never automatically replayed. An explicit
+and reports an uncertain result; it is never automatically replayed. Explicit
+close, ordinary drop and unwinding retain the uncertain SQLite connection,
+open-state custody and owner lease until process exit, so SQLite is not asked
+to roll it back implicitly.
+An explicit
 `max_pages` is refused for this profile because the rollback-journal bytes are
 not yet included in the existing physical allocation observations.
 
@@ -50,8 +54,10 @@ On 2026-11-09 the overlay VM probe passed on QEMU 6.2.0/KVM with a Linux
 an acknowledged 86,016-byte overlay and was killed, and the second guest
 reopened that disk and checked the written file bytes. The receipt and serial
 logs are retained under
-`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-overlay-vm-20261109-final/`.
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-overlay-vm-20261109-retained-final/`.
 The probe binary SHA-256 was
-`356b6dce6fcfc9fb3c91bbdfcc75977294061cfdaeca2d3003133f1cc06a0e8b`;
+`35842eff1e9d7fe178a9864dcbea9ec8ce0ba78036e83f6f0f2bd6ab5aca0652`;
 the overlay durable implementation SHA-256 was
-`48a9efaecd831b28d79f9dced3622a724910084c864cd17f0959e454abcb296f`.
+`f6a5c6563d0837982c1a2930528d05ebdaae97c30635e3f3edcd57cb909b8318`,
+and its connection-owner SHA-256 was
+`43474bdfda377ffef4125c47e27097dfd729ff0047b57aeaff7b8a1818d06cd3`.
