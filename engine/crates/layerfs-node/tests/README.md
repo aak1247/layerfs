@@ -62,3 +62,6 @@ in [the Git Workspace proof](../../../../docs/general/sdk-git-workspaces-proof.m
 `fixtures/linked_git_worktree.cjs` records the distinct failing import of a
 linked Git worktree; it is a characterization of a missing integration, not a
 passing test of linked-worktree support.
+`fixtures/staged_linked_worktree.cjs` then exercised a manually staged copy
+created by AutoTask's existing archive code. It does not wire that staging into
+the SDK or prove its production authorization and recovery boundaries.

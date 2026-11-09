@@ -50,3 +50,27 @@ the Node input is also kept as
 This failure means linked worktrees need a self-contained, authorized Git
 materialization before import; the successful standalone-repository result does
 not establish that support.
+
+A third experiment used the actual AutoTask `workspace_archive.rs` code in a
+separate test harness to create a self-contained copy of a new synthetic linked
+worktree. Before import the copy retained the original branch and Git HEAD,
+staged index, unstaged and untracked drafts, ignored dependency, and valid Git
+object connectivity; it did not include other worktrees' private metadata. The
+SDK imported that copy, and the Sandbox observed the same state. After a Git
+commit and a LayerFS commit, a normal unmount and new mount retained the new Git
+HEAD and file contents. The original linked worktree remained unchanged. The
+test harness, source hash, temporary archive, synthetic source and staged copy,
+original runtime identities and output are retained at
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/staged-linked-git-20261110-hh23b9as/`;
+the SDK portion is
+[`staged_linked_worktree.cjs`](../../engine/crates/layerfs-node/tests/fixtures/staged_linked_worktree.cjs).
+The harness used the same direct `anyhow`, `tar` and `walkdir` versions as
+AutoTask, not AutoTask's entire locked dependency graph.
+
+This is a manually staged, small synthetic fixture, not a shipped integration.
+It does not establish safe staging of an actively changing source, bounded
+space usage for large projects, source authorization, credential handling,
+automatic cleanup, crash recovery, or Kubernetes behavior. The archive was a
+full temporary copy, and the existing upload routine can include Git config
+and hooks; a production integration must preserve its own authorization and
+sensitive-data boundaries rather than assume those details are safe.
