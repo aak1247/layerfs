@@ -6,16 +6,17 @@
 mod support;
 
 use layerfs_bridge::{
-    control::{Answer, Call, ControlCode, Reply, Request, UnmountControl},
+    control::{Answer, Call, ControlCode, Reply, Request, UnmountControl, WorkspaceToken},
     duplex,
 };
 use layerfs_daemon::{
     bootstrap::open_store,
     control::{
         CatalogRecoveryCause, DurableControlCause, DurableControlConfig, Failure,
-        RecordedCloseFailure, RecordedMountFailure, RecordedMountRequest, Service,
+        RecordedCloseFailure, RecordedMountFailure, RecordedMountRequest, RecoverControlCause,
+        RecoverControlConfig, Service,
     },
-    durable_roster::{Authority, Roster},
+    durable_roster::{Authority, Roster, RosterError, WorkspaceRecord},
     Owner, OwnerConfig,
 };
 use layerfs_history::WorkspaceId;
@@ -24,7 +25,7 @@ use layerfs_storage::ReservationBlocks;
 use std::{
     fs,
     net::{TcpListener, TcpStream},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
     process::Command,
     sync::Arc,
@@ -95,6 +96,216 @@ fn durable_control_rejects_disposable_store_before_recovery() {
     owner.stop().unwrap();
     drop(store);
     fixture.cleanup();
+}
+
+#[test]
+fn fenced_recovery_pins_separate_directories_on_the_store_device() {
+    let fixture = support::Fixture::new_durable(1, "recovery-control-directories");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        1,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let (catalog, overlays) = directories(&fixture);
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    drop(Roster::create(&catalog, authority).unwrap());
+    let owner = Owner::start(
+        &fixture.directory.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 1 },
+    )
+    .unwrap();
+    let mut service = Service::new(store.clone(), &owner);
+    let config = RecoverControlConfig {
+        catalog_directory: catalog.clone(),
+        overlay_directory: overlays,
+        sandbox: [8; 32],
+        profile: ProfileConfig::default(),
+        minimum_namespace: 1,
+        store_device: fs::metadata(&fixture.config.path).unwrap().dev(),
+    };
+    let mut wrong = config.clone();
+    wrong.store_device ^= 1;
+    let error = service.recover_durable_control(&owner, wrong).unwrap_err();
+    assert!(matches!(
+        error.cause,
+        RecoverControlCause::Invalid("separate local durable directories")
+    ));
+    drop(error);
+    drop(Roster::open(&catalog, authority).unwrap());
+    let mut overlap = config.clone();
+    overlap.overlay_directory = catalog.clone();
+    let error = service
+        .recover_durable_control(&owner, overlap)
+        .unwrap_err();
+    assert!(matches!(error.cause, RecoverControlCause::Invalid(_)));
+    drop(error);
+    assert!(service
+        .recover_durable_control(&owner, config)
+        .unwrap()
+        .is_empty());
+    assert!(Roster::open(&catalog, authority).is_err());
+    assert_eq!(service.workspaces(), Some(0));
+    drop(service);
+    owner.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn fenced_recovery_preserves_an_unresolved_close_intent() {
+    let fixture = support::Fixture::new_durable(1, "recovery-pending-close");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        1,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let (catalog, overlays) = directories(&fixture);
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    let mut discovery = Roster::create(&catalog, authority).unwrap();
+    let workspace = WorkspaceId::from_authority([70; 32]).unwrap();
+    discovery
+        .record(WorkspaceRecord {
+            workspace,
+            branch: fixture.branch,
+        })
+        .unwrap();
+    let closing = discovery
+        .begin_close(WorkspaceToken {
+            workspace,
+            namespace: 1,
+        })
+        .unwrap();
+    drop(discovery);
+    let owner = Owner::start(
+        &fixture.directory.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 1 },
+    )
+    .unwrap();
+    let mut service = Service::new(store.clone(), &owner);
+    let mut failure = service
+        .recover_durable_control(
+            &owner,
+            RecoverControlConfig {
+                catalog_directory: catalog.clone(),
+                overlay_directory: overlays,
+                sandbox: [8; 32],
+                profile: ProfileConfig::default(),
+                minimum_namespace: 2,
+                store_device: fs::metadata(&fixture.config.path).unwrap().dev(),
+            },
+        )
+        .unwrap_err();
+    let RecoverControlCause::Control(control) = &mut failure.cause else {
+        panic!("original recovery failure was not retained")
+    };
+    assert!(matches!(
+        &control.cause,
+        DurableControlCause::Recovery(cause)
+            if matches!(&cause.cause, CatalogRecoveryCause::Discovery(RosterError::PendingClose(value)) if *value == closing)
+    ));
+    assert_eq!(
+        control.config.catalog.pending_close().unwrap(),
+        Some(closing)
+    );
+    assert_eq!(service.workspaces(), Some(0));
+    drop(failure);
+    let mut discovery = Roster::open(&catalog, authority).unwrap();
+    assert_eq!(discovery.pending_close().unwrap(), Some(closing));
+    drop(discovery);
+    drop(service);
+    owner.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+#[ignore = "requires CAP_SYS_ADMIN and an owned ext4 test directory"]
+fn same_inode_bind_mount_is_not_accepted_as_the_original_directory() {
+    use nix::mount::{mount, umount, MsFlags};
+    for which in ["catalog", "overlays"] {
+        let fixture = support::Fixture::new_durable(1, &format!("recovery-control-bind-{which}"));
+        let store = open_store(
+            fixture.config.clone(),
+            support::BINDING,
+            support::CURSOR,
+            1,
+            2 * 1024 * 1024,
+            ReservationBlocks::default(),
+        )
+        .unwrap();
+        let (catalog, overlays) = directories(&fixture);
+        let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+        drop(Roster::create(&catalog, authority).unwrap());
+        let owner = Owner::start(
+            &fixture.directory.join("template.sqlite"),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 1 },
+        )
+        .unwrap();
+        let mut service = Service::new(store.clone(), &owner);
+        let config = RecoverControlConfig {
+            catalog_directory: catalog.clone(),
+            overlay_directory: overlays.clone(),
+            sandbox: [8; 32],
+            profile: ProfileConfig::default(),
+            minimum_namespace: 1,
+            store_device: fs::metadata(&fixture.config.path).unwrap().dev(),
+        };
+        let target = if which == "catalog" {
+            &catalog
+        } else {
+            &overlays
+        };
+        let bind = || {
+            mount(
+                Some(target.as_path()),
+                target.as_path(),
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .unwrap();
+        };
+        bind();
+        let refused = service
+            .recover_durable_control(&owner, config.clone())
+            .unwrap_err();
+        assert!(matches!(refused.cause, RecoverControlCause::Invalid(_)));
+        drop(refused);
+        umount(target.as_path()).unwrap();
+        service.recover_durable_control(&owner, config).unwrap();
+        bind();
+        let request = Request::Mount {
+            workspace: WorkspaceId::from_authority([70; 32]).unwrap(),
+            branch: fixture.branch,
+        };
+        assert!(matches!(
+            service.execute_control(&request),
+            Err(Failure::DurableRoot(_))
+        ));
+        umount(target.as_path()).unwrap();
+        assert!(matches!(
+            service.execute_control(&request),
+            Err(Failure::DurableRoot(_))
+        ));
+        drop(service);
+        assert!(Roster::open(&catalog, authority).is_err());
+        owner.stop().unwrap();
+        drop(store);
+        println!("target={which} same_inode_bind_refused=true held_root_quarantined=true");
+        println!("owned_fixture={}", fixture.directory.display());
+        // The quarantine intentionally retains descriptors until this test process exits.
+    }
 }
 
 #[test]

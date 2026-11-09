@@ -161,6 +161,7 @@ impl Service {
         self.install_fresh_control(
             catalog.expect("fresh catalog created"),
             overlay_root.expect("overlay directory held"),
+            catalog_root.expect("catalog directory held"),
             config.sandbox,
             config.profile,
         );

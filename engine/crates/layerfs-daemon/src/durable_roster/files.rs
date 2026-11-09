@@ -170,6 +170,18 @@ impl Roster {
     pub fn open(path: &Path, authority: Authority) -> Result<Self, RosterError> {
         owner_bytes(authority)?;
         let (path, directory) = open_directory(path)?;
+        Self::open_opened(path, directory, authority)
+    }
+
+    /// Opens through an already pinned and validated private directory.
+    pub(crate) fn open_opened(
+        path: PathBuf,
+        directory: File,
+        authority: Authority,
+    ) -> Result<Self, RosterError> {
+        owner_bytes(authority)?;
+        check_directory(&path, &directory)?;
+        check_local_filesystem(&directory)?;
         let file = open_file(&directory, OsStr::new(OWNER), false)?;
         check_file(&directory, OsStr::new(OWNER), &file)?;
         let owner = Flock::lock(file, FlockArg::LockExclusiveNonblock)
@@ -715,9 +727,12 @@ fn open_directory(path: &Path) -> Result<(PathBuf, File), RosterError> {
         .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
         .open(&path)?;
     check_directory(&path, &directory)?;
-    let kind = statfs::fstatfs(&directory)
-        .map_err(errno)?
-        .filesystem_type();
+    check_local_filesystem(&directory)?;
+    Ok((path, directory))
+}
+
+fn check_local_filesystem(directory: &File) -> Result<(), RosterError> {
+    let kind = statfs::fstatfs(directory).map_err(errno)?.filesystem_type();
     if ![
         statfs::EXT4_SUPER_MAGIC,
         statfs::XFS_SUPER_MAGIC,
@@ -727,7 +742,7 @@ fn open_directory(path: &Path) -> Result<(PathBuf, File), RosterError> {
     {
         return Err(RosterError::Invalid("roster requires a local filesystem"));
     }
-    Ok((path, directory))
+    Ok(())
 }
 
 fn check_directory(path: &Path, directory: &File) -> Result<(), RosterError> {

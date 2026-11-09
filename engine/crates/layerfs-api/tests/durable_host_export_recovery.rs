@@ -8,8 +8,7 @@ use layerfs_bridge::{
 };
 use layerfs_daemon::{
     bootstrap::open_store,
-    control::{ContainerExportRoot, DurableControlConfig, KernelConfig, KernelServing, Service},
-    durable_roster::{Authority, Roster},
+    control::{ContainerExportRoot, KernelConfig, KernelServing, RecoverControlConfig, Service},
     Owner, OwnerConfig,
 };
 use layerfs_history::WorkspaceId;
@@ -18,6 +17,7 @@ use layerfs_persistence::{PersistenceConfig, SqlitePersistenceProfile};
 use layerfs_storage::ReservationBlocks;
 use std::{
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -62,8 +62,6 @@ fn recover_synced_host_workspace_after_original_owner_exit() {
         OwnerConfig { namespaces: 16 },
     )
     .unwrap();
-    let authority = Authority::for_catalog(fresh.sandbox, store.history()).unwrap();
-    let roster = Roster::open(&PathBuf::from(&fresh.catalog_directory), authority).unwrap();
     let kernel = Arc::new(
         KernelServing::start_with_export(
             KernelConfig {
@@ -82,14 +80,15 @@ fn recover_synced_host_workspace_after_original_owner_exit() {
     );
     let mut service = Service::with_kernel(store, &owner, kernel);
     let tokens = service
-        .activate_durable_control(
+        .recover_durable_control(
             &owner,
-            DurableControlConfig {
-                catalog: roster,
+            RecoverControlConfig {
+                catalog_directory: fresh.catalog_directory.clone().into(),
                 overlay_directory: fresh.overlay_directory.clone().into(),
                 sandbox: fresh.sandbox,
                 profile: ProfileConfig::default(),
                 minimum_namespace: old_namespace + 1,
+                store_device: fs::metadata(&setup.store).unwrap().dev(),
             },
         )
         .unwrap();

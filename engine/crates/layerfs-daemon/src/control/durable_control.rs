@@ -30,6 +30,7 @@ pub(super) struct DurableControl {
 struct DurableState {
     catalog: Roster,
     root: DurableRoot,
+    catalog_root: Option<DurableRoot>,
     failure: Option<Arc<io::Error>>,
 }
 impl DurableState {
@@ -37,11 +38,18 @@ impl DurableState {
         if let Some(cause) = &self.failure {
             return Err(Failure::DurableRoot(cause.clone()));
         }
-        if let Err(error) = self.root.verify() {
+        let verified = self.root.verify().and_then(|()| match &self.catalog_root {
+            Some(root) => root.verify(),
+            None => Ok(()),
+        });
+        if let Err(error) = verified {
             let cause = Arc::new(error);
             self.root.quarantine();
+            if let Some(root) = &mut self.catalog_root {
+                root.quarantine();
+            }
             self.catalog
-                .quarantine("durable Overlay directory identity changed");
+                .quarantine("durable directory identity changed");
             self.failure = Some(cause.clone());
             return Err(Failure::DurableRoot(cause));
         }
@@ -69,6 +77,7 @@ pub struct DurableControlFailure {
     pub cause: DurableControlCause,
     pub config: Box<DurableControlConfig>,
     _root: Option<DurableRoot>,
+    _catalog_root: Option<DurableRoot>,
 }
 impl fmt::Debug for DurableControlFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -116,6 +125,7 @@ impl Service {
         &mut self,
         catalog: Roster,
         root: DurableRoot,
+        catalog_root: DurableRoot,
         sandbox: [u8; 32],
         profile: ProfileConfig,
     ) {
@@ -123,6 +133,7 @@ impl Service {
             state: Mutex::new(DurableState {
                 catalog,
                 root,
+                catalog_root: Some(catalog_root),
                 failure: None,
             }),
             sandbox,
@@ -200,7 +211,7 @@ impl Service {
     pub fn activate_durable_control(
         &mut self,
         owner: &Owner,
-        mut config: DurableControlConfig,
+        config: DurableControlConfig,
     ) -> Result<Vec<WorkspaceToken>, Box<DurableControlFailure>> {
         let invalid = if self.durable.is_some() || self.fresh_failed {
             Some("durable control already installed")
@@ -214,18 +225,30 @@ impl Service {
                 cause: DurableControlCause::Invalid(detail),
                 config: Box::new(config),
                 _root: None,
+                _catalog_root: None,
             }));
         }
-        let mut root = match DurableRoot::open(&config.overlay_directory) {
+        let root = match DurableRoot::open(&config.overlay_directory) {
             Ok(root) => root,
             Err(error) => {
                 return Err(Box::new(DurableControlFailure {
                     cause: DurableControlCause::Directory(error),
                     config: Box::new(config),
                     _root: None,
+                    _catalog_root: None,
                 }))
             }
         };
+        self.activate_durable_with_roots(owner, config, root, None)
+    }
+
+    pub(super) fn activate_durable_with_roots(
+        &mut self,
+        owner: &Owner,
+        mut config: DurableControlConfig,
+        mut root: DurableRoot,
+        mut catalog_root: Option<DurableRoot>,
+    ) -> Result<Vec<WorkspaceToken>, Box<DurableControlFailure>> {
         let path = root.retained_path();
         let recovery = self.recover_catalog(
             &mut config.catalog,
@@ -235,7 +258,10 @@ impl Service {
             config.profile,
             config.minimum_namespace,
         );
-        let checked = root.verify();
+        let checked = root.verify().and_then(|()| match &catalog_root {
+            Some(root) => root.verify(),
+            None => Ok(()),
+        });
         let completed = match (recovery, checked) {
             (Ok(tokens), Ok(())) => tokens,
             (Err(cause), Ok(())) => {
@@ -243,14 +269,18 @@ impl Service {
                     cause: DurableControlCause::Recovery(cause),
                     config: Box::new(config),
                     _root: Some(root),
+                    _catalog_root: catalog_root,
                 }))
             }
             (result, Err(error)) => {
                 let cause = Arc::new(error);
                 root.quarantine();
+                if let Some(root) = &mut catalog_root {
+                    root.quarantine();
+                }
                 config
                     .catalog
-                    .quarantine("durable Overlay directory changed during recovery");
+                    .quarantine("durable directory changed during recovery");
                 let cause = match result {
                     Ok(completed) => {
                         DurableControlCause::DirectoryAfterRecovery { cause, completed }
@@ -261,6 +291,7 @@ impl Service {
                     cause,
                     config: Box::new(config),
                     _root: Some(root),
+                    _catalog_root: catalog_root,
                 }));
             }
         };
@@ -268,6 +299,7 @@ impl Service {
             state: Mutex::new(DurableState {
                 catalog: config.catalog,
                 root,
+                catalog_root,
                 failure: None,
             }),
             sandbox: config.sandbox,

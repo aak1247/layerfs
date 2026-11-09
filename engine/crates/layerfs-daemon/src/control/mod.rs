@@ -29,6 +29,8 @@ mod recorded_close;
 #[cfg(target_os = "linux")]
 mod recorded_mount;
 #[cfg(target_os = "linux")]
+mod recover_control;
+#[cfg(target_os = "linux")]
 mod recovery;
 mod registry;
 mod serve;
@@ -53,6 +55,8 @@ pub use recorded::{RecordedRegistrationError, RecordedRegistrationFailure};
 pub use recorded_close::RecordedCloseFailure;
 #[cfg(target_os = "linux")]
 pub use recorded_mount::{RecordedMountFailure, RecordedMountRequest, RecordedMountReservation};
+#[cfg(target_os = "linux")]
+pub use recover_control::{RecoverControlCause, RecoverControlConfig, RecoverControlFailure};
 #[cfg(target_os = "linux")]
 pub use recovery::{CatalogRecoveryCause, CatalogRecoveryFailure};
 pub use registry::{DurableRegistrationFailure, Service};

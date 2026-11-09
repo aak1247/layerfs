@@ -11,6 +11,7 @@ use std::{
 pub(super) struct DurableRoot {
     pub path: PathBuf,
     file: Option<File>,
+    mount_id: u64,
     quarantined: bool,
 }
 impl DurableRoot {
@@ -19,10 +20,12 @@ impl DurableRoot {
             .read(true)
             .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
             .open(path)?;
+        let mount_id = descriptor_mount_id(&file)?;
         let path = path.canonicalize()?;
         let root = Self {
             path,
             file: Some(file),
+            mount_id,
             quarantined: false,
         };
         root.verify()?;
@@ -44,8 +47,13 @@ impl DurableRoot {
         Ok(root)
     }
     pub fn verify(&self) -> io::Result<()> {
-        let opened = self.file.as_ref().expect("root retained").metadata()?;
-        let named = fs::symlink_metadata(&self.path)?;
+        let held = self.file.as_ref().expect("root retained");
+        let opened = held.metadata()?;
+        let named_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&self.path)?;
+        let named = named_file.metadata()?;
         let uid = nix::unistd::geteuid().as_raw();
         if !opened.is_dir()
             || !named.is_dir()
@@ -55,6 +63,8 @@ impl DurableRoot {
             || named.mode() & 0o077 != 0
             || opened.dev() != named.dev()
             || opened.ino() != named.ino()
+            || descriptor_mount_id(held)? != self.mount_id
+            || descriptor_mount_id(&named_file)? != self.mount_id
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -75,6 +85,12 @@ impl DurableRoot {
     }
     pub fn device(&self) -> io::Result<u64> {
         Ok(self.file.as_ref().expect("root retained").metadata()?.dev())
+    }
+    pub fn inode(&self) -> io::Result<u64> {
+        Ok(self.file.as_ref().expect("root retained").metadata()?.ino())
+    }
+    pub fn mount_id(&self) -> u64 {
+        self.mount_id
     }
     /// Confirms creation of this directory and its entry in its private parent.
     pub fn sync_creation(&self) -> io::Result<()> {
@@ -116,6 +132,22 @@ impl DurableRoot {
     pub fn quarantine(&mut self) {
         self.quarantined = true;
     }
+}
+
+fn descriptor_mount_id(file: &File) -> io::Result<u64> {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let mut matches = info.lines().filter_map(|line| line.strip_prefix("mnt_id:"));
+    let id = matches
+        .next()
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "durable directory mount ID"))?;
+    if matches.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate durable directory mount ID",
+        ));
+    }
+    Ok(id)
 }
 impl Drop for DurableRoot {
     fn drop(&mut self) {

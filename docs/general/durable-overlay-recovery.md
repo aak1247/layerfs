@@ -4,8 +4,9 @@ The Overlay crate exposes `Overlay::create_durable(path, config, identity)`
 and `Overlay::recover_durable(path, config, identity)` on Linux. This is a
 single-Workspace database primitive. The daemon can also initialize a fresh
 durable catalog when explicitly configured with new private directories and a
-Durable Store. Existing SDK Sandbox creation still selects disposable overlays;
-neither path automatically recovers an old mount.
+Durable Store. The Node SDK selects durable Workspaces for a newly created Durable project
+and disposable Workspaces for a Disposable project. Neither path automatically
+recovers an old mount.
 
 The caller supplies a stable, nonzero 32-byte Workspace identity and a private
 directory owned by the calling user. The directory must be on ext4, XFS or
@@ -65,9 +66,33 @@ supplies a minimum and must serialize it with all other live Workspace routes;
 legacy schemas lack this evidence and are refused by that method.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
-identities and original Branches of multiple Workspaces. It is not yet wired
-by the daemon when a fresh durable Workspace setup is explicitly supplied.
-It is not used to automatically reopen an existing Sandbox.
+identities and original Branches of multiple Workspaces. The daemon uses it
+when a fresh durable Workspace setup is explicitly supplied. It is not used to
+automatically reopen an existing Sandbox.
+
+For an explicitly fenced recovery, `Service::recover_durable_control` opens
+and retains the original catalog and Overlay directories through pinned
+descriptors. It requires separate directories with different inodes on the same
+mount and on the device of the independently authenticated Store. The catalog
+is opened through its held descriptor; the Overlay recovery uses the other
+held descriptor. Both named directories are rechecked, including their mount
+IDs, during recovery and subsequent control operations. A changed mount or
+directory quarantines the original owners; an unresolved close remains a
+blocking original intent. The caller must still authenticate the physical
+Store and Sandbox, fence the original processes, mounts and consumers, and
+reconcile unknown effects before this one attempt. These checks do not detect
+a wholesale rollback or replacement with a copied Store.
+
+An isolated Docker/FUSE test killed an exact SDK and container after an
+acknowledged host write, verified the original cgroup, mount and FUSE
+connection were gone, and used this recovery method on the original ext4
+volume and a fresh host export. The host read the original bytes under a new
+namespace; the old token was refused. Separate test-container bind mounts over
+the original catalog and Overlay directories were refused even when the inode
+was unchanged. Receipts are under
+`~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/recovery-guards-20261110-OsLZy6vH/`.
+These are explicitly fenced synthetic tests, not automatic SDK recovery,
+Kubernetes recovery or physical host power-loss tests.
 
 An explicitly assembled daemon `Service` can register already bound durable
 owners and use its ordinary control and FUSE Attach path. The caller may first
