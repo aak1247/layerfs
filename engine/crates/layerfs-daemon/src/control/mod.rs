@@ -12,6 +12,8 @@ mod invalidate;
 mod kernel;
 mod observation;
 mod operations;
+#[cfg(target_os = "linux")]
+mod recorded;
 mod registry;
 mod serve;
 #[cfg(target_os = "linux")]
@@ -21,6 +23,8 @@ mod types;
 mod unmount;
 pub use kernel::{KernelConfig, KernelServing};
 pub(crate) use observation::{reply_token, request_token};
+#[cfg(target_os = "linux")]
+pub use recorded::{RecordedRegistrationError, RecordedRegistrationFailure};
 pub use registry::{DurableRegistrationFailure, Service};
 pub(crate) use serve::answer_call;
 pub use serve::{ServeCause, ServeFailure, Served};

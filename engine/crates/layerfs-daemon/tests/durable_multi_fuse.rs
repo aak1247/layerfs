@@ -9,6 +9,7 @@ use layerfs_bridge::control::{Reply, Request, UnmountControl, WorkspaceToken};
 use layerfs_daemon::{
     bootstrap::open_store,
     control::{KernelConfig, KernelServing, Service},
+    durable_roster::{Authority, Roster, WorkspaceRecord},
     store::BindRequest,
     Owner, OwnerConfig,
 };
@@ -103,9 +104,17 @@ fn child(directory: &Path) {
     let branch = BranchId::from_authority([24; 16]);
     let snapshot = store.history().branch_snapshot(branch).unwrap().unwrap();
     let roster = roster(&directory.join("writer-template.sqlite"));
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    let mut discovery = Roster::create(&directory.join("catalog"), authority).unwrap();
     let service = Service::with_kernel(store.clone(), &roster, kernel(&directory.join("mounts")));
     for (identity, namespace, text) in ITEMS {
-        let path = directory.join(format!("durable/{identity}.sqlite"));
+        let workspace_id = WorkspaceId::from_authority([identity; 32]).unwrap();
+        let record = WorkspaceRecord {
+            workspace: workspace_id,
+            branch,
+        };
+        discovery.record(record).unwrap();
+        let path = directory.join("durable").join(record.overlay_name());
         let owner = Owner::create_durable(DurableWorkspace {
             path: &path,
             profile: ProfileConfig::default(),
@@ -119,14 +128,16 @@ fn child(directory: &Path) {
             .bind_durable(
                 client,
                 BindRequest {
-                    workspace: WorkspaceId::from_authority([identity; 32]).unwrap(),
+                    workspace: workspace_id,
                     branch,
                 },
                 snapshot.clone(),
             )
             .unwrap()
             .workspace;
-        let token = service.register_durable(workspace).unwrap();
+        let token = service
+            .register_recorded(&mut discovery, workspace)
+            .unwrap();
         let mount = attach(&service, token);
         let file = mount.join("file-000000");
         let status = Command::new("/bin/sh")
@@ -157,6 +168,8 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     let directory = &fixture.directory;
     fs::create_dir(directory.join("durable")).unwrap();
     fs::set_permissions(directory.join("durable"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(directory.join("catalog")).unwrap();
+    fs::set_permissions(directory.join("catalog"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(directory.join("mounts")).unwrap();
     fs::set_permissions(directory.join("mounts"), fs::Permissions::from_mode(0o755)).unwrap();
     let mounts = directory.join("mounts");
@@ -189,10 +202,24 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
 
     let store = open(fixture.config.clone());
     let roster = roster(&directory.join("reader-template.sqlite"));
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    let mut discovery = Roster::open(&directory.join("catalog"), authority).unwrap();
     let service = Service::with_kernel(store.clone(), &roster, kernel(&mounts));
     let mut tokens = Vec::new();
-    for (identity, old_namespace, expected) in ITEMS {
-        let path = directory.join(format!("durable/{identity}.sqlite"));
+    let mut records = Vec::new();
+    discovery.visit(|record| records.push(record)).unwrap();
+    records.sort_by_key(|record| record.workspace.to_bytes());
+    assert_eq!(records.len(), ITEMS.len());
+    for record in records {
+        let workspace_id = record.workspace;
+        let identity = workspace_id.to_bytes()[0];
+        let (_, old_namespace, expected) = ITEMS
+            .iter()
+            .copied()
+            .find(|item| item.0 == identity)
+            .unwrap();
+        assert_eq!(record.branch, fixture.branch);
+        let path = directory.join("durable").join(record.overlay_name());
         assert!(Owner::recover_recorded(
             &path,
             ProfileConfig::default(),
@@ -208,7 +235,6 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
         )
         .unwrap();
         let client = roster.adopt_durable(owner).unwrap();
-        let workspace_id = WorkspaceId::from_authority([identity; 32]).unwrap();
         let workspace = store
             .bind_durable(
                 client,
@@ -220,7 +246,9 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
             )
             .unwrap()
             .workspace;
-        let token = service.register_durable(workspace).unwrap();
+        let token = service
+            .register_recorded(&mut discovery, workspace)
+            .unwrap();
         assert!(service
             .execute_control(&Request::Status(WorkspaceToken {
                 workspace: workspace_id,
@@ -254,6 +282,7 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     cleanup.0.clear();
     drop(service);
     roster.stop().unwrap();
+    drop(discovery);
     drop(store);
     fixture.cleanup();
 }

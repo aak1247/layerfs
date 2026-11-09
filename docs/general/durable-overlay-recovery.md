@@ -245,8 +245,9 @@ executable/source hashes, test-only fault shim, image and kernel facts are under
 
 The schema-41 FUSE rerun also explicitly attempted recovery with the old
 namespace before remounting under a newer one; all five container test cases
-passed. Docker reported the test container's exit code as 0, but its automatic
-removal remained in progress after the client wait timed out. The runner
+passed. Docker reported the test container's exit code as 0; automatic removal
+was still in progress after the client wait timed out, and a later inspection
+found no such container. The runner
 output, executable/source hashes and observed Docker state are retained under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-sync-namespace41-20261109/`.
 

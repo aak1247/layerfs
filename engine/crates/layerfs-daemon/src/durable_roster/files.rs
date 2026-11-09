@@ -3,6 +3,7 @@ use super::{
     ledger::{decode_entry, decode_head, entry_bytes, head_bytes, Head, ENTRY_LEN, HEAD_LEN},
     record::{owner_bytes, Authority, WorkspaceRecord, OWNER_LEN},
 };
+use layerfs_history::WorkspaceId;
 use nix::{
     fcntl::{openat, renameat, Flock, FlockArg, OFlag},
     sys::{stat::Mode, statfs},
@@ -69,6 +70,11 @@ pub struct Roster {
 }
 
 impl Roster {
+    /// The authority supplied when this catalog was created or opened.
+    pub fn authority(&self) -> Authority {
+        self.authority
+    }
+
     /// Initializes an empty directory without replacing or deleting any entry.
     /// The caller creates and synchronizes the directory and its parent first.
     pub fn create(path: &Path, authority: Authority) -> Result<Self, RosterError> {
@@ -326,6 +332,20 @@ impl Roster {
             self.verify()
         })();
         result.map_err(|cause| self.retain(cause, false))
+    }
+
+    /// Returns one record only after the entire catalog was verified.
+    pub fn lookup(
+        &mut self,
+        workspace: WorkspaceId,
+    ) -> Result<Option<WorkspaceRecord>, RosterError> {
+        let mut result = None;
+        self.visit(|record| {
+            if record.workspace == workspace {
+                result = Some(record);
+            }
+        })?;
+        Ok(result)
     }
 
     fn ensure(&mut self) -> Result<(), RosterError> {

@@ -75,6 +75,8 @@ fn records_remain_bound_to_the_original_authority_without_a_count_cap() {
         .unwrap();
     actual.sort_unstable();
     assert_eq!(actual, (1..=64).collect::<Vec<_>>());
+    assert_eq!(roster.lookup(entry(17).workspace).unwrap(), Some(entry(17)));
+    assert_eq!(roster.lookup(entry(65).workspace).unwrap(), None);
     drop(roster);
     assert!(Roster::open(
         &fixture.0,
@@ -250,6 +252,39 @@ fn record_symlink_is_not_followed_or_deleted() {
         .unwrap();
     assert!(status.success());
     assert_eq!(fs::read(fixture.0.join("target")).unwrap(), b"owned target");
+}
+
+#[test]
+fn lookup_never_returns_an_early_match_from_an_incomplete_catalog() {
+    const CHILD: &str = "LAYERFS_ROSTER_LOOKUP_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let directory = PathBuf::from(directory);
+        let mut roster = Roster::create(&directory, AUTHORITY).unwrap();
+        roster.record(entry(33)).unwrap();
+        roster.record(entry(34)).unwrap();
+        let path = record_path(&directory, entry(34));
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[110] ^= 1;
+        fs::write(path, bytes).unwrap();
+        assert!(matches!(
+            roster.lookup(entry(33).workspace),
+            Err(RosterError::Retained(_))
+        ));
+        drop(roster);
+        assert!(Roster::open(&directory, AUTHORITY).is_err());
+        return;
+    }
+    let fixture = Fixture::new();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lookup_never_returns_an_early_match_from_an_incomplete_catalog",
+        ])
+        .env(CHILD, &fixture.0)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]

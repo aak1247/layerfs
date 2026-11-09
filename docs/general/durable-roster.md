@@ -6,9 +6,11 @@ before the caller creates that Workspace's durable Overlay or exposes a token.
 It does not create an Overlay, start a daemon or recover a mount. The normal
 daemon application does not yet use this catalog.
 
-The caller supplies nonzero, stable Sandbox and Store identities and must
-independently authenticate them and validate the actual Store. The catalog's
-checksums detect incomplete or corrupted records; they are not authentication.
+The caller supplies a nonzero, stable Sandbox identity.
+`Authority::for_catalog` derives the Store identity from the validated history
+catalog identity and incarnation. The caller must independently authenticate
+the Sandbox and prove the actual physical Store. The catalog's checksums detect
+incomplete or corrupted records; they are not authentication.
 All participants must use the same kernel and cooperate with its exclusive
 owner-file lock. A lock released by an exited process does not prove that old
 FUSE mounts, consumers or unknown external operations have been fenced.
@@ -41,6 +43,11 @@ identity and monotonic-state evidence.
 
 `Roster::visit` streams tentative records without imposing a Workspace count
 cap. Its callback must only observe; a failed scan is not a complete catalog.
+`Roster::lookup` returns a record only after a full successful scan, and a
+manually assembled daemon may pass the catalog to `Service::register_recorded`
+to require the bound Workspace and Branch to match it. This check does not
+itself authenticate the Sandbox or physical Store. It rejects a different
+history catalog identity or incarnation.
 Even after a successful scan the caller must separately authorize each
 Workspace and Branch, prove the Store and original file identities, fence old
 processes and mounts, and reconcile unknown operations before exposing data.
@@ -54,3 +61,16 @@ duplicate identity. The receipt and serial logs are retained under
 the probe SHA-256 was
 `5911e20792734aee40dcdc8f4930d6415fe26abca149117b2b74d1ce7e72a414`.
 This simulates guest memory loss, not physical host power loss or mount recovery.
+
+An isolated FUSE test recorded two Workspace/Branch identities before creating
+their overlays, mounted both, wrote different bytes as an unprivileged user and
+synchronized them. It killed and reaped the original daemon, detached its old
+mounts, reopened the catalog against the same Store catalog identity and
+incarnation, discovered the two overlay filenames from its records and manually
+rebound and remounted them. The old tokens were rejected and the separate bytes
+survived. The test-only container used `/dev/fuse`, CAP_SYS_ADMIN and unconfined
+AppArmor and seccomp, without network or a Docker socket. The runner output,
+exit status, image and source hashes are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-multi-fuse-final-20261109/`.
+This is a manually fenced, single-host process-loss test, not automatic daemon
+startup, container/Pod reconstruction, physical host power loss or scale qualification.

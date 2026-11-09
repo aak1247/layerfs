@@ -1,6 +1,6 @@
 //! Fixed-size, versioned discovery records; no user path is interpreted.
 use super::files::RosterError;
-use layerfs_history::{BranchId, WorkspaceId};
+use layerfs_history::{BranchId, HistoryCatalog, WorkspaceId};
 use std::fmt::Write as _;
 
 const OWNER_MAGIC: &[u8; 8] = b"LFSROST1";
@@ -14,6 +14,28 @@ pub(super) const RECORD_LEN: usize = 8 + 32 + 32 + 32 + 17 + 32;
 pub struct Authority {
     pub sandbox: [u8; 32],
     pub store: [u8; 32],
+}
+
+impl Authority {
+    /// Bind discovery evidence to a validated history catalog identity and
+    /// incarnation. The caller must still prove the physical Store instance.
+    pub fn for_catalog(
+        sandbox: [u8; 32],
+        catalog: &dyn HistoryCatalog,
+    ) -> Result<Self, RosterError> {
+        let incarnation = catalog.incarnation();
+        if sandbox == [0; 32] || incarnation == 0 {
+            return Err(RosterError::Invalid("roster authority"));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"layerfs/durable-roster-store/v1\0");
+        hasher.update(catalog.catalog_id().as_slice());
+        hasher.update(&incarnation.to_be_bytes());
+        Ok(Self {
+            sandbox,
+            store: *hasher.finalize().as_bytes(),
+        })
+    }
 }
 
 /// The originally requested Branch for one immutable Workspace identity.
