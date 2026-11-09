@@ -1,7 +1,7 @@
 //! Daemon-side verification of one host export in this mount namespace.
 use layerfs_bridge::{control::ReadyMount, daemon_setup::HostExportIdentity};
 use nix::{
-    fcntl::{open, openat, OFlag},
+    fcntl::{open, openat, Flock, FlockArg, OFlag},
     sys::stat::Mode,
 };
 use std::{
@@ -31,7 +31,7 @@ pub struct ContainerExportRoot {
 
 #[derive(Debug)]
 struct Claim {
-    file: File,
+    file: Flock<File>,
     body: Vec<u8>,
     gid: u32,
 }
@@ -109,12 +109,14 @@ impl ContainerExportRoot {
         let directory = self.directories.last().expect("root and leaf are held");
         let flags =
             OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-        let mut file = File::from(openat(
+        let file = File::from(openat(
             directory,
             Path::new(CLAIM_FILE),
             flags,
             Mode::from_bits_truncate(0o600),
         )?);
+        let mut file = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, error)| io::Error::from(error))?;
         let mut body = CLAIM_MAGIC.to_vec();
         body.extend_from_slice(self.expected.boot_id.as_bytes());
         body.extend_from_slice(&public_key);

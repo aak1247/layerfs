@@ -169,6 +169,7 @@ fn exported_serving_requires_a_claimed_root() {
 #[test]
 #[ignore = "requires a caller-owned shared export and a FUSE-capable container"]
 fn configured_daemon_starts_with_the_verified_export() {
+    use nix::fcntl::{Flock, FlockArg};
     let directory = env::temp_dir().join(format!("layerfs-export-start-{}", std::process::id()));
     DirBuilder::new().mode(0o700).create(&directory).unwrap();
     let path = |name: &str| directory.join(name).to_str().unwrap().to_owned();
@@ -227,6 +228,15 @@ fn configured_daemon_starts_with_the_verified_export() {
             .read_line(&mut line)
             .unwrap();
         let started = line.starts_with("LAYERFS_DAEMON_LISTEN ");
+        if started {
+            let file = OpenOptions::new()
+                .read(true)
+                .open(Path::new(&setup.mounts).join(".layerfs-export-owner"))
+                .unwrap();
+            let (_, error) = Flock::lock(file, FlockArg::LockExclusiveNonblock).unwrap_err();
+            assert_eq!(error, nix::errno::Errno::EWOULDBLOCK);
+            ready += 1;
+        }
         let _ = child.kill();
         let status = child.wait().unwrap();
         let mut stderr = String::new();
@@ -236,9 +246,7 @@ fn configured_daemon_starts_with_the_verified_export() {
             .unwrap()
             .read_to_string(&mut stderr)
             .unwrap();
-        if started {
-            ready += 1;
-        } else {
+        if !started {
             refused += 1;
             assert!(
                 stderr.contains("host Workspace export"),
@@ -249,6 +257,11 @@ fn configured_daemon_starts_with_the_verified_export() {
     }
     assert_eq!((ready, refused), (1, 1));
     assert!(ContainerExportRoot::open_fresh(Path::new(&setup.mounts), &expected()).is_err());
+    let file = OpenOptions::new()
+        .read(true)
+        .open(Path::new(&setup.mounts).join(".layerfs-export-owner"))
+        .unwrap();
+    drop(Flock::lock(file, FlockArg::LockExclusiveNonblock).unwrap());
     let claim = fs::read(Path::new(&setup.mounts).join(".layerfs-export-owner")).unwrap();
     assert!(claim.starts_with(b"LAYERFS-EXPORT-OWNER\x01"));
     assert!(!claim

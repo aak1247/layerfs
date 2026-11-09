@@ -41,12 +41,16 @@ are refused, rather than downgraded to a container-local Workspace.
 Before opening storage, the daemon also creates `.layerfs-export-owner`
 exclusively in the pinned root, writes the boot ID and its public key, and
 syncs the file and directory. An existing or partially written marker is never
-replaced. Each later guarded operation rechecks its original file identity,
-permissions and contents. Two daemons racing for one root cannot both claim
+replaced. The daemon keeps an exclusive advisory lock on that exact file while
+it owns the export. Each later guarded operation rechecks its original file
+identity, permissions and contents. Two daemons racing for one root cannot both claim
 it, even if the controller's advisory lock was lost. The marker remains after
 normal exit; a caller must preserve it until an independently verified
 retirement or recovery protocol says what can be done. Its physical-crash
 durability depends on the export filesystem; a tmpfs test is not such proof.
+Acquiring a released marker lock is only evidence about that cooperative lock;
+it does not establish that old FUSE connections or external consumers have
+gone away.
 
 An owned KVM guest additionally wrote and synchronized a claim on a new ext4
 disk (`cache=none`), then was killed immediately after the acknowledgement.
