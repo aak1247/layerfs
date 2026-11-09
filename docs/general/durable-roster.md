@@ -4,8 +4,8 @@
 Sandbox. It records an authorized Workspace identity and its original Branch
 before the caller creates that Workspace's durable Overlay or exposes a token.
 The catalog itself does not start a daemon or recover a mount. The daemon can
-initialize one for a fresh Sandbox when explicitly configured; its SDK does not
-yet supply that configuration.
+initialize one for a fresh Sandbox when explicitly configured; the Linux Node
+SDK selects this fresh path for a Project initialized with a Durable Store.
 
 The caller supplies a nonzero, stable Sandbox identity.
 `Authority::for_catalog` derives the Store identity from the validated history
@@ -70,8 +70,8 @@ Disposable installation is refused before Store creation; failure after an
 installed Store retains the original service and reports the Retained phase.
 Version-5 setup remains readable and keeps its disposable behavior; version 6
 keeps its pre-created-directory meaning. The Docker SDK validates that both
-requested directories are on the named Store volume, but does not yet select
-the new setup or prove an old container and its consumers exited.
+requested directories are on the named Store volume, but does not prove an old
+container and its consumers exited.
 This fresh path refuses existing contents and is not recovery.
 
 SDK discovery recognizes a durable Sandbox identity in its private record.
@@ -79,8 +79,9 @@ If the Engine reports that container stopped or missing, it retains the
 container and records and returns `RecoveryRequired`; malformed identities
 are refused rather than treated as disposable. Explicit Sandbox close also
 refuses until durable catalog ownership can be resolved. Legacy records with
-no durable identity keep their prior disposable behavior. The SDK does not
-yet create such records on its normal Sandbox creation path.
+no durable identity keep their prior disposable behavior. New Sandboxes of a
+Durable Project record their fresh identity; a Disposable Project continues to
+use disposable Workspaces.
 
 `SandboxApi::create_file_observed` also exposes one ordered creation attempt:
 the caller can record intent before Docker Create and Start, then record the
@@ -88,8 +89,16 @@ acknowledged container, upload, Start, authenticated Hello and optional Store
 installation. An observer failure stops before the next side effect and
 returns the exact container, control owner, status and installation receipt
 already obtained. This callback does not itself persist a journal or resolve
-unknown Docker outcomes; its caller must do so. The Node binding has not yet
-connected these milestones to durable Sandbox creation.
+unknown Docker outcomes; its caller must do so. On Linux, the Node binding
+synchronizes a private creation intent containing the original identities and
+deployment inputs before Docker Create, then records each milestone before the
+next effect. It writes a private Sandbox record and completion receipt before
+retiring the intent. An uncertain outcome retains the original owner in the
+process, leaves the durable evidence and refuses automatic retries. A stopped
+or missing durable container still requires independently fenced recovery.
+Native binding tests use a simulated Engine and daemon to check successful
+creation, an unknown Start, and failure while recording the Create reply; they
+do not establish a real Docker or FUSE recovery result for this SDK path.
 
 For a Sandbox record explicitly marked durable, the Node binding records a
 private mount intent before Bind, the original Branch snapshot before Attach,

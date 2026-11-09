@@ -14,6 +14,8 @@ mod pool;
 mod project;
 mod registry;
 mod sandbox;
+#[cfg(target_os = "linux")]
+mod sandbox_durable;
 mod trace;
 mod workspace;
 

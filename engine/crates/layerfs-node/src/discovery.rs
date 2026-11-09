@@ -436,6 +436,36 @@ pub(crate) fn save_sandbox(
     peer: [u8; 32],
     instance: [u8; 32],
 ) -> Result<()> {
+    let value = sandbox_value(state, args, secret, peer, instance)?;
+    save_with_sync(
+        &directory.join("sandbox.record"),
+        value,
+        state.durable_identity.is_some(),
+    )
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn save_sandbox_pinned(
+    directory: &crate::durable_records::Directory,
+    state: &SandboxState,
+    args: &SdkValue,
+    secret: [u8; 32],
+    peer: [u8; 32],
+    instance: [u8; 32],
+) -> Result<()> {
+    pinned_write(
+        directory,
+        "sandbox.record",
+        sandbox_value(state, args, secret, peer, instance)?,
+        true,
+    )
+}
+fn sandbox_value(
+    state: &SandboxState,
+    args: &SdkValue,
+    secret: [u8; 32],
+    peer: [u8; 32],
+    instance: [u8; 32],
+) -> Result<SdkValue> {
     let deploy = args
         .get("deploy")
         .ok_or_else(|| refused("InvalidInput", "deploy"))?;
@@ -477,11 +507,7 @@ pub(crate) fn save_sandbox(
     if let (Some(identity), SdkValue::Map(fields)) = (state.durable_identity, &mut value) {
         fields.push(("durableSandbox".into(), SdkValue::Bytes(identity.to_vec())));
     }
-    save_with_sync(
-        &directory.join("sandbox.record"),
-        value,
-        state.durable_identity.is_some(),
-    )
+    Ok(value)
 }
 /// A Sandbox whose container the Engine reports gone or stopped. Disposable
 /// records may be reclaimed; durable records need separate recovery evidence.

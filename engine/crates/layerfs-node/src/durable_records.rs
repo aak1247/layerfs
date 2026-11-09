@@ -42,6 +42,11 @@ impl Directory {
     pub(crate) fn verify(&self) -> io::Result<()> {
         check_directory(&self.canonical, &self.file)
     }
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        self.verify()?;
+        self.file.sync_all()?;
+        self.verify()
+    }
     pub(crate) fn path(&self) -> PathBuf {
         fd_path(&self.file).join(".")
     }
@@ -157,6 +162,24 @@ impl Directory {
             });
         }
         Ok(())
+    }
+
+    /// Removes one checked original record, then synchronizes its directory.
+    /// The caller retains this Directory if any part of the effect is unknown.
+    pub(crate) fn remove(&self, name: &OsStr) -> io::Result<()> {
+        self.verify()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(0x20000)
+            .open(fd_path(&self.file).join(name))?;
+        check_file(&self.file, name, &file)?;
+        let result = fs::remove_file(fd_path(&self.file).join(name))
+            .and_then(|()| self.file.sync_all())
+            .and_then(|()| self.verify());
+        if result.is_err() {
+            std::mem::forget(file);
+        }
+        result
     }
 }
 

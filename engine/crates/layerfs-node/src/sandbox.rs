@@ -28,11 +28,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Port the daemon listens on inside its container.
-const PORT: u16 = 30421;
+pub(crate) const PORT: u16 = 30421;
 /// Wait for the daemon's listener after Start.
-const STARTUP: Duration = Duration::from_secs(30);
+pub(crate) const STARTUP: Duration = Duration::from_secs(30);
 /// Wait for one Engine control response.
-const ENGINE: Duration = Duration::from_secs(30);
+pub(crate) const ENGINE: Duration = Duration::from_secs(30);
 /// A failed create's report keeps its daemon's last log lines, up to this many bytes.
 const LOG_LINES: u16 = 20;
 const LOG_BYTES: usize = 2048;
@@ -66,7 +66,7 @@ pub(crate) fn workspace_capacity(value: &SdkValue) -> Result<u32, SdkRefusal> {
 /// for this process and the rest for others (#352 F-017).
 pub(crate) const DAEMON_CONNECTIONS: u16 = 8;
 
-fn setup(private: [u8; 32], peer: [u8; 32], max_workspaces: u32) -> DaemonSetup {
+pub(crate) fn setup(private: [u8; 32], peer: [u8; 32], max_workspaces: u32) -> DaemonSetup {
     DaemonSetup {
         listen: format!("0.0.0.0:{PORT}"),
         private_key: private,
@@ -154,6 +154,24 @@ pub(crate) fn start(args: &SdkValue, directory: &Path) -> Result<Arc<SandboxStat
     }
     let store_volume = text(deploy, "volume")?.to_owned();
     let executable = PathBuf::from(text(deploy, "daemon")?);
+    if project.store.profile == layerfs_persistence::SqlitePersistenceProfile::Durable {
+        #[cfg(target_os = "linux")]
+        return crate::sandbox_durable::start(
+            args,
+            directory,
+            &project,
+            installed,
+            crate::sandbox_durable::Inputs {
+                docker,
+                image,
+                volume: store_volume,
+                executable,
+                max_workspaces,
+            },
+        );
+        #[cfg(not(target_os = "linux"))]
+        return Err(refused("Unsupported", "durable Sandboxes require Linux"));
+    }
     // A creation whose outcome is unknown is never silently attempted again.
     let intent = directory.join("create.intent");
     if intent.exists() {
@@ -368,6 +386,12 @@ pub(crate) fn create(args: &SdkValue) -> Outcome {
     workspace_capacity(args)?;
     let project = crate::discovery::project_dir(args)?;
     let _placing = crate::discovery::guard(&project)?;
+    #[cfg(target_os = "linux")]
+    if crate::discovery::project(args)?.store.profile
+        == layerfs_persistence::SqlitePersistenceProfile::Durable
+    {
+        crate::sandbox_durable::ensure_available(&project)?;
+    }
     crate::workspace::reclaim_gone(args)?;
     let state = start(args, &project)?;
     Ok(SdkValue::map([
