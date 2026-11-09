@@ -59,3 +59,6 @@ experiment with a private synthetic Git source, SDK home and Durable Store.
 It tests independent Git commits on two LayerFS Branches and normal
 close/remount. Its harness requirements, evidence and limitations are recorded
 in [the Git Workspace proof](../../../../docs/general/sdk-git-workspaces-proof.md).
+`fixtures/linked_git_worktree.cjs` records the distinct failing import of a
+linked Git worktree; it is a characterization of a missing integration, not a
+passing test of linked-worktree support.

@@ -32,8 +32,21 @@ The stopped or idle test resources are retained for evidence, under this task's
 cleanup ownership.
 
 This covers a small standalone repository and one successful run. It does not
-cover importing a linked Git worktree whose `.git` file points into another
-repository, sharing a Git object store between Workspaces, large repositories,
+cover sharing a Git object store between Workspaces, large repositories,
 concurrent Git writers in one Workspace, crash recovery, Kubernetes, or Git
 operations performed by AutoTask itself. LayerFS commits and Git commits are
 distinct: the experiment explicitly made both before unmounting.
+
+A second independent experiment imported a synthetic **linked Git worktree**,
+whose `.git` is a file pointing to its main repository on the host. Its dirty
+tracked file was visible in the Workspace, but both `git status` and
+`git rev-parse HEAD` exited 128: the imported `.git` still named the host path,
+which did not exist in the Sandbox. The source worktree and its dirty file
+remained unchanged. The Workspace was explicitly unmounted. The fixture,
+container and volume identities and original output are retained at
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-linked-git-20261110-ftfyc24r/`;
+the Node input is also kept as
+[`linked_git_worktree.cjs`](../../engine/crates/layerfs-node/tests/fixtures/linked_git_worktree.cjs).
+This failure means linked worktrees need a self-contained, authorized Git
+materialization before import; the successful standalone-repository result does
+not establish that support.
