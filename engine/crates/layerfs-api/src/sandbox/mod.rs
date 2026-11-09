@@ -7,6 +7,7 @@ pub(crate) mod create;
 #[cfg(unix)]
 pub(crate) mod exec;
 mod mount;
+mod mount_observed;
 mod status;
 mod unmount;
 pub mod values;
@@ -21,4 +22,5 @@ pub use create::{ManagedSandbox, SandboxApi};
 pub use mount::BoundWorkspace;
 pub use mount::WorkspaceApi;
 pub use mount::{MountFailure, MountedWorkspace};
+pub use mount_observed::{MountCause, MountMilestone, MountObservation, ObservedMountFailure};
 pub use unmount::Unmounted;
