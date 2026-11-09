@@ -183,6 +183,19 @@ in `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-c
 This is a normal-close functional test, not a performance, automatic-recovery,
 Kubernetes or AutoTask integration proof.
 
+A separate same-host process-kill fixture paused the SDK after the real daemon
+returned Ready and before the SDK synchronized the replacement mount intent.
+After the exact SDK process was killed, a read-only verifier matched the saved
+before-Attach intent, original Bound receipt and unsynced Ready receipt. The
+original test Sandbox was then killed explicitly; its observed process and FUSE
+connection were absent afterward. An independent verifier and a fresh Node
+process without a Docker socket checked the retained records; Node refused the
+unresolved operation before connecting. Exact identities, retained
+resources and cleanup ownership are recorded in
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-mount-kill-20261110-f1649631e9-34ipcdzd/receipt.txt`.
+This observes unsynced bytes after a process kill, not after power loss; it does
+not implement automatic recovery or prove Kubernetes or AutoTask integration.
+
 The Linux Node binding also synchronizes a close intent before sending a durable
 Workspace's ordinary Unmount. It records the correlated terminal reply before
 removing and synchronizing the original Workspace record, then records the
