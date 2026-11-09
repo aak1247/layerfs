@@ -1,7 +1,10 @@
 //! The validator is read-only; privileged mount setup belongs to the caller.
 #![cfg(target_os = "linux")]
 
-use layerfs_sandbox::host_export::{ExportIdentity, HostExportRoot};
+use layerfs_sandbox::{
+    export_lease::HostExportLease,
+    host_export::{ExportIdentity, HostExportRoot},
+};
 use std::path::Path;
 
 #[test]
@@ -53,6 +56,52 @@ fn validates_exact_owned_shared_mount() {
         ..identity
     };
     assert!(HostExportRoot::reopen(path, &altered).is_err());
+}
+
+#[test]
+#[ignore = "requires a caller-owned empty shared root for a cross-process lock"]
+fn live_export_lease_excludes_another_process() {
+    let path = std::env::var_os("LAYERFS_EXPORT_ROOT").expect("owned export root");
+    let root = HostExportRoot::open_fresh(Path::new(&path)).unwrap();
+    if std::env::var_os("LAYERFS_EXPORT_LEASE_CHILD").is_some() {
+        let error = HostExportLease::try_acquire(root).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        return;
+    }
+    let lease = HostExportLease::try_acquire(root).unwrap();
+    lease.verify().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .env("LAYERFS_EXPORT_LEASE_CHILD", "1")
+        .arg("--exact")
+        .arg("live_export_lease_excludes_another_process")
+        .arg("--ignored")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    drop(lease);
+    let root = HostExportRoot::open_fresh(Path::new(&path)).unwrap();
+    HostExportLease::try_acquire(root)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires root and a caller-owned empty shared export"]
+fn lease_rechecks_freshness_after_the_original_observation() {
+    use std::{fs::OpenOptions, io::Write};
+    let path = std::env::var_os("LAYERFS_EXPORT_ROOT").expect("owned export root");
+    let root = HostExportRoot::open_fresh(Path::new(&path)).unwrap();
+    let marker = Path::new(&path).join(format!("owned-marker-{}", std::process::id()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .unwrap()
+        .write_all(b"owned fixture")
+        .unwrap();
+    assert!(HostExportLease::try_acquire(root).is_err());
+    std::fs::remove_file(marker).unwrap();
 }
 
 #[test]

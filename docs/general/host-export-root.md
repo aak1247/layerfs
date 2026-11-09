@@ -47,6 +47,16 @@ host removes its bind from a propagation peer group, the container may still
 see the old group unchanged. The daemon-side guard alone cannot establish that
 the host is still a member, identify consumers, or authorize their use.
 
+`HostExportLease::try_acquire` can additionally hold a nonblocking advisory
+exclusive lock on the verified host directory inode. This prevents two
+cooperating live owners from claiming that same inode, without creating a file
+in the fresh root. The locked descriptor and the mount/path guard are checked
+together. The lock disappears when its process loses the descriptor: it does
+not fence noncooperating processes, record a durable intent, prove daemon or
+consumer exit, or authorize adoption or recovery after a crash. A lifecycle
+adapter must retain both its lease and its separate durable evidence, including
+when a create or close result is unknown.
+
 External tests used separate, newly provisioned mount roots on the local host.
 They verified an isolated shared root, a path containing a space, refusal of a
 root in its parent's peer group, refusal of a nonempty fresh root, and failure

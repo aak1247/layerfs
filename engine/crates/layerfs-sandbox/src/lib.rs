@@ -3,6 +3,8 @@
 #[cfg(unix)]
 pub mod backend;
 #[cfg(target_os = "linux")]
+pub mod export_lease;
+#[cfg(target_os = "linux")]
 pub mod host_export;
 mod types;
 pub use types::{

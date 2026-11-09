@@ -44,17 +44,23 @@ impl HostExportRoot {
     /// The caller creates and configures the mount separately.
     pub fn open_fresh(path: &Path) -> io::Result<Self> {
         let guard = Self::open(path)?;
-        if fs::read_dir(&guard.path)?.next().transpose()?.is_some() {
+        guard.verify_fresh()?;
+        Ok(guard)
+    }
+
+    /// Rechecks both identity and the absence of entries and child mounts.
+    pub fn verify_fresh(&self) -> io::Result<()> {
+        self.verify()?;
+        if fs::read_dir(&self.path)?.next().transpose()?.is_some() {
             return Err(invalid("host export root is not empty"));
         }
         if mount_entries()?
             .iter()
-            .any(|entry| entry.target != guard.path && entry.target.starts_with(&guard.path))
+            .any(|entry| entry.target != self.path && entry.target.starts_with(&self.path))
         {
             return Err(invalid("host export root already contains mounts"));
         }
-        guard.verify()?;
-        Ok(guard)
+        self.verify()
     }
 
     /// Compares a root against previously observed identity fields.
@@ -101,6 +107,18 @@ impl HostExportRoot {
         }
         if observe(&self.path, &current)? != self.identity {
             return Err(invalid("host export mount identity changed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_descriptor(&self, file: &File) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        check_directory(&metadata)?;
+        if metadata.dev() != self.identity.device
+            || metadata.ino() != self.identity.inode
+            || descriptor_mount_id(file)? != self.identity.mount_id
+        {
+            return Err(invalid("host export locked directory changed"));
         }
         Ok(())
     }
