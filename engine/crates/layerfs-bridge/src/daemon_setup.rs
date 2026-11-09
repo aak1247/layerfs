@@ -6,7 +6,8 @@ use crate::{
 };
 use std::fmt;
 const LEGACY_MAGIC: &[u8] = b"LFSD\x05";
-const MAGIC: &[u8] = b"LFSD\x06";
+const PRECREATED_MAGIC: &[u8] = b"LFSD\x06";
+const MAGIC: &[u8] = b"LFSD\x07";
 /// The daemon reads at most this many bytes from its private config file.
 pub const MAX_DAEMON_SETUP_BYTES: usize = 8192;
 /// Explicit daemon startup resources; these are windows/admission, not file caps.
@@ -36,10 +37,48 @@ pub struct DaemonLimits {
 pub struct FreshWorkspaceSetup {
     /// Independently generated identity of this newly created Sandbox.
     pub sandbox: [u8; 32],
-    /// Pre-created, private and initially empty discovery directory.
+    /// Private, initially empty discovery directory.
     pub catalog_directory: String,
-    /// Pre-created, private and initially empty durable Overlay directory.
+    /// Private, initially empty durable Overlay directory.
     pub overlay_directory: String,
+    /// The daemon creates a new identity-specific directory on the volume.
+    /// False requires the caller to supply pre-created private directories.
+    pub create_directories: bool,
+}
+impl FreshWorkspaceSetup {
+    /// Returns the volume only for the exact identity-derived creation layout.
+    pub fn creation_volume(&self) -> Result<Option<std::path::PathBuf>, ControlError> {
+        use std::{fmt::Write as _, path::Path};
+        if !self.create_directories {
+            return Ok(None);
+        }
+        let catalog = Path::new(&self.catalog_directory);
+        let overlay = Path::new(&self.overlay_directory);
+        let sandbox = catalog
+            .parent()
+            .ok_or(ControlError("fresh Sandbox directory"))?;
+        let shared = sandbox
+            .parent()
+            .ok_or(ControlError("fresh Sandbox parent"))?;
+        let volume = shared
+            .parent()
+            .ok_or(ControlError("fresh Sandbox volume"))?;
+        let mut name = String::with_capacity(64);
+        for byte in self.sandbox {
+            write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        if catalog.file_name().and_then(|v| v.to_str()) != Some("catalog")
+            || overlay.file_name().and_then(|v| v.to_str()) != Some("overlays")
+            || overlay.parent() != Some(sandbox)
+            || sandbox.file_name().and_then(|v| v.to_str()) != Some(name.as_str())
+            || shared.file_name().and_then(|v| v.to_str()) != Some("layerfs-durable")
+            || !volume.is_absolute()
+            || volume == Path::new("/")
+        {
+            return Err(ControlError("fresh Sandbox creation layout"));
+        }
+        Ok(Some(volume.to_owned()))
+    }
 }
 /// Private configuration for one real daemon; caller supplies all policy/resource values.
 #[derive(Clone, Eq, PartialEq)]
@@ -98,6 +137,7 @@ impl DaemonSetup {
             out.put(&value.sandbox)?;
             out.blob(value.catalog_directory.as_bytes())?;
             out.blob(value.overlay_directory.as_bytes())?;
+            out.byte(u8::from(value.create_directories))?;
         }
         if out.0.len() > MAX_DAEMON_SETUP_BYTES {
             return Err(ControlError("daemon config size"));
@@ -110,7 +150,17 @@ impl DaemonSetup {
             return Err(ControlError("daemon config size"));
         }
         let legacy = bytes.starts_with(LEGACY_MAGIC);
-        let mut input = Reader::new(bytes, if legacy { LEGACY_MAGIC } else { MAGIC })?;
+        let precreated = bytes.starts_with(PRECREATED_MAGIC);
+        let mut input = Reader::new(
+            bytes,
+            if legacy {
+                LEGACY_MAGIC
+            } else if precreated {
+                PRECREATED_MAGIC
+            } else {
+                MAGIC
+            },
+        )?;
         let listen = input.text(128)?;
         let store = input.text(4096)?;
         let overlay = input.text(4096)?;
@@ -138,11 +188,26 @@ impl DaemonSetup {
         } else {
             match input.byte()? {
                 0 => None,
-                1 => Some(FreshWorkspaceSetup {
-                    sandbox: input.array()?,
-                    catalog_directory: input.text(4096)?,
-                    overlay_directory: input.text(4096)?,
-                }),
+                1 => {
+                    let sandbox = input.array()?;
+                    let catalog_directory = input.text(4096)?;
+                    let overlay_directory = input.text(4096)?;
+                    let create_directories = if precreated {
+                        false
+                    } else {
+                        match input.byte()? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(ControlError("daemon directory creation boolean")),
+                        }
+                    };
+                    Some(FreshWorkspaceSetup {
+                        sandbox,
+                        catalog_directory,
+                        overlay_directory,
+                        create_directories,
+                    })
+                }
                 _ => return Err(ControlError("daemon fresh Workspace boolean")),
             }
         };
@@ -233,6 +298,12 @@ impl DaemonSetup {
             }
             if catalog.starts_with(overlays) || overlays.starts_with(catalog) {
                 return Err(ControlError("fresh Workspace directories overlap"));
+            }
+            if let Some(volume) = fresh.creation_volume()? {
+                let store = std::path::Path::new(&self.store);
+                if !store.starts_with(&volume) || store == volume {
+                    return Err(ControlError("fresh Workspace volume placement"));
+                }
             }
         }
         Ok(())

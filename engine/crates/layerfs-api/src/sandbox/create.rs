@@ -314,6 +314,15 @@ pub(crate) fn create(
         let config = request.setup.encode().map_err(SandboxCause::Setup)?;
         if let Some(fresh) = &request.setup.fresh_workspace {
             let volume = std::path::Path::new("/layerfs-store");
+            if fresh
+                .creation_volume()
+                .map_err(SandboxCause::Setup)?
+                .is_some_and(|path| path != volume)
+            {
+                return Err(SandboxCause::Setup(ControlError(
+                    "durable Workspace creation must use the Store volume root",
+                )));
+            }
             for directory in [&fresh.catalog_directory, &fresh.overlay_directory] {
                 let directory = std::path::Path::new(directory);
                 if directory == volume || !directory.starts_with(volume) {

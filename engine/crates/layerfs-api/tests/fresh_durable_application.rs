@@ -88,6 +88,7 @@ fn setup(f: &support::Fixture, label: &str) -> (DaemonSetup, PathBuf) {
             sandbox: [8; 32],
             catalog_directory: f.directory.join("catalog").to_str().unwrap().into(),
             overlay_directory: f.directory.join("durable").to_str().unwrap().into(),
+            create_directories: false,
         }),
     };
     (setup, mounts)
@@ -211,6 +212,94 @@ fn failed_workspace_initialization_retains_store_and_never_uses_disposable_overl
     );
     drop(control);
     drop(process);
+    fs::remove_dir(mounts).unwrap();
+    nix::mount::umount2(
+        fixture.directory.join("fusectl").as_path(),
+        nix::mount::MntFlags::MNT_DETACH,
+    )
+    .unwrap();
+    fs::remove_dir(fixture.directory.join("fusectl")).unwrap();
+    fixture.cleanup();
+}
+
+#[test]
+fn real_daemon_creates_fresh_volume_directories_and_refuses_reuse() {
+    let fixture = support::Fixture::new_durable("fresh-created-volume", None);
+    let (mut setup, mounts) = setup(&fixture, "created");
+    let base = fixture
+        .directory
+        .join("layerfs-durable")
+        .join("08".repeat(32));
+    let fresh = setup.fresh_workspace.as_mut().unwrap();
+    fresh.catalog_directory = base.join("catalog").to_str().unwrap().into();
+    fresh.overlay_directory = base.join("overlays").to_str().unwrap().into();
+    fresh.create_directories = true;
+    assert!(!base.exists());
+    let (process, address) = start(&fixture, &setup);
+    let mut connection = connect(address);
+    let installed = layerfs_api::internal::install(&fixture.project, &mut connection).unwrap();
+    let mut control = Control::new(connection);
+    assert!(
+        matches!(control.call(Request::Hello(HelloRequest { expected_instance: None, wait_for_store: true })).unwrap(), Reply::Hello(status) if status.phase == DaemonPhase::ControlReady)
+    );
+    assert_eq!(
+        fs::metadata(&base).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let workspace = WorkspaceId::from_authority([53; 32]).unwrap();
+    let bound = layerfs_api::internal::workspace(&mut control)
+        .bind(workspace, fixture.project.branch.branch.id)
+        .unwrap();
+    assert!(base.join("catalog/roster.owner").is_file());
+    assert_eq!(
+        fs::read_dir(base.join("overlays"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".sqlite"))
+            .count(),
+        1
+    );
+    layerfs_api::internal::workspace(&mut control)
+        .unmount(bound.token, false)
+        .unwrap();
+    drop(control);
+    drop(process);
+
+    setup.overlay = fixture
+        .directory
+        .join("created-retry-template.sqlite")
+        .to_str()
+        .unwrap()
+        .into();
+    setup.existing_store = Some(installed.manifest);
+    let retry_config = config(&fixture, &setup, "created-retry.config");
+    let error_file = fixture.directory.join("created-retry.stderr");
+    let mut retry = Process(
+        Command::new(daemon_binary::path())
+            .arg("--config")
+            .arg(retry_config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&error_file).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = retry.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "duplicate Sandbox identity did not refuse"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success());
+    assert!(fs::read_to_string(error_file)
+        .unwrap()
+        .contains("SandboxCreate"));
+    assert!(base.join("catalog/roster.owner").is_file());
     fs::remove_dir(mounts).unwrap();
     nix::mount::umount2(
         fixture.directory.join("fusectl").as_path(),

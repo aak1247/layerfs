@@ -291,3 +291,17 @@ The output and binaries remain under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/fresh-daemon-v2-20261109-v7sNIr7k/`.
 This does not prove automatic daemon restart, container or Pod recreation,
 node failure, physical power loss, or AutoTask integration.
+
+On 2026-11-10 the real daemon was additionally tested with version-7 setup:
+it created its private per-Sandbox directories on the Store volume, bound and
+closed a Workspace, and refused a second creation with the same identity while
+preserving the first catalog. The previous process-loss and refusal cases also
+passed: four tests, exit 0, in an isolated test-only FUSE container with the
+same image and kernel scope above. The test executable SHA-256 was
+`e9fa7fd5a91943543c1896e8d8289addc64dc0e764eaf4e22ff407adb117799f`, the
+daemon was `2ea9462249dc05aef1241f5afa0d057b7d502c685dbdf557cfe664d6bd7b06f3`,
+and the test source was
+`14ff4226f2277931a1cdc52ee7ca2a381da70bb15df86fbc443b04f09dfa5a06`.
+The output and binaries are retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/fresh-volume-daemon-20261110-k32dPXv8/`.
+This is still not automatic recovery or AutoTask integration.

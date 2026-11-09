@@ -62,13 +62,15 @@ pub(super) fn read(path: &Path) -> io::Result<DaemonSetup> {
             if path.starts_with(directory) || directory.starts_with(path) {
                 return Err(invalid("private config overlaps durable Workspace"));
             }
-            private_directory(directory, false)?;
-            private_directory(
-                directory
-                    .parent()
-                    .ok_or_else(|| invalid("durable directory parent"))?,
-                false,
-            )?;
+            if !fresh.create_directories {
+                private_directory(directory, false)?;
+                private_directory(
+                    directory
+                        .parent()
+                        .ok_or_else(|| invalid("durable directory parent"))?,
+                    false,
+                )?;
+            }
         }
     }
     if let Some(manifest) = &config.existing_store {

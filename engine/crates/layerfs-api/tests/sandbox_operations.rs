@@ -470,6 +470,7 @@ fn fresh_durable_workspace_outside_store_volume_refuses_before_deployment() {
         sandbox: [9; 32],
         catalog_directory: "/layerfs-store/sandboxes/one/catalog".into(),
         overlay_directory: "/layerfs-local/durable".into(),
+        create_directories: false,
     });
     let result = api.create(
         SandboxCreate {
@@ -494,5 +495,44 @@ fn fresh_durable_workspace_outside_store_volume_refuses_before_deployment() {
     assert_eq!(failure.phase, SandboxPhase::Validate);
     assert!(matches!(failure.cause, SandboxCause::Setup(_)));
     assert!(failure.sandbox.is_none() && failure.control.is_none());
+    assert!(peer.finish().is_empty());
+}
+
+#[test]
+fn created_workspace_must_use_the_actual_docker_volume_root() {
+    let project = ProjectFixture::new();
+    let (docker, peer) = Peer::new(vec![], 4096);
+    let api = SandboxApi::new(docker);
+    let mut deployment_setup = setup([32; 32], duplex::public_key(&[31; 32]).unwrap());
+    let base = format!("/layerfs-store/other/layerfs-durable/{}", "09".repeat(32));
+    deployment_setup.store = "/layerfs-store/other/global/store.sqlite".into();
+    deployment_setup.fresh_workspace = Some(FreshWorkspaceSetup {
+        sandbox: [9; 32],
+        catalog_directory: format!("{base}/catalog"),
+        overlay_directory: format!("{base}/overlays"),
+        create_directories: true,
+    });
+    let result = api.create(
+        SandboxCreate {
+            deployment: layerfs_sandbox::backend::docker::SandboxRequest {
+                image: IMAGE.into(),
+                store_volume: "lfs-test-borrowed".into(),
+                port: 30421,
+                labels: vec![],
+            },
+            setup: deployment_setup,
+            executable: project.project.store.path.clone(),
+            controller_private: [31; 32],
+            daemon_peer: duplex::public_key(&[32; 32]).unwrap(),
+            startup_wait: Duration::from_secs(2),
+            connect_host: None,
+        },
+        &project.project,
+    );
+    let Err(failure) = result else {
+        panic!("wrong Store volume root must refuse")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Validate);
+    assert!(matches!(failure.cause, SandboxCause::Setup(_)));
     assert!(peer.finish().is_empty());
 }

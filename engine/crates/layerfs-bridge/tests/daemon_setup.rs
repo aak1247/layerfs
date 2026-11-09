@@ -40,9 +40,14 @@ fn fresh_workspace_roundtrips_and_old_records_remain_disposable() {
         sandbox: [3; 32],
         catalog_directory: "/volume/sandboxes/one/catalog".into(),
         overlay_directory: "/volume/sandboxes/one/overlays".into(),
+        create_directories: false,
     });
     let encoded = new.encode().unwrap();
     assert_eq!(DaemonSetup::decode(&encoded).unwrap(), new);
+    let mut previous = encoded.clone();
+    assert_eq!(previous.pop(), Some(0));
+    previous[4] = 6;
+    assert_eq!(DaemonSetup::decode(&previous).unwrap(), new);
     for end in 0..encoded.len() {
         assert!(DaemonSetup::decode(&encoded[..end]).is_err());
     }
@@ -53,12 +58,45 @@ fn fresh_workspace_roundtrips_and_old_records_remain_disposable() {
 }
 
 #[test]
+fn generated_directories_are_bound_to_the_volume_and_sandbox_identity() {
+    let mut value = setup();
+    let base = format!("/volume/layerfs-durable/{}", "03".repeat(32));
+    value.fresh_workspace = Some(FreshWorkspaceSetup {
+        sandbox: [3; 32],
+        catalog_directory: format!("{base}/catalog"),
+        overlay_directory: format!("{base}/overlays"),
+        create_directories: true,
+    });
+    let encoded = value.encode().unwrap();
+    assert_eq!(DaemonSetup::decode(&encoded).unwrap(), value);
+    assert_eq!(
+        value
+            .fresh_workspace
+            .as_ref()
+            .unwrap()
+            .creation_volume()
+            .unwrap()
+            .unwrap(),
+        std::path::Path::new("/volume")
+    );
+    let mut wrong = value.clone();
+    wrong.fresh_workspace.as_mut().unwrap().sandbox = [4; 32];
+    assert!(wrong.encode().is_err());
+    let mut wrong = value.clone();
+    wrong.fresh_workspace.as_mut().unwrap().overlay_directory = format!("{base}/other");
+    assert!(wrong.encode().is_err());
+    value.store = "/other/store.sqlite".into();
+    assert!(value.encode().is_err());
+}
+
+#[test]
 fn fresh_workspace_rejects_overlap_and_disposable_existing_store() {
     let mut value = setup();
     value.fresh_workspace = Some(FreshWorkspaceSetup {
         sandbox: [3; 32],
         catalog_directory: "/volume/sandboxes/one/catalog".into(),
         overlay_directory: "/volume/sandboxes/one/overlays".into(),
+        create_directories: false,
     });
     for invalid in [
         "/workspaces/hidden",

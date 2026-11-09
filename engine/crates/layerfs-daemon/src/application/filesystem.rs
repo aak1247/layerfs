@@ -54,6 +54,26 @@ fn configure(
             "durable Store identity or privacy",
         )));
     }
+    let profile = layerfs_overlay::ProfileConfig {
+        pager_kib: setup.limits.pager_kib,
+        max_pages: None,
+    };
+    let creation_volume = fresh.creation_volume().map_err(|cause| {
+        ServiceStartCause::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, cause))
+    })?;
+    if let Some(volume) = creation_volume {
+        return service
+            .activate_fresh_volume(
+                owner,
+                crate::control::FreshVolumeConfig {
+                    volume,
+                    sandbox: fresh.sandbox,
+                    profile,
+                    store_device: metadata.dev(),
+                },
+            )
+            .map_err(ServiceStartCause::FreshVolume);
+    }
     service
         .activate_fresh_control(
             owner,
@@ -61,10 +81,7 @@ fn configure(
                 catalog_directory: fresh.catalog_directory.clone().into(),
                 overlay_directory: fresh.overlay_directory.clone().into(),
                 sandbox: fresh.sandbox,
-                profile: layerfs_overlay::ProfileConfig {
-                    pager_kib: setup.limits.pager_kib,
-                    max_pages: None,
-                },
+                profile,
                 store_device: metadata.dev(),
             },
         )

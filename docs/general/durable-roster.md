@@ -62,15 +62,26 @@ directory handle. Both directories must share the caller-observed Durable Store
 device. An admitted failure retains the exact error and refuses subsequent
 effectful controls, rather than falling back to disposable Workspaces.
 
-The Linux daemon's version-6 private setup can select this fresh path with a
-nonzero Sandbox identity and the two pre-created private directories. The
+The Linux daemon's version-7 private setup can select this fresh path with a
+nonzero Sandbox identity and either two pre-created private directories or a
+new identity-specific directory beneath the authenticated Store volume. The
 caller supplies a fresh identity and authenticates the physical Store. A
 Disposable installation is refused before Store creation; failure after an
 installed Store retains the original service and reports the Retained phase.
-Version-5 setup remains readable and keeps its disposable behavior. The Docker
-SDK checks that both requested directories are on the named Store volume; it
-does not yet create them or prove an old container and its consumers exited.
+Version-5 setup remains readable and keeps its disposable behavior; version 6
+keeps its pre-created-directory meaning. The Docker SDK validates that both
+requested directories are on the named Store volume, but does not yet select
+the new setup or prove an old container and its consumers exited.
 This fresh path refuses existing contents and is not recovery.
+
+Automatic directory creation uses the fixed `layerfs-durable/<Sandbox-id>`
+layout. It creates the identity directory exclusively under retained parent
+descriptors and synchronizes the volume, parent and private children before
+initializing the catalog. If the identity already exists, the daemon refuses
+without adopting it. A failure retains the original phase and acquired owners;
+activation rechecks the original directory chain and keeps both errors if the
+chain changes during an already attempted activation. The caller must persist
+its creation intent before starting the daemon.
 
 The directory contains an authority-bound owner file, immutable Workspace and
 lifecycle event files, a fixed-width hash-chained ledger and a durable ledger
