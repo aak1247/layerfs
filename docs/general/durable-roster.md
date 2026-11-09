@@ -120,6 +120,15 @@ Docker socket refused to replay it. The original test container, volume and
 diagnostic evidence are retained under the same proof directory. This failed
 attempt is not a 32-Workspace capacity result.
 
+A separate manually assembled durable Service later mounted 32 real FUSE
+Workspaces at once, refused a 33rd at its configured capacity and acknowledged
+closure of all 32. Its successful output and hashes are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-capacity-fuse-v2-20261110-8m775z31/`.
+The prior test attempt had mounted 32 but failed an incorrect assertion about
+the direct API's wrapped refusal; that failure is retained separately. This
+functional capacity check does not measure performance or establish SDK or
+Kubernetes capacity.
+
 For a Sandbox record explicitly marked durable, the Node binding records a
 private mount intent before Bind, the original Branch snapshot before Attach,
 and the exact Ready receipt before reporting success. It synchronizes the
