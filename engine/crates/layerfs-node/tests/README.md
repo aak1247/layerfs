@@ -49,3 +49,7 @@ retained fixture (`LAYERFS_CLOSE_PROOF`). It decodes the original close intent
 and its pre-sync replacement and matches the Unmounted token. The caller must
 separately fence and identify the original process; this test never infers
 process exit or mounts from record contents.
+
+`external_mount_reply` similarly checks a retained mount fixture supplied by
+`LAYERFS_MOUNT_PROOF`: it matches the original Bound and pre-sync Ready replies
+without claiming that unsynced bytes survive power loss or proving a fence.
