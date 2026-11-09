@@ -16,11 +16,44 @@ pub struct KernelServing {
     /// Short registration and observation sections only; never held across
     /// a mount, a kernel request or an engine job.
     pub(super) config: KernelConfig,
+    host_export: Option<super::ContainerExportRoot>,
 }
 impl KernelServing {
     /// Starts the fixed worker pool once. No mount, device or kernel effect.
     pub fn start(config: KernelConfig) -> Result<Self, std::io::Error> {
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            host_export: None,
+        })
+    }
+    /// Retains and rechecks a daemon-side host export for every Attach.
+    pub fn start_with_export(
+        config: KernelConfig,
+        host_export: super::ContainerExportRoot,
+    ) -> Result<Self, std::io::Error> {
+        if host_export.path() != config.mounts {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host Workspace export path differs from kernel mount root",
+            ));
+        }
+        host_export.verify()?;
+        Ok(Self {
+            config,
+            host_export: Some(host_export),
+        })
+    }
+    pub(super) fn verify_export(&self) -> Result<(), std::io::Error> {
+        match &self.host_export {
+            Some(export) => export.verify(),
+            None => Ok(()),
+        }
+    }
+    pub(super) fn verify_attached(&self, ready: &ReadyMount) -> Result<(), std::io::Error> {
+        match &self.host_export {
+            Some(export) => export.verify_mount(ready),
+            None => Ok(()),
+        }
     }
     pub(super) fn register(&self, mount: KernelMount) -> Result<MountRequests, DispatchError> {
         Ok(MountRequests::new(mount))
@@ -37,6 +70,7 @@ impl fmt::Debug for KernelServing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KernelServing")
             .field("config", &self.config)
+            .field("host_export", &self.host_export)
             .finish()
     }
 }

@@ -5,11 +5,17 @@
 #[path = "support/installed_store.rs"]
 mod support;
 
-use layerfs_bridge::control::{Reply, Request, UnmountControl};
+use layerfs_bridge::{
+    control::{Reply, Request, TeardownStage, UnmountControl},
+    daemon_setup::HostExportIdentity,
+};
 use layerfs_daemon::{
     bootstrap::open_store,
-    control::{DurableControlConfig, KernelConfig, KernelServing, Service},
-    durable_roster::{Authority, Roster},
+    control::{
+        ContainerExportRoot, DurableControlConfig, Failure, KernelConfig, KernelServing,
+        RecordedCloseFailure, Service,
+    },
+    durable_roster::{Authority, Roster, RosterError},
     Owner, OwnerConfig,
 };
 use layerfs_history::WorkspaceId;
@@ -63,19 +69,31 @@ fn owned_mounts_reach_host_and_restricted_consumer() {
     .unwrap();
     let authority = Authority::for_catalog([9; 32], store.history()).unwrap();
     let roster = Roster::create(&fixture.directory.join("catalog"), authority).unwrap();
-    let kernel = Arc::new(
-        KernelServing::start(KernelConfig {
-            mounts: exported.clone(),
-            owner_uid: 0,
-            owner_gid: 0,
-            command_uid: uid,
-            command_gid: gid,
-            ready_wait: Duration::from_secs(10),
-            drain_wait: Duration::from_secs(10),
-            control: fixture.directory.join("unused-fusectl"),
-        })
-        .unwrap(),
-    );
+    let config = KernelConfig {
+        mounts: exported.clone(),
+        owner_uid: 0,
+        owner_gid: 0,
+        command_uid: uid,
+        command_gid: gid,
+        ready_wait: Duration::from_secs(10),
+        drain_wait: Duration::from_secs(10),
+        control: fixture.directory.join("unused-fusectl"),
+    };
+    let kernel = Arc::new(match std::env::var("LAYERFS_TEST_EXPORT_BOOT") {
+        Ok(boot_id) => {
+            let number = |name| std::env::var(name).unwrap().parse().unwrap();
+            let identity = HostExportIdentity {
+                boot_id,
+                device: number("LAYERFS_TEST_EXPORT_DEVICE"),
+                inode: number("LAYERFS_TEST_EXPORT_INODE"),
+                shared_peer: number("LAYERFS_TEST_EXPORT_PEER"),
+            };
+            let guard = ContainerExportRoot::open_fresh(&exported, &identity).unwrap();
+            KernelServing::start_with_export(config, guard).unwrap()
+        }
+        Err(std::env::VarError::NotPresent) => KernelServing::start(config).unwrap(),
+        Err(error) => panic!("invalid host export proof identity: {error}"),
+    });
     let mut service = Service::with_kernel(store, &owner, kernel);
     assert!(service
         .activate_durable_control(
@@ -143,6 +161,41 @@ fn owned_mounts_reach_host_and_restricted_consumer() {
     );
     assert!(!dirs[0].join("sibling-only").exists());
     assert!(!dirs[1].join("from-host").exists());
+    if std::env::var_os("LAYERFS_VISIBILITY_EXPECT_EXPORT_CHANGE").is_some() {
+        let close = |token| {
+            service
+                .execute_control(&Request::Unmount(UnmountControl {
+                    token,
+                    discard: true,
+                }))
+                .unwrap_err()
+        };
+        let Failure::RecordedClose(first) = close(tokens[0]) else {
+            panic!("expected retained recorded close")
+        };
+        let RecordedCloseFailure::Control {
+            cause: Failure::Retained(custody),
+            ..
+        } = *first
+        else {
+            panic!("expected retained original connection: {first:?}")
+        };
+        assert_eq!(custody.stage, TeardownStage::Detach);
+        assert!(!custody.detached);
+        let Failure::RecordedClose(second) = close(tokens[1]) else {
+            panic!("expected durable close refusal")
+        };
+        let RecordedCloseFailure::Discovery(RosterError::PendingClose(original)) = *second else {
+            panic!("expected original pending close: {second:?}")
+        };
+        assert_eq!(original.token, tokens[0]);
+        fs::write(
+            proof.join("closed"),
+            b"original connection retained; next close refused by original intent\n",
+        )
+        .unwrap();
+        return;
+    }
     for token in tokens {
         assert_eq!(
             service

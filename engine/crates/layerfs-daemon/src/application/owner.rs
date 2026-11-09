@@ -51,13 +51,30 @@ pub struct Application {
 }
 impl Application {
     pub(super) fn start(setup: DaemonSetup) -> Result<Arc<Self>, ApplicationError> {
-        // Until this application can retain and revalidate the host binding,
-        // accepting its identity as ordinary container-local setup would be
-        // an unsafe downgrade. Refuse before any Overlay or Store effect.
+        // Open the export before any Overlay or Store effect and retain its
+        // exact descriptors through the kernel serving owner's lifetime.
+        #[cfg(target_os = "linux")]
+        let host_export = setup
+            .host_export
+            .as_ref()
+            .map(|expected| {
+                crate::control::ContainerExportRoot::open_fresh(
+                    std::path::Path::new(&setup.mounts),
+                    expected,
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                ApplicationError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("host Workspace export preflight: {error}"),
+                ))
+            })?;
+        #[cfg(not(target_os = "linux"))]
         if setup.host_export.is_some() {
             return Err(ApplicationError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "host Workspace export verification is not assembled",
+                "host Workspace export requires Linux",
             )));
         }
         let l = setup.limits;
@@ -127,7 +144,11 @@ impl Application {
             },
             None => None,
         };
-        let kernel = match super::filesystem::assemble(&setup) {
+        #[cfg(target_os = "linux")]
+        let assembled = super::filesystem::assemble(&setup, host_export);
+        #[cfg(not(target_os = "linux"))]
+        let assembled = super::filesystem::assemble(&setup);
+        let kernel = match assembled {
             Ok(kernel) => kernel,
             Err(cause) => {
                 return Err(ApplicationError::AfterOverlay {

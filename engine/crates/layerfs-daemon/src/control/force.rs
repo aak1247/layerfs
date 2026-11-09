@@ -258,6 +258,25 @@ impl Service {
         let Attached { mut session, ready } = *attached;
         let mount = session.mount();
         let observer = session.observer();
+        if let Some(serving) = &self.kernel {
+            // A stalled connection was already detached; it has no child
+            // mount left to compare, but its export root must remain pinned.
+            let checked = if stalled {
+                serving.verify_export()
+            } else {
+                serving.verify_attached(&ready)
+            };
+            if let Err(error) = checked {
+                return Err(self.retain(
+                    token,
+                    TeardownStage::Detach,
+                    format!("host Workspace export before forced teardown: {error}"),
+                    Some(observer),
+                    Box::new((session, commit)),
+                    None,
+                ));
+            }
+        }
         let mut facts = ForcedFacts {
             abort: AbortDisposition::Written,
             detach: if stalled {

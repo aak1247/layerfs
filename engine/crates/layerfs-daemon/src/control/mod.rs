@@ -15,6 +15,8 @@ mod force;
 mod fresh_control;
 #[cfg(target_os = "linux")]
 mod fresh_volume;
+#[cfg(target_os = "linux")]
+mod host_export;
 mod inspect;
 mod invalidate;
 mod kernel;
@@ -41,6 +43,8 @@ pub use durable_control::{DurableControlCause, DurableControlConfig, DurableCont
 pub use fresh_control::{FreshControlCause, FreshControlConfig, FreshControlFailure};
 #[cfg(target_os = "linux")]
 pub use fresh_volume::{FreshVolumeCause, FreshVolumeConfig, FreshVolumeFailure};
+#[cfg(target_os = "linux")]
+pub use host_export::ContainerExportRoot;
 pub use kernel::{KernelConfig, KernelServing};
 pub(crate) use observation::{reply_token, request_token};
 #[cfg(target_os = "linux")]

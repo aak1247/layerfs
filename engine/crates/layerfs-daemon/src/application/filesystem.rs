@@ -111,7 +111,7 @@ pub(super) fn assemble(
 pub(super) use linux::assemble;
 #[cfg(target_os = "linux")]
 mod linux {
-    use crate::control::{KernelConfig, KernelServing};
+    use crate::control::{ContainerExportRoot, KernelConfig, KernelServing};
     use layerfs_bridge::daemon_setup::DaemonSetup;
     use nix::{
         fcntl::OFlag,
@@ -136,10 +136,17 @@ mod linux {
     /// device is opened and nothing is mounted until an explicit Attach.
     pub(in crate::application) fn assemble(
         setup: &DaemonSetup,
+        host_export: Option<ContainerExportRoot>,
     ) -> io::Result<Option<Arc<KernelServing>>> {
         let mounts = Path::new(&setup.mounts);
+        if let Some(export) = &host_export {
+            export.verify()?;
+        }
         device()?;
-        home(mounts)?;
+        match &host_export {
+            Some(export) => export.verify()?,
+            None => home(mounts)?,
+        }
         // Beside the Overlay file, in the directory configuration checked
         // private, so no command identity can reach another connection.
         // Best effort: where the mount is refused (a user namespace refuses
@@ -155,7 +162,7 @@ mod linux {
                 layerfs_fuse::mount::CONTROL.into()
             }
         };
-        KernelServing::start(KernelConfig {
+        let config = KernelConfig {
             mounts: mounts.to_owned(),
             owner_uid: Uid::effective().as_raw(),
             owner_gid: Gid::effective().as_raw(),
@@ -164,7 +171,11 @@ mod linux {
             ready_wait: READY_WAIT,
             drain_wait: DRAIN_WAIT,
             control,
-        })
+        };
+        match host_export {
+            Some(export) => KernelServing::start_with_export(config, export),
+            None => KernelServing::start(config),
+        }
         .map(|serving| Some(Arc::new(serving)))
         .map_err(|failure| io::Error::other(failure.to_string()))
     }

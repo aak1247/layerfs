@@ -78,6 +78,18 @@ impl Service {
         let Attached { mut session, ready } = attached;
         let mount = session.mount();
         let observer = session.observer();
+        if let Some(serving) = &self.kernel {
+            if let Err(error) = serving.verify_attached(&ready) {
+                return Err(self.retain(
+                    token,
+                    TeardownStage::Detach,
+                    format!("host Workspace export before detach: {error}"),
+                    Some(observer),
+                    Box::new(session),
+                    None,
+                ));
+            }
+        }
         match session.detach() {
             Ok(Detach::Detached) => {}
             Ok(Detach::Busy) => {

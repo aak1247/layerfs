@@ -1,7 +1,7 @@
 # Host export root admission
 
-Status: Linux read-only validation primitive. It is not connected to the SDK,
-Docker Sandbox creation, AutoTask, or a Kubernetes node service.
+Status: Linux host- and daemon-side validation primitives. They are not
+connected to SDK Sandbox creation, AutoTask, or a Kubernetes node service.
 
 `layerfs_sandbox::host_export::HostExportRoot::open_fresh` checks an explicitly
 provisioned, empty mount root before a trusted local adapter considers exposing
@@ -24,6 +24,29 @@ has been lost does **not** prove uninterrupted identity: kernel identifiers can
 be reused. A match is not an owner-exit proof or an authorization to replay a
 mount, close, commit or other operation.
 
+The optional version 8 daemon setup carries the boot ID, directory device and
+inode, and shared propagation peer, but not the host mount ID: a container's
+mount namespace gives the same bind a different ID. Ordinary configurations
+continue to encode as version 7. Before opening an Overlay or Store, a daemon
+that receives version 8 independently checks an empty export in its own mount
+namespace, pins its own descriptor chain and local mount ID, and compares the
+cross-namespace fields. The daemon requires the initial user namespace and
+root-owned, non-writable path components. Unsupported or mismatched setups
+are refused, rather than downgraded to a container-local Workspace.
+
+The kernel serving owner retains this daemon-side guard. It rechecks the root
+before an Attach, and checks both the root and the exact child mount ID and
+device before acknowledging Ready. Normal and forced teardown also check the
+original root and child identity before acting; if the check fails after a
+connection exists, the connection and its original close intent stay retained.
+These checks are observations at operation boundaries, not atomic protection
+against a privileged concurrent mount change.
+
+The host must independently retain and recheck its own `HostExportRoot`: if a
+host removes its bind from a propagation peer group, the container may still
+see the old group unchanged. The daemon-side guard alone cannot establish that
+the host is still a member, identify consumers, or authorize their use.
+
 External tests used separate, newly provisioned mount roots on the local host.
 They verified an isolated shared root, a path containing a space, refusal of a
 root in its parent's peer group, refusal of a nonempty fresh root, and failure
@@ -31,6 +54,19 @@ after an original held root's propagation or ancestor permissions changed. The
 exact test mounts were normally unmounted; the owned fixtures were removed.
 Receipts are retained at `/tmp/layerfs-export-fence-smu1qg7u/` and
 `/tmp/layerfs-export-ancestor-4xq566wo/`.
+
+Further isolated tests compared the recorded identity inside a real Docker
+namespace, rejected altered identity fields and a nonempty root, and refused
+a later propagation change. The complete daemon also started and reported its
+listener with the verified export in a FUSE-capable Docker container. A
+separately assembled durable daemon Service
+attached two FUSE Workspaces with this guard; a host process and a restricted
+nonroot container accessed only their selected Workspace and both mounts were
+normally closed. In a second run, changing the producer's propagation caused
+the first recorded close to retain its original connection; the next close was
+refused by that pending intent. After the test owner and consumer exited, only
+the exact test mounts were normally unmounted. These are manually assembled
+Service proofs, not SDK or AutoTask integration or automatic recovery.
 
 An adapter still needs its own exclusive lifecycle authority, a durable intent
 and receipt, proof that its Docker or node runtime addresses this same root,

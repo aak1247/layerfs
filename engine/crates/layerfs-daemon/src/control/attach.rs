@@ -90,6 +90,13 @@ impl Service {
         token: WorkspaceToken,
         workspace: &Arc<BoundWorkspace>,
     ) -> Result<Attached, Stop> {
+        serving.verify_export().map_err(|error| {
+            Stop::Unattached(Failure::kernel(
+                ControlCode::Failed,
+                "attach:host_export",
+                error.to_string(),
+            ))
+        })?;
         let directory = serving.directory(token);
         let Some(text) = directory
             .to_str()
@@ -157,6 +164,11 @@ impl Service {
             }
         };
         let config = &serving.config;
+        if let Err(error) = serving.verify_export() {
+            drop(queue);
+            let failure = failed(ControlCode::Failed, "attach:host_export", error.to_string());
+            return Err(self.unwind(workspace, mount, failure));
+        }
         let attached = KernelSession::attach(
             SessionConfig {
                 directory,
@@ -177,7 +189,17 @@ impl Service {
         let failure = match attached {
             Ok(session) => {
                 return match ready(token, text, &session) {
-                    Some(ready) => Ok(Attached { session, ready }),
+                    Some(ready) => match serving.verify_attached(&ready) {
+                        Ok(()) => Ok(Attached { session, ready }),
+                        Err(error) => Err(Stop::Retained(Box::new(Kept {
+                            ready: Some(ready),
+                            stage: TeardownStage::Detach,
+                            detail: format!("host Workspace export changed after attach: {error}"),
+                            observer: Some(session.observer()),
+                            evidence: Evidence::Other(Box::new(session)),
+                            forced: None,
+                        }))),
+                    },
                     // A serving session always recorded both receipts; keep the
                     // owner rather than guess if that invariant is ever broken.
                     None => Err(Stop::Retained(Box::new(Kept {
