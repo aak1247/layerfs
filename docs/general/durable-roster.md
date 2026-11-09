@@ -183,6 +183,18 @@ in `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-c
 This is a normal-close functional test, not a performance, automatic-recovery,
 Kubernetes or AutoTask integration proof.
 
+Another fresh SDK/Docker/FUSE fixture configured a capacity of 100, mounted 100
+distinct durable Workspaces of one Branch, refused the 101st and acknowledged
+all 100 normal discarding closes. An independent Node process without network
+or a Docker socket validated 100 mount intents, 100 close receipts and no
+remaining Workspace records before the expected unavailable-socket error. The
+original SDK Sandbox later exited, its observed process was absent, and host
+FUSE connections returned to baseline. The receipt, exact retained resources
+and cleanup ownership are in
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-hundred-20261110-a9e0f69a56-4kej2qio/receipt.txt`.
+This is one functional run, not a sustained-performance, power-loss,
+automatic-recovery, Kubernetes or AutoTask integration proof.
+
 A separate same-host process-kill fixture paused the SDK after the real daemon
 returned Ready and before the SDK synchronized the replacement mount intent.
 After the exact SDK process was killed, a read-only verifier matched the saved
