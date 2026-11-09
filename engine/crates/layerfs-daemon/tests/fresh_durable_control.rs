@@ -16,7 +16,13 @@ use layerfs_daemon::{
 use layerfs_history::WorkspaceId;
 use layerfs_overlay::ProfileConfig;
 use layerfs_storage::ReservationBlocks;
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, sync::Arc};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::PathBuf,
+    process::Command,
+    sync::Arc,
+};
 
 fn setup(fixture: &support::Fixture) -> (Arc<Store>, Owner, FreshControlConfig) {
     fs::set_permissions(&fixture.directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -46,6 +52,7 @@ fn setup(fixture: &support::Fixture) -> (Arc<Store>, Owner, FreshControlConfig) 
         overlay_directory: overlays,
         sandbox: [8; 32],
         profile: ProfileConfig::default(),
+        store_device: fs::metadata(&fixture.config.path).unwrap().dev(),
     };
     (store, owner, config)
 }
@@ -163,6 +170,27 @@ fn disposable_store_is_rejected_before_initializing_a_catalog() {
             layerfs_bridge::control::ControlCode::Unknown,
             _
         ))
+    ));
+    assert_eq!(fs::read_dir(config.catalog_directory).unwrap().count(), 0);
+    drop(error);
+    drop(service);
+    owner.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn different_store_device_is_rejected_without_publishing_a_catalog() {
+    let fixture = support::Fixture::new_durable(1, "fresh-device");
+    let (store, owner, mut config) = setup(&fixture);
+    config.store_device ^= 1;
+    let mut service = Service::new(store.clone(), &owner);
+    let error = service
+        .activate_fresh_control(&owner, config.clone())
+        .unwrap_err();
+    assert!(matches!(
+        error.cause,
+        FreshControlCause::Invalid("separate local durable directories")
     ));
     assert_eq!(fs::read_dir(config.catalog_directory).unwrap().count(), 0);
     drop(error);

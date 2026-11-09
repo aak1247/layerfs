@@ -7,7 +7,7 @@ use layerfs_bridge::{
     provision::StoreManifest,
 };
 use layerfs_storage::ReservationBlocks;
-use std::path::Path;
+use std::{io::Write, path::Path};
 
 impl Application {
     pub(super) fn install(
@@ -16,6 +16,16 @@ impl Application {
         manifest: StoreManifest,
         slot: usize,
     ) -> Result<bool, ConnectionFailure> {
+        if self.setup.fresh_workspace.is_some()
+            && manifest.profile != layerfs_bridge::provision::StoreProfile::Durable
+        {
+            return refuse(
+                connection,
+                slot,
+                RefusalKind::Invalid,
+                "fresh durable Workspaces require a Durable Store",
+            );
+        }
         let admitted = {
             let mut state = self.state.lock().map_err(|_| self.poisoned(slot))?;
             match state.startup.phase {
@@ -27,43 +37,12 @@ impl Application {
             }
         };
         if !admitted {
-            let refusal = InstallReply::Refused(InstallRefusal {
-                phase: InstallPhase::Request,
-                kind: RefusalKind::Exists,
-                claim_acknowledged: false,
-                written: 0,
-                published: false,
-                os_code: None,
-                detail: "one original installer already admitted; no resume/replay".into(),
-            });
-            let bytes = refusal.encode().map_err(|cause| ConnectionFailure {
+            return refuse(
+                connection,
                 slot,
-                received: None,
-                original: None,
-                cause: ApplicationError::Protocol(cause),
-                fence_error: None,
-                diagnostic_error: None,
-            })?;
-            connection
-                .send
-                .send(&bytes)
-                .map_err(|cause| ConnectionFailure {
-                    slot,
-                    received: None,
-                    original: None,
-                    cause: ApplicationError::Channel(cause),
-                    fence_error: None,
-                    diagnostic_error: None,
-                })?;
-            connection.send.close().map_err(|cause| ConnectionFailure {
-                slot,
-                received: None,
-                original: None,
-                cause: ApplicationError::Channel(cause),
-                fence_error: None,
-                diagnostic_error: None,
-            })?;
-            return Ok(false);
+                RefusalKind::Exists,
+                "one original installer already admitted; no resume/replay",
+            );
         }
         let l = self.setup.limits;
         let settings = StoreSettings {
@@ -92,14 +71,8 @@ impl Application {
         };
         match result {
             Ok(installed) => {
-                state.startup.service = Some(super::filesystem::service(
-                    installed.opened.store.clone(),
-                    &self.owner,
-                    self.kernel.as_ref(),
-                    l.serial_low_water,
-                ));
+                self.publish_service(&mut state, installed.opened.store.clone());
                 state.startup.installed = Some(installed);
-                state.startup.phase = DaemonPhase::ControlReady;
                 self.changed.notify_all();
                 Ok(true)
             }
@@ -115,13 +88,7 @@ impl Application {
                     && failure.opened.is_some();
                 if ready {
                     let opened = failure.opened.as_ref().expect("validated original Store");
-                    state.startup.service = Some(super::filesystem::service(
-                        opened.store.clone(),
-                        &self.owner,
-                        self.kernel.as_ref(),
-                        l.serial_low_water,
-                    ));
-                    state.startup.phase = DaemonPhase::ControlReady;
+                    self.publish_service(&mut state, opened.store.clone());
                 } else {
                     state.startup.phase = DaemonPhase::Retained;
                 }
@@ -130,6 +97,23 @@ impl Application {
                 // The original installer already owns its reply/fence result.
                 // Keep it in startup custody, and stop this conversation once.
                 Ok(false)
+            }
+        }
+    }
+    fn publish_service(
+        &self,
+        state: &mut super::owner::State,
+        store: std::sync::Arc<crate::store::Store>,
+    ) {
+        match super::filesystem::service(store, &self.owner, self.kernel.as_ref(), &self.setup) {
+            Ok(service) => {
+                state.startup.service = Some(service);
+                state.startup.phase = DaemonPhase::ControlReady;
+            }
+            Err(mut failure) => {
+                failure.diagnostic_error = writeln!(std::io::stderr().lock(), "{failure}").err();
+                state.startup.service_failure = Some(failure);
+                state.startup.phase = DaemonPhase::Retained;
             }
         }
     }
@@ -143,4 +127,41 @@ impl Application {
             diagnostic_error: None,
         }
     }
+}
+
+fn refuse(
+    connection: &mut Connection,
+    slot: usize,
+    kind: RefusalKind,
+    detail: &'static str,
+) -> Result<bool, ConnectionFailure> {
+    let refusal = InstallReply::Refused(InstallRefusal {
+        phase: InstallPhase::Request,
+        kind,
+        claim_acknowledged: false,
+        written: 0,
+        published: false,
+        os_code: None,
+        detail: detail.into(),
+    });
+    let failure = |cause| ConnectionFailure {
+        slot,
+        received: None,
+        original: None,
+        cause,
+        fence_error: None,
+        diagnostic_error: None,
+    };
+    let bytes = refusal
+        .encode()
+        .map_err(|cause| failure(ApplicationError::Protocol(cause)))?;
+    connection
+        .send
+        .send(&bytes)
+        .map_err(|cause| failure(ApplicationError::Channel(cause)))?;
+    connection
+        .send
+        .close()
+        .map_err(|cause| failure(ApplicationError::Channel(cause)))?;
+    Ok(false)
 }

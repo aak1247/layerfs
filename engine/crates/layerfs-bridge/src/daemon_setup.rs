@@ -5,7 +5,10 @@ use crate::{
     wire::{Reader, Writer},
 };
 use std::fmt;
-const MAGIC: &[u8] = b"LFSD\x05";
+const LEGACY_MAGIC: &[u8] = b"LFSD\x05";
+const MAGIC: &[u8] = b"LFSD\x06";
+/// The daemon reads at most this many bytes from its private config file.
+pub const MAX_DAEMON_SETUP_BYTES: usize = 8192;
 /// Explicit daemon startup resources; these are windows/admission, not file caps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DaemonLimits {
@@ -26,6 +29,17 @@ pub struct DaemonLimits {
     /// Seconds with no Workspace and no control call after which the daemon
     /// ends its process (#373 idle close). Zero never ends it.
     pub idle_exit_s: u32,
+}
+/// Private, empty directories for one newly created durable Sandbox.
+/// Existing catalogs require independent recovery and cannot use this setup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FreshWorkspaceSetup {
+    /// Independently generated identity of this newly created Sandbox.
+    pub sandbox: [u8; 32],
+    /// Pre-created, private and initially empty discovery directory.
+    pub catalog_directory: String,
+    /// Pre-created, private and initially empty durable Overlay directory.
+    pub overlay_directory: String,
 }
 /// Private configuration for one real daemon; caller supplies all policy/resource values.
 #[derive(Clone, Eq, PartialEq)]
@@ -51,6 +65,8 @@ pub struct DaemonSetup {
     /// None selects the original one-time installer. Some selects explicit existing
     /// Store open using retained authority; never selected after an install error.
     pub existing_store: Option<StoreManifest>,
+    /// Creates a new durable Workspace catalog. None keeps disposable overlays.
+    pub fresh_workspace: Option<FreshWorkspaceSetup>,
 }
 impl DaemonSetup {
     /// Encodes one bounded private config. No operation/flow byte limit is implied.
@@ -77,11 +93,24 @@ impl DaemonSetup {
         if let Some(value) = &self.existing_store {
             out.blob(&value.encode()?)?;
         }
+        out.byte(u8::from(self.fresh_workspace.is_some()))?;
+        if let Some(value) = &self.fresh_workspace {
+            out.put(&value.sandbox)?;
+            out.blob(value.catalog_directory.as_bytes())?;
+            out.blob(value.overlay_directory.as_bytes())?;
+        }
+        if out.0.len() > MAX_DAEMON_SETUP_BYTES {
+            return Err(ControlError("daemon config size"));
+        }
         Ok(out.0)
     }
     /// Decodes exactly one config without fallback or profile selection.
     pub fn decode(bytes: &[u8]) -> Result<Self, ControlError> {
-        let mut input = Reader::new(bytes, MAGIC)?;
+        if bytes.len() > MAX_DAEMON_SETUP_BYTES {
+            return Err(ControlError("daemon config size"));
+        }
+        let legacy = bytes.starts_with(LEGACY_MAGIC);
+        let mut input = Reader::new(bytes, if legacy { LEGACY_MAGIC } else { MAGIC })?;
         let listen = input.text(128)?;
         let store = input.text(4096)?;
         let overlay = input.text(4096)?;
@@ -104,6 +133,19 @@ impl DaemonSetup {
             1 => Some(StoreManifest::decode(input.blob(crate::wire::LIMIT)?)?),
             _ => return Err(ControlError("daemon config boolean")),
         };
+        let fresh_workspace = if legacy {
+            None
+        } else {
+            match input.byte()? {
+                0 => None,
+                1 => Some(FreshWorkspaceSetup {
+                    sandbox: input.array()?,
+                    catalog_directory: input.text(4096)?,
+                    overlay_directory: input.text(4096)?,
+                }),
+                _ => return Err(ControlError("daemon fresh Workspace boolean")),
+            }
+        };
         input.finish()?;
         let value = Self {
             listen,
@@ -116,6 +158,7 @@ impl DaemonSetup {
             command_gid,
             limits,
             existing_store,
+            fresh_workspace,
         };
         value.check()?;
         Ok(value)
@@ -154,6 +197,44 @@ impl DaemonSetup {
                 return Err(ControlError("existing Store locator differs"));
             }
         }
+        if let Some(fresh) = &self.fresh_workspace {
+            if fresh.sandbox == [0; 32]
+                || self
+                    .existing_store
+                    .as_ref()
+                    .is_some_and(|m| m.profile != crate::provision::StoreProfile::Durable)
+            {
+                return Err(ControlError("fresh Workspace authority or Store profile"));
+            }
+            let catalog = std::path::Path::new(&fresh.catalog_directory);
+            let overlays = std::path::Path::new(&fresh.overlay_directory);
+            for (text, path) in [
+                (&fresh.catalog_directory, catalog),
+                (&fresh.overlay_directory, overlays),
+            ] {
+                if !path.is_absolute()
+                    || text.len() > 4096
+                    || text.as_bytes().contains(&0)
+                    || path.components().any(|c| {
+                        matches!(
+                            c,
+                            std::path::Component::ParentDir | std::path::Component::CurDir
+                        )
+                    })
+                {
+                    return Err(ControlError("fresh Workspace path"));
+                }
+                for other in [&self.store, &self.overlay, &self.mounts] {
+                    let other = std::path::Path::new(other);
+                    if path.starts_with(other) || other.starts_with(path) {
+                        return Err(ControlError("fresh Workspace backing overlap"));
+                    }
+                }
+            }
+            if catalog.starts_with(overlays) || overlays.starts_with(catalog) {
+                return Err(ControlError("fresh Workspace directories overlap"));
+            }
+        }
         Ok(())
     }
 }
@@ -170,6 +251,7 @@ impl fmt::Debug for DaemonSetup {
             .field("command_gid", &self.command_gid)
             .field("limits", &self.limits)
             .field("existing_store", &self.existing_store)
+            .field("fresh_workspace", &self.fresh_workspace)
             .finish()
     }
 }

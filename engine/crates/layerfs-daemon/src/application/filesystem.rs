@@ -1,9 +1,11 @@
 //! Kernel serving assembly over the daemon's one Store and one overlay owner.
+use super::{ServiceStartCause, ServiceStartFailure};
 use crate::{
     control::{KernelServing, Service},
     store::Store,
     Owner,
 };
+use layerfs_bridge::daemon_setup::DaemonSetup;
 use std::sync::Arc;
 
 /// Control and kernel serving share the same Store handle and overlay owner;
@@ -13,13 +15,73 @@ pub(super) fn service(
     store: Arc<Store>,
     owner: &Owner,
     kernel: Option<&Arc<KernelServing>>,
-    serial_low_water: u64,
-) -> Arc<Service> {
-    store.set_serial_low_water(serial_low_water);
-    Arc::new(match kernel {
+    setup: &DaemonSetup,
+) -> Result<Arc<Service>, Box<ServiceStartFailure>> {
+    store.set_serial_low_water(setup.limits.serial_low_water);
+    let mut service = match kernel {
         Some(kernel) => Service::with_kernel(store, owner, kernel.clone()),
         None => Service::new(store, owner),
-    })
+    };
+    if let Err(cause) = configure(&mut service, owner, setup) {
+        return Err(Box::new(ServiceStartFailure {
+            cause,
+            service: Box::new(service),
+            opened: None,
+            diagnostic_error: None,
+        }));
+    }
+    Ok(Arc::new(service))
+}
+
+#[cfg(target_os = "linux")]
+fn configure(
+    service: &mut Service,
+    owner: &Owner,
+    setup: &DaemonSetup,
+) -> Result<(), ServiceStartCause> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(fresh) = &setup.fresh_workspace else {
+        return Ok(());
+    };
+    let metadata = std::fs::symlink_metadata(&setup.store).map_err(ServiceStartCause::Io)?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(ServiceStartCause::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable Store identity or privacy",
+        )));
+    }
+    service
+        .activate_fresh_control(
+            owner,
+            crate::control::FreshControlConfig {
+                catalog_directory: fresh.catalog_directory.clone().into(),
+                overlay_directory: fresh.overlay_directory.clone().into(),
+                sandbox: fresh.sandbox,
+                profile: layerfs_overlay::ProfileConfig {
+                    pager_kib: setup.limits.pager_kib,
+                    max_pages: None,
+                },
+                store_device: metadata.dev(),
+            },
+        )
+        .map_err(ServiceStartCause::Fresh)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure(
+    _service: &mut Service,
+    _owner: &Owner,
+    setup: &DaemonSetup,
+) -> Result<(), ServiceStartCause> {
+    if setup.fresh_workspace.is_some() {
+        Err(ServiceStartCause::Unsupported)
+    } else {
+        Ok(())
+    }
 }
 /// Kernel serving is a Linux capability; elsewhere control alone is assembled.
 #[cfg(not(target_os = "linux"))]

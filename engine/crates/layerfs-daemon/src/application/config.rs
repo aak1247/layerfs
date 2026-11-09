@@ -1,5 +1,5 @@
 //! Actual protected configuration descriptors and process/placement checks.
-use layerfs_bridge::daemon_setup::DaemonSetup;
+use layerfs_bridge::daemon_setup::{DaemonSetup, MAX_DAEMON_SETUP_BYTES};
 use nix::{fcntl::OFlag, unistd::Uid};
 use std::{
     fs::{self, OpenOptions},
@@ -23,9 +23,10 @@ pub(super) fn read(path: &Path) -> io::Result<DaemonSetup> {
         path.parent().ok_or_else(|| invalid("config parent"))?,
         false,
     )?;
-    let mut bytes = Vec::with_capacity(8193);
-    (&mut file).take(8193).read_to_end(&mut bytes)?;
-    if bytes.len() > 8192 {
+    let limit = MAX_DAEMON_SETUP_BYTES + 1;
+    let mut bytes = Vec::with_capacity(limit);
+    (&mut file).take(limit as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_DAEMON_SETUP_BYTES {
         return Err(invalid("private config record size"));
     }
     let config = DaemonSetup::decode(&bytes).map_err(|_| invalid("private config fields"))?;
@@ -55,6 +56,21 @@ pub(super) fn read(path: &Path) -> io::Result<DaemonSetup> {
         store.parent().ok_or_else(|| invalid("Store parent"))?,
         config.existing_store.is_none(),
     )?;
+    if let Some(fresh) = &config.fresh_workspace {
+        for directory in [&fresh.catalog_directory, &fresh.overlay_directory] {
+            let directory = Path::new(directory);
+            if path.starts_with(directory) || directory.starts_with(path) {
+                return Err(invalid("private config overlaps durable Workspace"));
+            }
+            private_directory(directory, false)?;
+            private_directory(
+                directory
+                    .parent()
+                    .ok_or_else(|| invalid("durable directory parent"))?,
+                false,
+            )?;
+        }
+    }
     if let Some(manifest) = &config.existing_store {
         if manifest.daemon_sqlite.is_none() {
             return Err(invalid("existing installation metadata"));

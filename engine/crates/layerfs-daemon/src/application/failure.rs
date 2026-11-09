@@ -6,6 +6,38 @@ use crate::{
 use layerfs_bridge::{control::ControlError, duplex::ChannelError};
 use std::{fmt, io};
 
+/// Original service startup refusal, retaining the unpublished Service.
+pub struct ServiceStartFailure {
+    pub cause: ServiceStartCause,
+    pub(crate) service: Box<crate::control::Service>,
+    pub(crate) opened: Option<crate::bootstrap::OpenedStore>,
+    pub diagnostic_error: Option<io::Error>,
+}
+/// The failure that prevented publishing the selected Workspace service.
+#[derive(Debug)]
+pub enum ServiceStartCause {
+    Io(io::Error),
+    #[cfg(target_os = "linux")]
+    Fresh(Box<crate::control::FreshControlFailure>),
+    #[cfg(not(target_os = "linux"))]
+    Unsupported,
+}
+impl fmt::Debug for ServiceStartFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceStartFailure")
+            .field("cause", &self.cause)
+            .field("store_retained", &self.opened.is_some())
+            .field("workspaces", &self.service.workspaces())
+            .field("diagnostic_error", &self.diagnostic_error)
+            .finish()
+    }
+}
+impl fmt::Display for ServiceStartFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Workspace service startup: {:?}", self.cause)
+    }
+}
+
 /// Exact startup or original connection failure, never followed by a replay.
 pub enum ApplicationError {
     /// Before-effect configuration/listener/kernel file error.
@@ -21,6 +53,8 @@ pub enum ApplicationError {
     },
     /// Original direct existing-Store open failure.
     Store(layerfs_storage::StorageError),
+    /// Original service and any opened Store, retained after failed initialization.
+    Service(Box<ServiceStartFailure>),
     /// Original authentication/kernel transport failure.
     Channel(ChannelError),
     /// Original malformed request, with bounded bytes retained separately.
@@ -51,6 +85,7 @@ impl fmt::Display for ApplicationError {
             Self::Owner(e) => write!(f, "Overlay startup: {:?}", e.result.as_ref().err()),
             Self::AfterOverlay { cause, .. } => write!(f, "after Overlay startup: {cause}"),
             Self::Store(e) => write!(f, "Store open: {e}"),
+            Self::Service(e) => write!(f, "{e}"),
             Self::Channel(e) => write!(f, "kernel channel: {e}"),
             Self::Protocol(e) => write!(f, "kernel request: {e}"),
             Self::Install(e) => write!(f, "installation: {e}"),

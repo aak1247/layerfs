@@ -49,11 +49,22 @@ pub fn shared_control() {
 }
 impl Fixture {
     pub fn new(label: &str, locator: Option<&str>) -> Self {
+        Self::with_profile(label, locator, SqlitePersistenceProfile::Disposable)
+    }
+    #[allow(dead_code)]
+    pub fn new_durable(label: &str, locator: Option<&str>) -> Self {
+        Self::with_profile(label, locator, SqlitePersistenceProfile::Durable)
+    }
+    fn with_profile(label: &str, locator: Option<&str>, profile: SqlitePersistenceProfile) -> Self {
         let directory = std::env::temp_dir().join(format!(
             "layerfs-kernel-install-{}-{label}",
             std::process::id()
         ));
         fs::create_dir(&directory).unwrap();
+        if profile == SqlitePersistenceProfile::Durable {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let source = directory.join("source");
         fs::create_dir(&source).unwrap();
         fs::create_dir(source.join(".git")).unwrap();
@@ -75,7 +86,7 @@ impl Fixture {
                 InitRequest {
                     source,
                     store: PersistenceConfig::sqlite(directory.join("sealed.sqlite"))
-                        .with_sqlite_profile(SqlitePersistenceProfile::Disposable),
+                        .with_sqlite_profile(profile),
                     locator: locator
                         .map(str::to_owned)
                         .unwrap_or_else(|| directory.join("store.sqlite").to_str().unwrap().into()),

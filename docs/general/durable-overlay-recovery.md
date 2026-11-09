@@ -2,9 +2,10 @@
 
 The Overlay crate exposes `Overlay::create_durable(path, config, identity)`
 and `Overlay::recover_durable(path, config, identity)` on Linux. This is a
-single-Workspace database primitive. The normal daemon application and SDK
-still mount disposable Workspaces; these methods do not start a Sandbox or
-automatically recover a mount.
+single-Workspace database primitive. The daemon can also initialize a fresh
+durable catalog when explicitly configured with new private directories and a
+Durable Store. Existing SDK Sandbox creation still selects disposable overlays;
+neither path automatically recovers an old mount.
 
 The caller supplies a stable, nonzero 32-byte Workspace identity and a private
 directory owned by the calling user. The directory must be on ext4, XFS or
@@ -65,7 +66,8 @@ legacy schemas lack this evidence and are refused by that method.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. It is not yet wired
-into the default daemon's startup or mount lifecycle.
+by the daemon when a fresh durable Workspace setup is explicitly supplied.
+It is not used to automatically reopen an existing Sandbox.
 
 An explicitly assembled daemon `Service` can register already bound durable
 owners and use its ordinary control and FUSE Attach path. The caller may first
@@ -267,3 +269,25 @@ This tests two manually assembled Workspaces after process loss, not automatic
 discovery, Pod recovery, physical power loss or high-capacity performance. The
 output, exit status and image/kernel/source hashes are retained under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-multi-fuse-20261109/`.
+
+On 2026-11-09 a separate isolated FUSE test ran the real daemon executable
+with a version-6 fresh durable setup. It verified a Disposable Store refusal
+before installation, retained startup after an already acknowledged Durable
+Store install with a pre-existing Overlay file, and an ordinary unprivileged
+FUSE write followed by file and directory sync. It then killed and reaped the
+exact daemon, detached its old mount, verified fresh startup refused the old
+data, and explicitly recovered and remounted the original Workspace under a
+newer namespace. The recovered bytes matched. All three tests passed in the
+test-only container with `/dev/fuse`, CAP_SYS_ADMIN, unconfined AppArmor and
+seccomp, no network and no Docker socket. The kernel was `5.15.0-198-generic`;
+the image SHA-256 was
+`24292ac486b1237366c849a4db2b0aaaa2ce7b09b64a834b0f3c902908185f5b`.
+The test and daemon executable SHA-256 values were respectively
+`7f4997f6e35d18040b22c57ed2c2431e50f4e20086cf302233359c58db29427d`
+and `077b00b042603f96749dacca17054ef25f661e28063db48edcac054c3c33d459`;
+the test source SHA-256 was
+`b4aa1607830474343f481002f6a40e353882511109cf217513b354ea0b2334c1`.
+The output and binaries remain under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/fresh-daemon-v2-20261109-v7sNIr7k/`.
+This does not prove automatic daemon restart, container or Pod recreation,
+node failure, physical power loss, or AutoTask integration.

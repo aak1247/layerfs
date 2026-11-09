@@ -92,6 +92,7 @@ fn setup(private: [u8; 32], peer: [u8; 32], max_workspaces: u32) -> DaemonSetup 
             idle_exit_s: IDLE_EXIT_S,
         },
         existing_store: None,
+        fresh_workspace: None,
     }
 }
 

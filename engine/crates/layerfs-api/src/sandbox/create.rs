@@ -14,7 +14,7 @@ use std::{fmt, fs::File, io, net::TcpStream, path::PathBuf, time::Duration};
 pub struct SandboxCreate {
     /// Exact immutable image and borrowed shared named volume.
     pub deployment: SandboxRequest,
-    /// Explicit private daemon resources and Disposable install/open selection.
+    /// Explicit private daemon resources and Store install/open selection.
     pub setup: DaemonSetup,
     /// Sealed Linux executable supplied by the caller; streamed once, never read as Store data.
     pub executable: PathBuf,
@@ -312,6 +312,17 @@ pub(crate) fn create(
     let mut observed = None;
     let result = (|| {
         let config = request.setup.encode().map_err(SandboxCause::Setup)?;
+        if let Some(fresh) = &request.setup.fresh_workspace {
+            let volume = std::path::Path::new("/layerfs-store");
+            for directory in [&fresh.catalog_directory, &fresh.overlay_directory] {
+                let directory = std::path::Path::new(directory);
+                if directory == volume || !directory.starts_with(volume) {
+                    return Err(SandboxCause::Setup(ControlError(
+                        "durable Workspace must be on the Store volume",
+                    )));
+                }
+            }
+        }
         if request.setup.listen != format!("0.0.0.0:{}", request.deployment.port)
             || request.setup.store != "/layerfs-store/global/store.sqlite"
             || request.setup.overlay != "/layerfs-local/overlay/overlay.sqlite"

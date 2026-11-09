@@ -9,7 +9,7 @@ use layerfs_api::{
 };
 use layerfs_bridge::{
     control::{Answer, Call, DaemonPhase, DaemonStatus, Reply, Request},
-    daemon_setup::{DaemonLimits, DaemonSetup},
+    daemon_setup::{DaemonLimits, DaemonSetup, FreshWorkspaceSetup},
     duplex,
 };
 use std::{
@@ -47,6 +47,7 @@ fn setup(private: [u8; 32], peer: [u8; 32]) -> DaemonSetup {
             idle_exit_s: 0,
         },
         existing_store: None,
+        fresh_workspace: None,
     }
 }
 
@@ -456,5 +457,42 @@ fn create_mismatched_existing_project_refuses_before_any_deployment_or_control_e
     };
     assert_eq!(failure.phase, SandboxPhase::Validate);
     assert!(failure.sandbox.is_none() && failure.control.is_none() && failure.installed.is_none());
+    assert!(peer.finish().is_empty());
+}
+
+#[test]
+fn fresh_durable_workspace_outside_store_volume_refuses_before_deployment() {
+    let project = ProjectFixture::new();
+    let (docker, peer) = Peer::new(vec![], 4096);
+    let api = SandboxApi::new(docker);
+    let mut deployment_setup = setup([32; 32], duplex::public_key(&[31; 32]).unwrap());
+    deployment_setup.fresh_workspace = Some(FreshWorkspaceSetup {
+        sandbox: [9; 32],
+        catalog_directory: "/layerfs-store/sandboxes/one/catalog".into(),
+        overlay_directory: "/layerfs-local/durable".into(),
+    });
+    let result = api.create(
+        SandboxCreate {
+            deployment: layerfs_sandbox::backend::docker::SandboxRequest {
+                image: IMAGE.into(),
+                store_volume: "lfs-test-borrowed".into(),
+                port: 30421,
+                labels: vec![],
+            },
+            setup: deployment_setup,
+            executable: project.project.store.path.clone(),
+            controller_private: [31; 32],
+            daemon_peer: duplex::public_key(&[32; 32]).unwrap(),
+            startup_wait: Duration::from_secs(2),
+            connect_host: None,
+        },
+        &project.project,
+    );
+    let Err(failure) = result else {
+        panic!("volatile Workspace path must refuse")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Validate);
+    assert!(matches!(failure.cause, SandboxCause::Setup(_)));
+    assert!(failure.sandbox.is_none() && failure.control.is_none());
     assert!(peer.finish().is_empty());
 }

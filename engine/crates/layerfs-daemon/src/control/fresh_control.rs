@@ -16,6 +16,8 @@ pub struct FreshControlConfig {
     pub overlay_directory: PathBuf,
     pub sandbox: [u8; 32],
     pub profile: ProfileConfig,
+    /// Device of the authenticated physical Store, observed by the caller.
+    pub store_device: u64,
 }
 
 /// The original initialization boundary and cause.
@@ -96,10 +98,11 @@ impl Service {
             );
             let catalog_dir = catalog_root.as_ref().expect("catalog directory held");
             let overlay_dir = overlay_root.as_ref().expect("overlay directory held");
+            let catalog_device = catalog_dir.device().map_err(FreshControlCause::Directory)?;
             if catalog_dir.path.starts_with(&overlay_dir.path)
                 || overlay_dir.path.starts_with(&catalog_dir.path)
-                || catalog_dir.device().map_err(FreshControlCause::Directory)?
-                    != overlay_dir.device().map_err(FreshControlCause::Directory)?
+                || catalog_device != overlay_dir.device().map_err(FreshControlCause::Directory)?
+                || catalog_device != config.store_device
             {
                 return Err(FreshControlCause::Invalid(
                     "separate local durable directories",

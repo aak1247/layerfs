@@ -3,8 +3,9 @@
 `layerfs_daemon::durable_roster` provides a Linux, append-only catalog for one
 Sandbox. It records an authorized Workspace identity and its original Branch
 before the caller creates that Workspace's durable Overlay or exposes a token.
-It does not create an Overlay, start a daemon or recover a mount. The normal
-daemon application does not yet use this catalog.
+The catalog itself does not start a daemon or recover a mount. The daemon can
+initialize one for a fresh Sandbox when explicitly configured; its SDK does not
+yet supply that configuration.
 
 The caller supplies a nonzero, stable Sandbox identity.
 `Authority::for_catalog` derives the Store identity from the validated history
@@ -51,8 +52,25 @@ controls are refused even if a token was already exposed; read-only status and
 Locate remain available. An uncertain operation is sent as Unknown while
 retaining its original error or successful receipt. The caller must still independently
 authenticate the physical Store, fence old processes/mounts and consumers,
-and reconcile unknown operations before activation. The normal application
-daemon and AutoTask do not yet activate this control path.
+and reconcile unknown operations before activation. AutoTask does not yet
+activate this control path.
+
+For a newly created Sandbox, `Service::activate_fresh_control` checks the
+empty catalog and Overlay directories through retained descriptors, syncs each
+directory and its private parent, and creates the catalog through the original
+directory handle. Both directories must share the caller-observed Durable Store
+device. An admitted failure retains the exact error and refuses subsequent
+effectful controls, rather than falling back to disposable Workspaces.
+
+The Linux daemon's version-6 private setup can select this fresh path with a
+nonzero Sandbox identity and the two pre-created private directories. The
+caller supplies a fresh identity and authenticates the physical Store. A
+Disposable installation is refused before Store creation; failure after an
+installed Store retains the original service and reports the Retained phase.
+Version-5 setup remains readable and keeps its disposable behavior. The Docker
+SDK checks that both requested directories are on the named Store volume; it
+does not yet create them or prove an old container and its consumers exited.
+This fresh path refuses existing contents and is not recovery.
 
 The directory contains an authority-bound owner file, immutable Workspace and
 lifecycle event files, a fixed-width hash-chained ledger and a durable ledger
@@ -97,9 +115,9 @@ processes and mounts, and reconcile unknown operations before exposing data.
 Before attempting a terminal close, the manually assembled daemon can use
 `Service::unmount_recorded`: it checks the catalog and current bound token,
 reserves the Workspace control entry, persists `Roster::begin_close(token)`,
-performs one unmount and records its actual terminal reply. Direct control-wire
-Unmount and ForceUnmount refuse catalog-backed bindings; forced close is not
-yet implemented for these bindings. A Dirty refusal occurs before an intent is
+performs one unmount and records its actual terminal reply. When durable control
+is active, its ordinary control-wire Unmount uses this close path; ForceUnmount
+is not yet implemented for these bindings. A Dirty refusal occurs before an intent is
 recorded. Only one close may be pending in a catalog at a time. While one is pending, normal discovery,
 recovery and new intents refuse without performing those operations.
 `Roster::pending_close` exposes the exact retained Workspace, Branch and token;
@@ -113,8 +131,8 @@ terminal change. The Service records that exact attempt's cancellation before
 making the Workspace available again; a subsequent unmount requires a new
 explicit request. If cancellation synchronization fails, the original Busy
 receipt and binding remain in custody. No other failure is treated as proof of
-no effect. The normal application daemon does not yet register catalog-backed
-bindings or call this close path.
+no effect. An explicitly configured fresh daemon uses catalog-backed bindings
+and this close path; it still does not reopen existing catalogs automatically.
 The caller must authenticate the Sandbox and physical Store, serialize access
 to the catalog, and retain the original Service and failure on an uncertain
 attempt. A terminal reply that cannot be recorded is returned with the exact

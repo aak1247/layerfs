@@ -1,5 +1,5 @@
 //! One startup lifecycle owner, Store transfer and bounded connection custody.
-use super::{ApplicationError, ConnectionFailure};
+use super::{ApplicationError, ConnectionFailure, ServiceStartFailure};
 use crate::{
     bootstrap::{open_store_observed, OpenedStore},
     control::Service,
@@ -30,6 +30,7 @@ pub(super) struct Startup {
     pub installed: Option<InstalledStore>,
     pub existing: Option<OpenedStore>,
     pub install_failure: Option<Box<InstallFailure>>,
+    pub service_failure: Option<Box<ServiceStartFailure>>,
 }
 pub(super) struct State {
     pub startup: Startup,
@@ -91,7 +92,7 @@ impl Application {
                 })
             }
         };
-        let existing = match &setup.existing_store {
+        let mut existing = match &setup.existing_store {
             Some(m) => match open_store_observed(
                 PersistenceConfig::sqlite(&setup.store).with_sqlite_profile(match m.profile {
                     layerfs_bridge::provision::StoreProfile::Disposable => {
@@ -126,14 +127,21 @@ impl Application {
                 })
             }
         };
-        let service = existing.as_ref().map(|opened| {
-            super::filesystem::service(
-                opened.store.clone(),
-                &owner,
-                kernel.as_ref(),
-                l.serial_low_water,
-            )
-        });
+        let service = if let Some(opened) = existing.as_ref() {
+            match super::filesystem::service(opened.store.clone(), &owner, kernel.as_ref(), &setup)
+            {
+                Ok(service) => Some(service),
+                Err(mut failure) => {
+                    failure.opened = existing.take();
+                    return Err(ApplicationError::AfterOverlay {
+                        owner: Box::new(owner),
+                        cause: Box::new(ApplicationError::Service(failure)),
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let phase = if service.is_some() {
             DaemonPhase::ControlReady
         } else {
@@ -152,6 +160,7 @@ impl Application {
                     installed: None,
                     existing,
                     install_failure: None,
+                    service_failure: None,
                 },
                 slots: (0..count).map(|_| Slot::Vacant).collect(),
                 in_flight: 0,
@@ -245,5 +254,13 @@ impl Application {
         };
         self.changed.notify_all();
         Ok(Some(failure))
+    }
+
+    /// Transfers the original unpublished service failure without restarting it.
+    pub fn take_service_failure(
+        &self,
+    ) -> Result<Option<Box<ServiceStartFailure>>, ApplicationError> {
+        let mut state = self.state.lock().map_err(|_| ApplicationError::Poisoned)?;
+        Ok(state.startup.service_failure.take())
     }
 }

@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "Cargo.toml"
 LINUX_ONLY = '#![cfg(target_os = "linux")]'
 MOUNT_PACKAGE = "layerfs-daemon"
-API_MOUNT_TARGETS = {"kernel_mount_routes", "kernel_application", "observed_application", "r5_1_actual_daemon_commit"}
+API_MOUNT_TARGETS = {"kernel_mount_routes", "kernel_application", "observed_application", "r5_1_actual_daemon_commit", "fresh_durable_application"}
 
 # (package, test target): run seconds on the macOS host, 2026-10-23.
 SLOW = {

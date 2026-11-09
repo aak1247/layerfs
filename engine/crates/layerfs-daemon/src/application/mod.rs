@@ -12,5 +12,5 @@ mod serve;
 pub use cli::main;
 pub use diagnostics::resources::{ResourceDiagnosticError, ResourceFailure, ResourceObservation};
 pub(crate) use diagnostics::{commit_parts, namespace_values, storage_values};
-pub use failure::{ApplicationError, ConnectionFailure};
+pub use failure::{ApplicationError, ConnectionFailure, ServiceStartCause, ServiceStartFailure};
 pub use owner::Application;
