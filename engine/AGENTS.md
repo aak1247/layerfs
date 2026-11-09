@@ -452,7 +452,14 @@ fixtures, examples and tools do not contribute to production LOC.
   one connection behind that Workspace's lock. Workspaces share no overlay
   connection, page cache or memory budget. It is not an implemented distributed Store or a universal
   global-Store rule; reader-pool alternatives need their own proofs.
-- WAL/sync are permitted for a declared global Store profile. Do not add
+- `Overlay::create_durable` and `recover_durable` implement a separate Linux
+  DELETE/FULL database boundary, including transactional lifecycle state and
+  an exclusive owner lease. Conservative reopen refuses unresolved capture,
+  unsafe cleanup or volatile ownership. Ready shrink-cleanup rows can resume
+  through ordinary bounded maintenance. This is not daemon/FUSE mount recovery; the
+  caller must fence the old execution and reconcile external outcomes. See
+  [durable overlay](../docs/general/durable-overlay-recovery.md).
+- Sync is permitted for an explicitly durable database. Do not add
   fsync/fdatasync/sync_data/sync_all on disposable Workspace backing. Memory
   hints do not prove bounds. Claim only actual completion/durability contracts.
 - No third-party patch, fork, vendor, registry edit or replacement dependency,

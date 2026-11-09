@@ -667,7 +667,7 @@ Source: [Save lifecycle](../../core/crates/layerfs-storage/src/save/operation.rs
 
 | Choice | Current behavior |
 | --- | --- |
-| Durable | Fork owner reauthorized WAL / FULL on 2026-11-09; global Store Commit is synchronized, but Workspace overlay recovery remains unimplemented |
+| Durable | Fork owner reauthorized WAL / FULL on 2026-11-09; global Store Commit is synchronized. The separate [durable overlay database](durable-overlay-recovery.md) does not yet provide Workspace mount recovery. |
 | Disposable | SQLite WAL / OFF; process-crash survival, no kernel/VM-crash durability |
 | Monolithic | Creation layout schema1; complete pack BLOBs |
 | GroupRows | Creation layout schema2; independently stored complete encoded units |

@@ -1,4 +1,4 @@
-//! Selected disposable profile, startup readback and physical observations.
+//! Selected overlay profile, startup readback and physical observations.
 use crate::{DatabaseWork, OverlayError, OverlayResult, StatementKind};
 use rusqlite::Connection;
 use std::cell::RefCell;
@@ -21,7 +21,8 @@ impl Default for ProfileConfig {
         }
     }
 }
-/// Actual read-back engine/build settings. No crash durability is claimed.
+/// Actual read-back engine/build settings. The selected profile determines
+/// whether completed SQLite transactions are synchronized.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatabaseProfile {
     pub schema_version: i64,
@@ -46,18 +47,48 @@ pub(crate) fn initialize(
     work: &RefCell<DatabaseWork>,
     configuration_calls: &mut u64,
 ) -> OverlayResult<DatabaseProfile> {
+    initialize_with(
+        c,
+        config,
+        work,
+        configuration_calls,
+        Persistence::Disposable,
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Persistence {
+    Disposable,
+    Durable,
+}
+
+pub(crate) fn initialize_with(
+    c: &Connection,
+    config: ProfileConfig,
+    work: &RefCell<DatabaseWork>,
+    configuration_calls: &mut u64,
+    persistence: Persistence,
+) -> OverlayResult<DatabaseProfile> {
     let max_pages = config.max_pages.unwrap_or(u32::MAX - 1);
     // The floor is below the schema's own pages, so the smallest quota is a
     // real creation failure rather than a refused setting.
-    if config.pager_kib == 0 || max_pages < 24 || max_pages == u32::MAX {
+    if config.pager_kib == 0
+        || max_pages < 24
+        || max_pages == u32::MAX
+        || (persistence == Persistence::Durable && config.max_pages.is_some())
+    {
         return Err(OverlayError::Invalid("profile resource settings"));
     }
     *configuration_calls += 1;
     c.busy_timeout(std::time::Duration::ZERO)?;
     *configuration_calls += 1;
     c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    let (journal, synchronous) = match persistence {
+        Persistence::Disposable => ("MEMORY", "OFF"),
+        Persistence::Durable => ("DELETE", "FULL"),
+    };
     crate::diagnostics::startup::batch(c, work, &format!(
-        "PRAGMA page_size=4096; PRAGMA auto_vacuum=NONE; PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF;
+        "PRAGMA page_size=4096; PRAGMA auto_vacuum=NONE; PRAGMA journal_mode={journal}; PRAGMA synchronous={synchronous};
          PRAGMA locking_mode=EXCLUSIVE; PRAGMA mmap_size=0; PRAGMA foreign_keys=ON;
          PRAGMA temp_store=MEMORY; PRAGMA cache_size=-{}; PRAGMA max_page_count={};",
         config.pager_kib, max_pages
@@ -104,9 +135,13 @@ pub(crate) fn initialize(
             "unqualified SQLite physical growth profile",
         ));
     }
-    if p.journal_mode != "memory"
+    let (expected_journal, expected_sync) = match persistence {
+        Persistence::Disposable => ("memory", 0),
+        Persistence::Durable => ("delete", 2),
+    };
+    if p.journal_mode != expected_journal
         || p.locking_mode != "exclusive"
-        || p.synchronous != 0
+        || p.synchronous != expected_sync
         || p.mmap_size != 0
         || p.cache_size != -i64::from(config.pager_kib)
         || p.page_size != 4096

@@ -42,6 +42,9 @@ pub(crate) struct Allocation {
 /// SQLite connection and performs only read-only observations, never sync.
 pub struct ClosedFile {
     pub(crate) allocation: Allocation,
+    /// A durable file cannot be reopened while its old main-file descriptor
+    /// remains open: closing it could release SQLite's process-local locks.
+    pub(crate) _durable: Option<crate::database::durable::Lease>,
 }
 impl ClosedFile {
     pub fn allocation(&self) -> OverlayResult<AllocationState> {
@@ -52,6 +55,12 @@ impl ClosedFile {
     }
 }
 impl Allocation {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sync_durable_file(&self) -> OverlayResult<()> {
+        self.state()?;
+        self.file.sync_all()?;
+        Ok(())
+    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn new(file: File, path: &Path) -> OverlayResult<Self> {
         let meta = file.metadata()?;

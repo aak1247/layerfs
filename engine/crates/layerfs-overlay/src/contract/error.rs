@@ -8,16 +8,19 @@ pub struct CloseFailure {
     pub cause: rusqlite::Error,
     _connection: Mutex<ManuallyDrop<rusqlite::Connection>>,
     _open: Mutex<ManuallyDrop<crate::open::OpenState>>,
+    _durable: Mutex<ManuallyDrop<Option<crate::database::durable::Lease>>>,
 }
 impl CloseFailure {
     pub(crate) fn retain(
         (connection, cause): (rusqlite::Connection, rusqlite::Error),
         open: crate::open::OpenState,
+        durable: Option<crate::database::durable::Lease>,
     ) -> Self {
         Self {
             cause,
             _connection: Mutex::new(ManuallyDrop::new(connection)),
             _open: Mutex::new(ManuallyDrop::new(open)),
+            _durable: Mutex::new(ManuallyDrop::new(durable)),
         }
     }
 }

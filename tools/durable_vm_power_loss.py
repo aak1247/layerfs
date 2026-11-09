@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Kill an owned Linux VM after a Durable Store save, then reopen its disk.
+"""Kill an owned Linux VM after a durable database write, then reopen its disk.
 
-This tests guest memory loss and recovery from the still-open WAL. It does not
-simulate loss of the physical host or a drive that lies about flush completion.
-The output directory must be new; all artifacts and both serial logs stay there.
+This tests guest memory loss and recovery of a Store or Workspace overlay. It
+does not simulate loss of the physical host or a drive that lies about flush
+completion. All artifacts remain in the new output directory.
 """
 
 from __future__ import annotations
@@ -150,6 +150,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True, help="new owned artifact directory")
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--probe", type=Path, required=True, help="prebuilt Rust test binary")
+    parser.add_argument("--probe-kind", choices=("store", "overlay"), default="store")
     parser.add_argument("--busybox", type=Path, default=Path("/bin/busybox"))
     args = parser.parse_args()
     output = args.output.absolute()
@@ -162,7 +163,11 @@ def main() -> int:
         "kernel_sha256": digest(kernel),
         "probe_sha256": digest(probe),
         "busybox_sha256": digest(busybox),
-        "scope": "guest power loss after acknowledged Durable Store save; not Workspace recovery",
+        "scope": (
+            "guest power loss after acknowledged Durable Store save; not Workspace recovery"
+            if args.probe_kind == "store"
+            else "guest power loss after acknowledged durable overlay transaction; not mount recovery"
+        ),
         "disk": "256 MiB raw ext4, QEMU IDE cache=none",
     }
     try:
@@ -199,9 +204,14 @@ def main() -> int:
             "-drive",
             f"file={disk},if=ide,format=raw,cache=none",
         ]
+        ack = (
+            rb"LAYERFS_VM_ACK wal_bytes=[1-9][0-9]*\r?\n"
+            if args.probe_kind == "store"
+            else rb"LAYERFS_VM_ACK overlay_bytes=[1-9][0-9]*\r?\n"
+        )
         receipt["write"] = boot_until(
             common + ["-append", "console=ttyS0 panic=-1 quiet layerfs.mode=write"],
-            rb"LAYERFS_VM_ACK wal_bytes=[1-9][0-9]*\r?\n",
+            ack,
             output / "write-serial.log",
         )
         receipt["read"] = boot_until(

@@ -11,6 +11,14 @@ use std::{
 
 static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
 
+pub(super) fn next_engine() -> OverlayResult<u64> {
+    NEXT_ENGINE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| crate::OverlayError::Invalid("engine identity exhausted"))
+}
+
 /// One attempted startup and its exact original result. Failed artifacts stay
 /// in caller custody; receipt observation never retries startup or removes them.
 /// Linux verifies a read-only reopened descriptor of the fresh owned file before
@@ -163,11 +171,7 @@ fn initialize(path: &Path, config: ProfileConfig, template: Option<&Path>) -> Cr
         // twice. The set is fixed by source; it does not grow with files,
         // bytes or operations.
         connection.set_prepared_statement_cache_capacity(256);
-        let identity = NEXT_ENGINE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-            .map_err(|_| crate::OverlayError::Invalid("engine identity exhausted"))?;
+        let identity = next_engine()?;
         Ok(Overlay {
             identity,
             connection,
@@ -185,6 +189,7 @@ fn initialize(path: &Path, config: ProfileConfig, template: Option<&Path>) -> Cr
             issued: Default::default(),
             profile,
             allocation: allocation.take().expect("allocation created"),
+            durable: None,
         })
     })();
     let physical = result

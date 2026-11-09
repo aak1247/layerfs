@@ -1,4 +1,4 @@
-//! One exclusive owner connection for one disposable Workspace file.
+//! One exclusive owner connection for one Workspace file.
 use crate::{
     metrics, DatabaseProfile, DatabaseWork, OverlayError, OverlayResult, ProfileConfig,
     StatementKind,
@@ -50,6 +50,8 @@ pub struct Overlay {
     pub(crate) issued: RefCell<Vec<i64>>,
     pub(super) profile: DatabaseProfile,
     pub(super) allocation: crate::database::physical::Allocation,
+    /// Kept through checked connection close; a failed close retains this lease.
+    pub(super) durable: Option<crate::database::durable::Lease>,
 }
 /// An atomic job starts its SQLite transaction at its first writing statement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +70,28 @@ impl Overlay {
         Self::create_observed(path, config).result
     }
 
+    /// Creates a durable Workspace database with an exact nonzero identity.
+    /// The parent must be a private, owner-controlled directory on a local
+    /// filesystem. This does not create or recover a FUSE mount.
+    pub fn create_durable(
+        path: &Path,
+        config: ProfileConfig,
+        identity: [u8; 32],
+    ) -> OverlayResult<Self> {
+        crate::database::durable::create(path, config, identity)
+    }
+
+    /// Reopens a durable database after its prior owner has released its lease.
+    /// The caller must separately fence the old mount, commands and uncertain
+    /// external operations before exposing this state to a new executor.
+    pub fn recover_durable(
+        path: &Path,
+        config: ProfileConfig,
+        identity: [u8; 32],
+    ) -> OverlayResult<Self> {
+        crate::database::durable::recover(path, config, identity)
+    }
+
     /// Creates one engine while retaining startup work on success or failure.
     pub fn create_observed(path: &Path, config: ProfileConfig) -> crate::Creation {
         crate::database::startup::create(path, config)
@@ -83,7 +107,7 @@ impl Overlay {
         crate::database::startup::copy_template(path, config, template)
     }
 
-    /// Checked close of the sole disposable connection. It performs no sync.
+    /// Checked close of the sole connection.
     /// Callers establish all request/capture/handle fences before consuming it.
     /// The path is retained on failure; close never authorizes an implicit replay.
     pub fn close_database(self) -> OverlayResult<()> {
@@ -94,17 +118,19 @@ impl Overlay {
     pub fn close_database_file(self) -> OverlayResult<crate::ClosedFile> {
         self.connection.flush_prepared_statement_cache();
         let open = self.open.into_inner();
-        self.connection
-            .close()
-            .map_err(|refused| OverlayError::Uncertain {
+        let durable = self.durable;
+        match self.connection.close() {
+            Ok(()) => Ok(crate::ClosedFile {
+                allocation: self.allocation,
+                _durable: durable,
+            }),
+            Err(refused) => Err(OverlayError::Uncertain {
                 cause: Box::new(OverlayError::Close(Box::new(crate::CloseFailure::retain(
-                    refused, open,
+                    refused, open, durable,
                 )))),
                 completion: None,
-            })?;
-        Ok(crate::ClosedFile {
-            allocation: self.allocation,
-        })
+            }),
+        }
     }
 
     /// Selected settings actually read back from this initialized connection.
@@ -154,10 +180,26 @@ impl Overlay {
     }
     pub(crate) fn available(&self) -> OverlayResult<()> {
         if self.quarantined.get() {
-            Err(OverlayError::Quarantined)
-        } else {
-            Ok(())
+            return Err(OverlayError::Quarantined);
         }
+        // The private directory and both exact file identities are the durable
+        // ownership boundary. Do not resume after any identity observation
+        // fails: a second owner may have acquired a replacement path.
+        if self.transaction.get() == Transaction::None {
+            if let Some(lease) = &self.durable {
+                if let Err(cause) = lease
+                    .verify()
+                    .and_then(|_| self.allocation.state().map(|_| ()))
+                {
+                    self.quarantined.set(true);
+                    return Err(OverlayError::Uncertain {
+                        cause: Box::new(cause),
+                        completion: None,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
     /// Nonrecycled identity for exact typed token validation, not routing.
     pub const fn engine(&self) -> u64 {
@@ -305,7 +347,24 @@ impl Overlay {
             self.open.borrow().mount,
         );
         let workspace = self.workspace.get();
-        let result = job();
+        let volatile = self
+            .durable
+            .as_ref()
+            .map(|_| crate::database::durable::volatile(self));
+        let result = job().and_then(|value| {
+            if let Some(previous) = volatile {
+                let current = crate::database::durable::volatile(self);
+                if current != previous
+                    || !crate::database::durable::same_persistent_state(
+                        workspace,
+                        self.workspace.get(),
+                    )
+                {
+                    crate::database::durable::save(self, current)?;
+                }
+            }
+            Ok(value)
+        });
         let issued = std::mem::take(&mut *self.issued.borrow_mut());
         let begun = self.transaction.get() == Transaction::Begun;
         let failed = match result {

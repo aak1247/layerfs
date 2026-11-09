@@ -49,11 +49,12 @@ explicitly and preserve historical receipts and their original verdicts. Never
 infer that an old Disposable Store became Durable just by opening it under a
 different connection setting.
 
-The existing Workspace overlay is still a separate MEMORY/OFF/EXCLUSIVE
-database without crash recovery. A Durable global Store alone does not make
-uncommitted Workspace writes durable. Do not route user work to a path that
-claims recovery until the overlay, lifecycle and FUSE synchronization contracts
-are implemented and verified together.
+Mounted Workspaces still use the separate MEMORY/OFF/EXCLUSIVE overlay. The
+Overlay crate also provides a Linux durable database and conservative reopen
+boundary; it is not yet connected to mount or daemon recovery. A Durable global
+Store alone does not make uncommitted Workspace writes durable. Do not route
+user work to a path that claims recovery until the overlay, lifecycle and FUSE
+synchronization contracts are implemented and verified together.
 
 ## LayerFS mental model
 
@@ -321,7 +322,7 @@ remain binding; moving them out of this file does not weaken them.
   measurement and proof budgets in §3 stay stricter.
 - Preserve [repository ARM64 build inputs](.cargo/config.toml); explicit
   RUSTFLAGS must repeat the profile. Details are in the core guide.
-- Persistence profiles are scoped to the store. Claim only their guarantees;
+- Persistence profiles are scoped to their database. Claim only their guarantees;
   no `fsync`/`fdatasync`/`sync_data`/`sync_all` on disposable Workspace backing,
   and no space is reserved ahead of use on it.
   Memory hints are hints, not evidence of resident bounds.
