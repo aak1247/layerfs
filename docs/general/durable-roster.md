@@ -22,9 +22,9 @@ or file and never removes records. Overlay files live separately; each record
 supplies a deterministic filename component, and the caller must open it with
 the Overlay's own identity and directory checks.
 
-The directory contains an authority-bound owner file, a sequence of immutable
-Workspace record files, a fixed-width hash-chained ledger and a durable ledger
-head. Appending writes and synchronizes the record, appends and synchronizes the
+The directory contains an authority-bound owner file, immutable Workspace and
+lifecycle event files, a fixed-width hash-chained ledger and a durable ledger
+head. Appending writes and synchronizes the event, appends and synchronizes the
 ledger entry, writes and synchronizes a replacement head, renames it into place,
 then synchronizes the checked directory before acknowledging success. The
 original directory, owner lock, journal and attempted files remain in custody
@@ -55,14 +55,33 @@ namespaces, validates their saved snapshots against the Store and registers the
 bindings without mounting them. If an entry fails, it returns the original
 failure, completed tokens and any unadmitted owner; the caller must retain the
 same Service and Owner, reconcile the result and not automatically replay it.
-An incomplete creation, terminally closed Workspace or missing file is an
-error, not permission to skip an entry or create replacement data. The caller
+An incomplete creation or missing file is an error, not permission to skip an
+entry or create replacement data. The caller
 must keep admissions serialized and independently prove the old mounts and
 consumers stopped before invoking this operation.
 Even after a successful scan the caller must separately authorize each
 Workspace and Branch, prove the Store and original file identities, fence old
 processes and mounts, and reconcile unknown operations before exposing data.
-The catalog has no automatic cleanup, terminal-state transition or migration.
+Before attempting a terminal close the caller may persist
+`Roster::begin_close(token)`. The caller must serialize control admission and
+verify that this is the current bound Workspace and namespace. Only one close
+may be pending in a catalog at a time. While one is pending, normal discovery,
+recovery and new intents refuse without performing those operations.
+`Roster::pending_close` exposes the exact retained Workspace, Branch and token;
+it does not establish whether the original unmount succeeded. After verifying
+the provenance of that exact unmount's `Reply::Unmounted`, the caller may pass
+the reply to `Roster::finish_close`. Status, a disconnected process or a reply
+for another namespace is not a receipt. An interrupted or unknown close must
+be reconciled with independent evidence, never automatically retried or
+declared complete. This is a low-level catalog protocol; the normal daemon's
+unmount path does not yet perform it or provide the required admission fencing.
+
+A completed close removes the Workspace from the active discovery set while
+keeping the original creation, intent and terminal event files. The same
+Workspace identity cannot be reused. The event chain validates both ordering
+and the exact namespace. Create-only catalogs remain readable; older binaries
+reject the new event tags and must not open a catalog after lifecycle events
+have been added. The catalog has no automatic cleanup or migration.
 
 On 2026-11-09 an owned QEMU/KVM guest wrote two records to a raw ext4 disk
 (`cache=none`) and acknowledged them. The harness killed that guest, booted
@@ -91,3 +110,22 @@ A separate control-only test recovered 64 distinct durable Overlay bindings
 from one catalog, checked their identities and namespaces, then closed them.
 It used a Disposable test Store and no FUSE mounts; it is a functional capacity
 check, not a crash, throughput or latency qualification.
+
+A later owned VM probe wrote one active record, one completed close and one
+pending close, using synthetic close replies, then lost guest power after the
+catalog acknowledgments. On the next boot it found the pending exact token,
+refused discovery, and verified the active set after a synthetic reconciliation.
+The result is under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-roster-lifecycle-vm-20261109/`;
+the probe SHA-256 was
+`2bbd1e7dbaf91a27c5f7d31360e3ce57284dbdcb0e92099b8239cdfa2f79df5a`.
+This tests catalog persistence, not a real unmount or physical power loss.
+
+The isolated two-Workspace FUSE test was extended to record intents around
+the actual successful unmount replies, then reopen the catalog and verify that
+neither closed Workspace is active. Its successful runner, hashes and container
+exit are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-roster-lifecycle-fuse-v2-20261109/`.
+The first test setup failed because its bind-mounted proof directory did not
+allow the test's unprivileged user to traverse it; that failed run is retained
+separately in `durable-roster-lifecycle-fuse-20261109`.

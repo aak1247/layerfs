@@ -7,4 +7,4 @@ mod ledger;
 mod record;
 
 pub use files::{Roster, RosterError};
-pub use record::{Authority, WorkspaceRecord};
+pub use record::{Authority, Closing, WorkspaceRecord};

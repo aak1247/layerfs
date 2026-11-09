@@ -1,6 +1,7 @@
 //! Durable discovery refuses incomplete identities and retains unknown writes.
 #![cfg(target_os = "linux")]
 
+use layerfs_bridge::control::{Reply, WorkspaceToken};
 use layerfs_daemon::durable_roster::{Authority, Roster, RosterError, WorkspaceRecord};
 use layerfs_history::{BranchId, WorkspaceId};
 use std::{
@@ -424,6 +425,19 @@ fn durable_save_survives_vm_power_loss() {
             let mut roster = Roster::create(&directory, AUTHORITY).unwrap();
             roster.record(entry(31)).unwrap();
             roster.record(entry(32)).unwrap();
+            roster.record(entry(33)).unwrap();
+            let closed = WorkspaceToken {
+                workspace: entry(31).workspace,
+                namespace: 31,
+            };
+            roster.begin_close(closed).unwrap();
+            // The guest probe tests the record format with synthetic receipts.
+            roster.finish_close(&Reply::Unmounted(closed)).unwrap();
+            let pending = WorkspaceToken {
+                workspace: entry(33).workspace,
+                namespace: 33,
+            };
+            roster.begin_close(pending).unwrap();
             let size = fs::metadata(record_path(&directory, entry(32)))
                 .unwrap()
                 .len();
@@ -434,12 +448,23 @@ fn durable_save_survives_vm_power_loss() {
         }
         "read" => {
             let mut roster = Roster::open(&directory, AUTHORITY).unwrap();
+            let pending = roster.pending_close().unwrap().unwrap();
+            assert_eq!(pending.record, entry(33));
+            assert_eq!(pending.token.namespace, 33);
+            assert!(matches!(
+                roster.visit(|_| panic!("pending close must block discovery")),
+                Err(RosterError::PendingClose(_))
+            ));
+            // A synthetic test receipt permits inspecting the remaining active set.
+            roster
+                .finish_close(&Reply::Unmounted(pending.token))
+                .unwrap();
             let mut found = Vec::new();
             roster
                 .visit(|record| found.push(record.workspace.to_bytes()[0]))
                 .unwrap();
             found.sort_unstable();
-            assert_eq!(found, vec![31, 32]);
+            assert_eq!(found, vec![32]);
             assert!(matches!(
                 roster.record(entry(31)),
                 Err(RosterError::AlreadyExists)

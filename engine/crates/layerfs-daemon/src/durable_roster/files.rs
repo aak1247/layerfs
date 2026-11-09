@@ -1,8 +1,12 @@
 //! Checked private directory, cooperative owner lock and append-only records.
 use super::{
     ledger::{decode_entry, decode_head, entry_bytes, head_bytes, Head, ENTRY_LEN, HEAD_LEN},
-    record::{owner_bytes, Authority, WorkspaceRecord, OWNER_LEN},
+    record::{
+        decode_record, identity_name, owner_bytes, Authority, Closing, Event, WorkspaceRecord,
+        OWNER_LEN, RECORD_LEN,
+    },
 };
+use layerfs_bridge::control::{Reply, WorkspaceToken};
 use layerfs_history::WorkspaceId;
 use nix::{
     fcntl::{openat, renameat, Flock, FlockArg, OFlag},
@@ -33,6 +37,8 @@ pub enum RosterError {
     Io(io::Error),
     Invalid(&'static str),
     AlreadyExists,
+    /// A close was durably started but has no recorded terminal receipt.
+    PendingClose(Closing),
     Uncertain(Arc<RosterError>),
     Retained(Arc<RosterError>),
 }
@@ -66,6 +72,7 @@ pub struct Roster {
     head: Head,
     retained: Vec<File>,
     authority: Authority,
+    pending_close: Option<Closing>,
     failure: Option<Arc<RosterError>>,
 }
 
@@ -132,6 +139,7 @@ impl Roster {
             head: Head::empty(),
             retained: Vec::new(),
             authority,
+            pending_close: None,
             failure: None,
         };
         if let Err(cause) = roster.verify() {
@@ -163,6 +171,7 @@ impl Roster {
             head: Head::empty(),
             retained: Vec::new(),
             authority,
+            pending_close: None,
             failure: None,
         };
         roster.verify_owner()?;
@@ -183,8 +192,11 @@ impl Roster {
         if let Err(cause) = roster.verify() {
             return Err(roster.retain(cause, false));
         }
-        // Never admit another intent while an earlier record is incomplete.
-        roster.visit(|_| {})?;
+        // A complete but unresolved close remains inspectable under the lock.
+        roster.pending_close = match roster.scan_structure() {
+            Ok(pending) => pending,
+            Err(cause) => return Err(roster.retain(cause, false)),
+        };
         Ok(roster)
     }
 
@@ -192,15 +204,81 @@ impl Roster {
     /// Existing identities are never overwritten, removed, or automatically reused.
     pub fn record(&mut self, record: WorkspaceRecord) -> Result<(), RosterError> {
         self.ensure()?;
-        let name = record.file_name();
-        let (next, bytes) = entry_bytes(self.authority, self.head, record)?;
+        self.ready()?;
+        self.append(Event::Created(record))
+    }
+
+    /// Persist one exact close intent before attempting unmount or Close.
+    /// The caller must first serialize admission and prove that the token is
+    /// the current bound namespace. A pending intent blocks other mutations.
+    pub fn begin_close(&mut self, token: WorkspaceToken) -> Result<Closing, RosterError> {
+        self.ensure()?;
+        self.ready()?;
+        if token.namespace <= 0 {
+            return Err(RosterError::Invalid("roster closing namespace"));
+        }
+        let name = format!("{}.record", identity_name(token.workspace));
+        let record = match self.checked_marker(&name)? {
+            Some((_, Event::Created(record))) if record.workspace == token.workspace => record,
+            Some(_) => {
+                return Err(self.retain(RosterError::Invalid("roster creation marker"), false))
+            }
+            None => return Err(RosterError::Invalid("unknown roster Workspace")),
+        };
+        let closing = Closing { record, token };
+        if self
+            .checked_marker(&Event::Closed(closing).file_name())?
+            .is_some()
+        {
+            return Err(RosterError::AlreadyExists);
+        }
+        self.append(Event::Closing(closing))?;
+        self.pending_close = Some(closing);
+        Ok(closing)
+    }
+
+    /// Record the exact terminal reply only after its provenance is verified.
+    /// A status read, missing process or old token is not an unmount receipt.
+    pub fn finish_close(&mut self, reply: &Reply) -> Result<(), RosterError> {
+        self.ensure()?;
+        let closing = self
+            .pending_close
+            .ok_or(RosterError::Invalid("no pending close"))?;
+        if !matches!(reply, Reply::Unmounted(token) if *token == closing.token) {
+            return Err(RosterError::Invalid("close receipt does not match intent"));
+        }
+        match self.checked_marker(&Event::Closing(closing).file_name())? {
+            Some((_, Event::Closing(saved))) if saved == closing => {}
+            _ => return Err(self.retain(RosterError::Invalid("roster close intent"), false)),
+        }
+        self.append(Event::Closed(closing))?;
+        self.pending_close = None;
+        Ok(())
+    }
+
+    /// Inspect an unresolved close after validating the entire catalog.
+    /// Inspection does not establish the outcome of the unmount attempt.
+    pub fn pending_close(&mut self) -> Result<Option<Closing>, RosterError> {
+        self.checked_scan()
+    }
+
+    fn ready(&self) -> Result<(), RosterError> {
+        match self.pending_close {
+            Some(closing) => Err(RosterError::PendingClose(closing)),
+            None => Ok(()),
+        }
+    }
+
+    fn append(&mut self, event: Event) -> Result<(), RosterError> {
+        let name = event.file_name();
+        let (next, bytes) = entry_bytes(self.authority, self.head, event)?;
         let offset = self.head.size()?;
         let directory = self.directory.as_ref().expect("roster directory retained");
         let journal = self.journal.as_ref().expect("roster journal retained");
         let mut file = match open_file(directory, OsStr::new(&name), true) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                self.visit(|_| {})?;
+                self.checked_scan()?;
                 return Err(RosterError::AlreadyExists);
             }
             Err(error) => return Err(self.retain(error.into(), true)),
@@ -277,61 +355,148 @@ impl Roster {
         Ok(())
     }
 
-    /// Visit each complete record without imposing a Workspace count limit.
+    /// Visit each active record without imposing a Workspace count limit.
     /// An error means the scan was incomplete; visited entries are tentative
     /// evidence. The callback must not start recovery or other side effects.
     /// A complete scan is not authorization or an old-mount fencing proof.
     pub fn visit(&mut self, mut receive: impl FnMut(WorkspaceRecord)) -> Result<(), RosterError> {
-        self.ensure()?;
+        if let Some(closing) = self.checked_scan()? {
+            return Err(RosterError::PendingClose(closing));
+        }
         let result = (|| {
-            let directory = self.directory.as_ref().expect("roster directory retained");
             let journal = self.journal.as_ref().expect("roster journal retained");
             let mut cursor = Head::empty();
             while cursor.count < self.head.count {
                 let mut bytes = [0; ENTRY_LEN];
                 journal.read_exact_at(&mut bytes, cursor.size()?)?;
-                let (next, record) = decode_entry(self.authority, cursor, &bytes)?;
-                let name = record.file_name();
-                let file = open_file(directory, OsStr::new(&name), false)?;
-                check_file(directory, OsStr::new(&name), &file)?;
-                if file.metadata()?.len() != ENTRY_LEN as u64 {
-                    return Err(RosterError::Invalid("roster record size"));
+                let (next, event) = decode_entry(self.authority, cursor, &bytes)?;
+                if let Event::Created(record) = event {
+                    let name = format!("{}.closed", identity_name(record.workspace));
+                    if self.marker(&name)?.is_none() {
+                        receive(record);
+                    }
                 }
-                let mut saved = [0; ENTRY_LEN];
-                file.read_exact_at(&mut saved, 0)?;
-                if saved != bytes {
-                    return Err(RosterError::Invalid("roster record differs from ledger"));
-                }
-                check_file(directory, OsStr::new(&name), &file)?;
-                self.verify()?;
-                receive(record);
                 cursor = next;
-            }
-            if cursor != self.head {
-                return Err(RosterError::Invalid("roster ledger head"));
-            }
-            let mut count = 0u64;
-            for entry in fs::read_dir(fd_path(directory))? {
-                let name = entry?.file_name();
-                if name == OWNER || name == JOURNAL || name == HEAD {
-                    continue;
-                }
-                let text = name
-                    .to_str()
-                    .ok_or(RosterError::Invalid("roster record name"))?;
-                if !text.starts_with("workspace-") || !text.ends_with(".record") {
-                    return Err(RosterError::Invalid("roster record name"));
-                }
-                count = count
-                    .checked_add(1)
-                    .ok_or(RosterError::Invalid("roster record count"))?;
-            }
-            if count != self.head.count {
-                return Err(RosterError::Invalid("roster record count"));
             }
             self.verify()
         })();
         result.map_err(|cause| self.retain(cause, false))
+    }
+
+    fn checked_scan(&mut self) -> Result<Option<Closing>, RosterError> {
+        self.ensure()?;
+        let pending = match self.scan_structure() {
+            Ok(value) => value,
+            Err(cause) => return Err(self.retain(cause, false)),
+        };
+        if pending != self.pending_close {
+            return Err(self.retain(RosterError::Invalid("roster close state changed"), false));
+        }
+        Ok(pending)
+    }
+
+    // Verify all immutable markers against their exact ledger positions before
+    // interpreting an active set or exposing an unresolved close.
+    fn scan_structure(&self) -> Result<Option<Closing>, RosterError> {
+        let directory = self.directory.as_ref().expect("roster directory retained");
+        let journal = self.journal.as_ref().expect("roster journal retained");
+        let mut cursor = Head::empty();
+        let mut pending = None;
+        while cursor.count < self.head.count {
+            let mut bytes = [0; ENTRY_LEN];
+            journal.read_exact_at(&mut bytes, cursor.size()?)?;
+            let (next, event) = decode_entry(self.authority, cursor, &bytes)?;
+            if self.marker(&event.file_name())? != Some((next.count, event)) {
+                return Err(RosterError::Invalid("roster record differs from ledger"));
+            }
+            match event {
+                Event::Created(_) => {}
+                Event::Closing(closing) => {
+                    let created = self.marker(&Event::Created(closing.record).file_name())?;
+                    if pending.is_some()
+                        || !matches!(created, Some((sequence, Event::Created(record))) if sequence < next.count && record == closing.record)
+                    {
+                        return Err(RosterError::Invalid("roster close ordering"));
+                    }
+                    pending = Some(closing);
+                }
+                Event::Closed(closing) => {
+                    let intent = self.marker(&Event::Closing(closing).file_name())?;
+                    if pending != Some(closing)
+                        || !matches!(intent, Some((sequence, Event::Closing(saved))) if sequence < next.count && saved == closing)
+                    {
+                        return Err(RosterError::Invalid("roster close receipt ordering"));
+                    }
+                    pending = None;
+                }
+            }
+            cursor = next;
+        }
+        if cursor != self.head {
+            return Err(RosterError::Invalid("roster ledger head"));
+        }
+        let mut count = 0u64;
+        for entry in fs::read_dir(fd_path(directory))? {
+            let name = entry?.file_name();
+            if name == OWNER || name == JOURNAL || name == HEAD {
+                continue;
+            }
+            let text = name
+                .to_str()
+                .ok_or(RosterError::Invalid("roster record name"))?;
+            if !text.starts_with("workspace-")
+                || !(text.ends_with(".record")
+                    || text.ends_with(".closing")
+                    || text.ends_with(".closed"))
+            {
+                return Err(RosterError::Invalid("roster record name"));
+            }
+            count = count
+                .checked_add(1)
+                .ok_or(RosterError::Invalid("roster record count"))?;
+        }
+        if count != self.head.count {
+            return Err(RosterError::Invalid("roster record count"));
+        }
+        self.verify()?;
+        Ok(pending)
+    }
+
+    fn marker(&self, name: &str) -> Result<Option<(u64, Event)>, RosterError> {
+        let directory = self.directory.as_ref().expect("roster directory retained");
+        let file = match open_file(directory, OsStr::new(name), false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        check_file(directory, OsStr::new(name), &file)?;
+        if file.metadata()?.len() != ENTRY_LEN as u64 {
+            return Err(RosterError::Invalid("roster record size"));
+        }
+        let mut bytes = [0; ENTRY_LEN];
+        file.read_exact_at(&mut bytes, 0)?;
+        let sequence = u64::from_be_bytes(bytes[..8].try_into().expect("fixed sequence"));
+        if sequence == 0 || sequence > self.head.count {
+            return Err(RosterError::Invalid("roster marker sequence"));
+        }
+        let event = decode_record(self.authority, &bytes[8..8 + RECORD_LEN])?;
+        if event.file_name() != name {
+            return Err(RosterError::Invalid("roster marker identity"));
+        }
+        let mut ledger = [0; ENTRY_LEN];
+        self.journal
+            .as_ref()
+            .expect("roster journal retained")
+            .read_exact_at(&mut ledger, (sequence - 1) * ENTRY_LEN as u64)?;
+        if ledger != bytes {
+            return Err(RosterError::Invalid("roster marker ledger mismatch"));
+        }
+        check_file(directory, OsStr::new(name), &file)?;
+        Ok(Some((sequence, event)))
+    }
+
+    fn checked_marker(&mut self, name: &str) -> Result<Option<(u64, Event)>, RosterError> {
+        self.marker(name).map_err(|cause| self.retain(cause, false))
     }
 
     /// Returns one record only after the entire catalog was verified.

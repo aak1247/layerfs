@@ -270,6 +270,7 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     }
     assert_eq!(service.workspaces(), Some(2));
     for token in tokens {
+        discovery.begin_close(token).unwrap();
         let done = service
             .execute_control(&Request::Unmount(UnmountControl {
                 token,
@@ -277,11 +278,17 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
             }))
             .unwrap();
         assert_eq!(done.reply, Reply::Unmounted(token));
+        discovery.finish_close(&done.reply).unwrap();
     }
     cleanup.0.clear();
     drop(service);
     roster.stop().unwrap();
     drop(discovery);
+    let mut reopened = Roster::open(&directory.join("catalog"), authority).unwrap();
+    let mut active = Vec::new();
+    reopened.visit(|record| active.push(record)).unwrap();
+    assert!(active.is_empty());
+    drop(reopened);
     drop(store);
     fixture.cleanup();
 }

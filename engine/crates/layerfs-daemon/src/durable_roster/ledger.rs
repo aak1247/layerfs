@@ -1,7 +1,7 @@
 //! A fixed-width hash chain and durable head prove discovery completeness.
 use super::{
     files::RosterError,
-    record::{decode_record, record_bytes, Authority, WorkspaceRecord, RECORD_LEN},
+    record::{decode_record, record_bytes, Authority, Event, RECORD_LEN},
 };
 
 const HEAD_MAGIC: &[u8; 8] = b"LFSHEAD1";
@@ -60,7 +60,7 @@ pub(super) fn decode_head(authority: Authority, bytes: &[u8]) -> Result<Head, Ro
 pub(super) fn entry_bytes(
     authority: Authority,
     previous: Head,
-    record: WorkspaceRecord,
+    event: Event,
 ) -> Result<(Head, Vec<u8>), RosterError> {
     let count = previous
         .count
@@ -68,7 +68,7 @@ pub(super) fn entry_bytes(
         .ok_or(RosterError::Invalid("roster sequence exhausted"))?;
     let mut bytes = Vec::with_capacity(ENTRY_LEN);
     bytes.extend_from_slice(&count.to_be_bytes());
-    bytes.extend_from_slice(&record_bytes(authority, record));
+    bytes.extend_from_slice(&record_bytes(authority, event));
     let digest = entry_digest(previous.digest, &bytes);
     bytes.extend_from_slice(&digest);
     let head = Head { count, digest };
@@ -80,16 +80,16 @@ pub(super) fn decode_entry(
     authority: Authority,
     previous: Head,
     bytes: &[u8],
-) -> Result<(Head, WorkspaceRecord), RosterError> {
+) -> Result<(Head, Event), RosterError> {
     if bytes.len() != ENTRY_LEN {
         return Err(RosterError::Invalid("roster ledger entry size"));
     }
-    let record = decode_record(authority, &bytes[8..8 + RECORD_LEN])?;
-    let (head, expected) = entry_bytes(authority, previous, record)?;
+    let event = decode_record(authority, &bytes[8..8 + RECORD_LEN])?;
+    let (head, expected) = entry_bytes(authority, previous, event)?;
     if bytes != expected {
         return Err(RosterError::Invalid("roster ledger chain"));
     }
-    Ok((head, record))
+    Ok((head, event))
 }
 
 fn entry_digest(previous: [u8; 32], bytes: &[u8]) -> [u8; 32] {

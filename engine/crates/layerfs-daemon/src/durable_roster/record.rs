@@ -1,10 +1,13 @@
 //! Fixed-size, versioned discovery records; no user path is interpreted.
 use super::files::RosterError;
+use layerfs_bridge::control::WorkspaceToken;
 use layerfs_history::{BranchId, HistoryCatalog, WorkspaceId};
 use std::fmt::Write as _;
 
 const OWNER_MAGIC: &[u8; 8] = b"LFSROST1";
 const RECORD_MAGIC: &[u8; 8] = b"LFSWORK1";
+const CLOSING_MAGIC: &[u8; 8] = b"LFSCLSG1";
+const CLOSED_MAGIC: &[u8; 8] = b"LFSCLOS1";
 pub(super) const OWNER_LEN: usize = 8 + 32 + 32 + 32;
 pub(super) const RECORD_LEN: usize = 8 + 32 + 32 + 32 + 17 + 32;
 
@@ -50,12 +53,34 @@ impl WorkspaceRecord {
     pub fn overlay_name(self) -> String {
         format!("{}.sqlite", identity_name(self.workspace))
     }
+}
+
+/// A persisted close intent, including the exact original namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Closing {
+    pub record: WorkspaceRecord,
+    pub token: WorkspaceToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Event {
+    Created(WorkspaceRecord),
+    Closing(Closing),
+    Closed(Closing),
+}
+
+impl Event {
     pub(super) fn file_name(self) -> String {
-        format!("{}.record", identity_name(self.workspace))
+        let (workspace, suffix) = match self {
+            Self::Created(record) => (record.workspace, "record"),
+            Self::Closing(closing) => (closing.record.workspace, "closing"),
+            Self::Closed(closing) => (closing.record.workspace, "closed"),
+        };
+        format!("{}.{suffix}", identity_name(workspace))
     }
 }
 
-fn identity_name(workspace: WorkspaceId) -> String {
+pub(super) fn identity_name(workspace: WorkspaceId) -> String {
     let mut name = String::from("workspace-");
     for byte in workspace.to_bytes() {
         write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
@@ -75,10 +100,30 @@ pub(super) fn owner_bytes(authority: Authority) -> Result<Vec<u8>, RosterError> 
     Ok(bytes)
 }
 
-pub(super) fn record_bytes(authority: Authority, record: WorkspaceRecord) -> Vec<u8> {
+pub(super) fn record_bytes(authority: Authority, event: Event) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(RECORD_LEN);
-    bytes.extend_from_slice(RECORD_MAGIC);
-    bytes.extend_from_slice(&authority.sandbox);
+    let (magic, record, namespace) = match event {
+        Event::Created(record) => (RECORD_MAGIC, record, None),
+        Event::Closing(closing) => (CLOSING_MAGIC, closing.record, Some(closing.token.namespace)),
+        Event::Closed(closing) => (CLOSED_MAGIC, closing.record, Some(closing.token.namespace)),
+    };
+    bytes.extend_from_slice(magic);
+    if let Some(namespace) = namespace {
+        // Lifecycle events retain the original fixed width and bind the exact
+        // namespace to both authorities and the immutable Workspace/Branch.
+        bytes.extend_from_slice(&namespace.to_be_bytes());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"layerfs/durable-roster-close/v1\0");
+        hasher.update(magic);
+        hasher.update(&authority.sandbox);
+        hasher.update(&authority.store);
+        hasher.update(record.workspace.as_slice());
+        hasher.update(record.branch.as_slice());
+        hasher.update(&namespace.to_be_bytes());
+        bytes.extend_from_slice(&hasher.finalize().as_bytes()[..24]);
+    } else {
+        bytes.extend_from_slice(&authority.sandbox);
+    }
     bytes.extend_from_slice(&authority.store);
     bytes.extend_from_slice(record.workspace.as_slice());
     bytes.extend_from_slice(record.branch.as_slice());
@@ -90,13 +135,8 @@ fn checksum(bytes: &mut Vec<u8>) {
     bytes.extend_from_slice(blake3::hash(bytes).as_bytes());
 }
 
-pub(super) fn decode_record(
-    authority: Authority,
-    bytes: &[u8],
-) -> Result<WorkspaceRecord, RosterError> {
+pub(super) fn decode_record(authority: Authority, bytes: &[u8]) -> Result<Event, RosterError> {
     if bytes.len() != RECORD_LEN
-        || &bytes[..8] != RECORD_MAGIC
-        || bytes[8..40] != authority.sandbox
         || bytes[40..72] != authority.store
         || blake3::hash(&bytes[..RECORD_LEN - 32]).as_bytes() != &bytes[RECORD_LEN - 32..]
     {
@@ -106,5 +146,31 @@ pub(super) fn decode_record(
         .map_err(|_| RosterError::Invalid("roster Workspace identity"))?;
     let branch = BranchId::from_slice(&bytes[104..121])
         .map_err(|_| RosterError::Invalid("roster Branch identity"))?;
-    Ok(WorkspaceRecord { workspace, branch })
+    let record = WorkspaceRecord { workspace, branch };
+    let event = if &bytes[..8] == RECORD_MAGIC {
+        Event::Created(record)
+    } else {
+        let namespace = i64::from_be_bytes(bytes[8..16].try_into().expect("fixed namespace"));
+        if namespace <= 0 {
+            return Err(RosterError::Invalid("roster closing namespace"));
+        }
+        let closing = Closing {
+            record,
+            token: WorkspaceToken {
+                workspace,
+                namespace,
+            },
+        };
+        if &bytes[..8] == CLOSING_MAGIC {
+            Event::Closing(closing)
+        } else if &bytes[..8] == CLOSED_MAGIC {
+            Event::Closed(closing)
+        } else {
+            return Err(RosterError::Invalid("roster record version"));
+        }
+    };
+    if record_bytes(authority, event) != bytes {
+        return Err(RosterError::Invalid("roster record authority"));
+    }
+    Ok(event)
 }
