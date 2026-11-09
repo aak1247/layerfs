@@ -560,7 +560,17 @@ fn explicit_profiles_keep_atomic_publication_and_matching_reopen_contracts() {
         assert_eq!(completed.profile, selected);
         assert!(!t.join("db-wal").exists());
         assert!(!t.join("db-shm").exists());
-        // Both profiles use WAL; mixed-profile provisioning cannot be detected.
+        // A mismatched writer must be rejected before it can change the Store.
+        let wrong = match selected {
+            Durable => layerfs_persistence::SqlitePersistenceProfile::Disposable,
+            _ => Durable,
+        };
+        assert!(Handles::open_writable(
+            cfg.clone().with_sqlite_profile(wrong),
+            b"durable-publication",
+            [71; 32],
+        )
+        .is_err());
         let reopened =
             Handles::open_writable(cfg.clone(), b"durable-publication", [71; 32]).unwrap();
         let read = Storage::new(reopened.storage.clone()).unwrap();
@@ -639,9 +649,9 @@ fn multi_page_publication_preserves_first_wins_loss_order_and_late_failure_atomi
     }
 }
 
-/// Owner direction 2026-10-07: Disposable is the sole active development
-/// verification profile. Durable execution of these bodies is NOT_RUN —
-/// deferred by owner for Disposable-only development. Durable support and its
-/// retained historical receipts are unchanged.
-const DEVELOPMENT_PROFILES: [layerfs_persistence::SqlitePersistenceProfile; 1] =
-    [layerfs_persistence::SqlitePersistenceProfile::Disposable];
+/// The fork owner reauthorized Durable verification on 2026-11-09. These
+/// Store-only tests do not establish durable Workspace overlays or recovery.
+const DEVELOPMENT_PROFILES: [layerfs_persistence::SqlitePersistenceProfile; 2] = [
+    layerfs_persistence::SqlitePersistenceProfile::Disposable,
+    layerfs_persistence::SqlitePersistenceProfile::Durable,
+];

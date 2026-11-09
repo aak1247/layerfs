@@ -40,21 +40,20 @@ Source and public contracts establish implemented behavior. Owner requirements
 and proposals establish target behavior; research establishes neither capability
 nor qualification. Preserve source pins, limits, failures and open prerequisites.
 
-## Active persistence profile — owner direction 2026-10-07
+## Persistence profiles — fork owner direction 2026-11-09
 
-**Disposable / WAL / synchronous=OFF is the only permitted global Store
-profile. Durable execution is disabled indefinitely, until the owner explicitly
-allows it again.** This supersedes earlier instructions to exercise both profiles
-or to resume Durable after Disposable development. A milestone, old benchmark
-selection, default argument or passing build does not reauthorize Durable.
+The fork owner has explicitly reauthorized development, testing and use of a
+Durable Store and durable Workspace recovery, superseding the upstream
+Disposable-only execution policy of 2026-10-07. Select the intended profile
+explicitly and preserve historical receipts and their original verdicts. Never
+infer that an old Disposable Store became Durable just by opening it under a
+different connection setting.
 
-Select Disposable explicitly for every new Store, application run, test,
-diagnostic and measurement. Do not execute Durable or fall back to it. Retained
-Durable implementation may compile, but report its execution as
-`NOT_RUN — disabled by owner until explicit reauthorization`. Preserve historical
-Durable receipts and their original verdicts. This execution policy does not
-claim that the Durable API has been removed. Each Workspace's daemon overlay
-remains a separate MEMORY/OFF/EXCLUSIVE database file.
+The existing Workspace overlay is still a separate MEMORY/OFF/EXCLUSIVE
+database without crash recovery. A Durable global Store alone does not make
+uncommitted Workspace writes durable. Do not route user work to a path that
+claims recovery until the overlay, lifecycle and FUSE synchronization contracts
+are implemented and verified together.
 
 ## LayerFS mental model
 

@@ -41,6 +41,7 @@ def parser():
             command.add_argument("arguments", nargs=argparse.REMAINDER)
         if name == "run":
             command.add_argument("--bundle", required=True)
+            command.add_argument("--store-profile", choices=("disposable", "durable"), default="disposable")
         if name == "teardown":
             command.add_argument("--run-receipt", required=True)
             command.add_argument("--release-failed", action="store_true")

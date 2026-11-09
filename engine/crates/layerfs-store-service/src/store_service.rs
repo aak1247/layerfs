@@ -83,6 +83,24 @@ impl StoreService {
         cursor_key: [u8; 32],
         template: &Path,
     ) -> Result<Self, OpenRefusal> {
+        Self::open_direct_with_profile(
+            store,
+            binding,
+            cursor_key,
+            template,
+            SqlitePersistenceProfile::Disposable,
+        )
+    }
+
+    /// Opens a Store with its recorded profile. The call-local overlays remain
+    /// disposable; this does not provide recovery for mounted Workspaces.
+    pub fn open_direct_with_profile(
+        store: &Path,
+        binding: &[u8],
+        cursor_key: [u8; 32],
+        template: &Path,
+        profile: SqlitePersistenceProfile,
+    ) -> Result<Self, OpenRefusal> {
         kernel_guard::check(store).map_err(OpenRefusal::Unsupported)?;
         if !store.is_file() {
             return Err(OpenRefusal::Missing(format!(
@@ -91,8 +109,7 @@ impl StoreService {
             )));
         }
         let opened = open_store_observed(
-            PersistenceConfig::sqlite(store)
-                .with_sqlite_profile(SqlitePersistenceProfile::Disposable),
+            PersistenceConfig::sqlite(store).with_sqlite_profile(profile),
             binding,
             cursor_key,
             CALLS,

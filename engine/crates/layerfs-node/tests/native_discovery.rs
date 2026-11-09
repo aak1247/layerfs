@@ -38,6 +38,17 @@ fn sandbox_create_refuses_invalid_capacity_before_any_side_effect() {
 }
 
 #[test]
+fn project_init_refuses_invalid_store_profile_before_creating_a_project() {
+    let home = Home::new();
+    home.node(
+        "for (const value of ['unknown',0,null]) { const result = await native.call('project.init',{...args,name:'new-project',path:'/tmp',storeProfile:value}); assert.equal(result.refused.code,'InvalidInput'); }",
+        None,
+        Duration::from_secs(5),
+    );
+    assert!(!home.0.join("new-project").exists());
+}
+
+#[test]
 fn invalid_recorded_capacity_is_not_treated_as_a_legacy_record() {
     let home = Home::new();
     home.record_with_capacity(CID, [1; 32], [2; 32], Some(SdkValue::Int(0)));

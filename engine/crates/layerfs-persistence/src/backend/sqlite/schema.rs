@@ -4,6 +4,15 @@ use crate::backend::records::{BackendError, Param, Record};
 use rusqlite::Connection;
 use std::cell::RefCell;
 pub(crate) const APPLICATION_ID: i64 = 1279677264;
+// A separate on-disk identity keeps an older or misconfigured writer from
+// silently opening a Durable Store with synchronous=OFF.
+pub(crate) const DURABLE_APPLICATION_ID: i64 = 1279677265;
+pub(crate) const fn application_id(profile: crate::SqlitePersistenceProfile) -> i64 {
+    match profile {
+        crate::SqlitePersistenceProfile::Disposable => APPLICATION_ID,
+        crate::SqlitePersistenceProfile::Durable => DURABLE_APPLICATION_ID,
+    }
+}
 pub(crate) const OBJECTS: &str = include_str!("../../../sql/sqlite/objects.sql");
 pub(crate) const METADATA: &str = include_str!("../../../sql/sqlite/metadata.sql");
 pub(crate) const HISTORY: &str = include_str!("../../../sql/sqlite/history.sql");
@@ -62,6 +71,7 @@ pub(crate) fn check(
     c: &Connection,
     w: &RefCell<SqlWork>,
     (layout, acquisition): Selection,
+    profile: crate::SqlitePersistenceProfile,
 ) -> Result<(), BackendError> {
     let app = query::run(c, "PRAGMA application_id", vec![], w)?
         .first()
@@ -71,7 +81,8 @@ pub(crate) fn check(
         .first()
         .ok_or(BackendError::Integrity)?
         .get::<i64>(0)?;
-    if app != APPLICATION_ID || version != layout.version() + acquisition.version_offset() {
+    if app != application_id(profile) || version != layout.version() + acquisition.version_offset()
+    {
         return Err(BackendError::Integrity);
     }
     let rows = query::run(
@@ -133,7 +144,7 @@ impl super::connection::Session {
    let version=self.schema_version();
    let selection=(self.layout,self.acquisition);
    for script in scripts(selection) { tx.bootstrap(&script)?; }
-   tx.query(&format!("PRAGMA application_id={APPLICATION_ID}"),vec![])?;
+   tx.query(&format!("PRAGMA application_id={}",application_id(self.profile.persistence)),vec![])?;
    tx.query(&format!("PRAGMA user_version={version}"),vec![])?;
    tx.query(&format!("INSERT INTO store_policy(id,schema_version,format_profile,small_file_threshold_bytes,whole_file_delta_max_depth,chunk_delta_max_depth,metadata_delta_max_depth) VALUES(1,{version},?1,?2,?3,?4,?5)"),vec![Param::I64(i64::from(policy.format_profile())),Param::I64(policy.small_file_threshold_bytes() as i64),Param::I64(i64::from(policy.whole_file_delta_max_depth())),Param::I64(i64::from(policy.chunk_delta_max_depth())),Param::I64(i64::from(policy.metadata_delta_max_depth()))])?;
    let definition=definition(tx.connection,tx.work)?;
@@ -308,7 +319,7 @@ impl super::connection::Session {
     ) -> Result<u64, BackendError> {
         self.run::<_,BackendError>(false,|tx| {
    let selection=(self.layout,self.acquisition);
-   check(tx.connection,tx.work,selection)?;
+   check(tx.connection,tx.work,selection,self.profile.persistence)?;
    let rows=tx.query("SELECT catalog_id,catalog_incarnation,binding_key,identity_format,schema_version,schema_source,schema_definition FROM history_meta WHERE id=1",vec![])?;
    let r=rows.first().filter(|_|rows.len()==1).ok_or(BackendError::Integrity)?;
    let incarnation:i64=r.get(1)?;

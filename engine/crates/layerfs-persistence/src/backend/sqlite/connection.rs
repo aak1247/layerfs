@@ -171,6 +171,15 @@ impl Session {
         connection
             .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
             .map_err(rows::error)?;
+        if !create {
+            let app = query::run(&connection, "PRAGMA application_id", vec![], &work)?
+                .first()
+                .ok_or(BackendError::Integrity)?
+                .get::<i64>(0)?;
+            if app != super::schema::application_id(selected) {
+                return Err(BackendError::Integrity);
+            }
+        }
         profile::apply(&connection, create, selected, creation_acquisition, &work)?;
         let (layout, acquisition) = if create {
             (creation_layout, creation_acquisition)

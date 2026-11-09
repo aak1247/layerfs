@@ -48,7 +48,7 @@ and [verification rules](../engine/AGENTS.md#checks-and-completion). Build and
 test through the selected worktree's registered private resources from the root
 manifest. Build tests first with `--no-run`, then execute each selection under an
 explicit wall timeout of at most 120 seconds. Preserve repository ARM64 flags,
-locked dependencies, exact failure custody, the Disposable-only execution policy
+locked dependencies, exact failure custody, the root guide's persistence policy
 and per-commit production LOC comparisons. Migrations retain cheap tests of
 surviving behavior and delete tests that require retired scaffolding, with the
 root guide's required behavior coverage and deletion record.

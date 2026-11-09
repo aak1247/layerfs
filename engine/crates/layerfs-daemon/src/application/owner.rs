@@ -93,8 +93,14 @@ impl Application {
         };
         let existing = match &setup.existing_store {
             Some(m) => match open_store_observed(
-                PersistenceConfig::sqlite(&setup.store)
-                    .with_sqlite_profile(SqlitePersistenceProfile::Disposable),
+                PersistenceConfig::sqlite(&setup.store).with_sqlite_profile(match m.profile {
+                    layerfs_bridge::provision::StoreProfile::Disposable => {
+                        SqlitePersistenceProfile::Disposable
+                    }
+                    layerfs_bridge::provision::StoreProfile::Durable => {
+                        SqlitePersistenceProfile::Durable
+                    }
+                }),
                 &m.binding,
                 m.cursor_key,
                 l.namespaces as usize,

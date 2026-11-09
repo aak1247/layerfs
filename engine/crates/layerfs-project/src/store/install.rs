@@ -33,11 +33,15 @@ pub fn install_file(
     let mut accepted = false;
     let mut acknowledged = None;
     let result = (|| {
-        if manifest.profile != StoreProfile::Disposable
-            || store.profile != SqlitePersistenceProfile::Disposable
-        {
+        if !matches!(
+            (manifest.profile, store.profile),
+            (
+                StoreProfile::Disposable,
+                SqlitePersistenceProfile::Disposable
+            ) | (StoreProfile::Durable, SqlitePersistenceProfile::Durable)
+        ) {
             return Err(InstallError::Protocol(ControlError(
-                "explicit Disposable Store profile required",
+                "sealed Store profile does not match its manifest",
             )));
         }
         if manifest.daemon_sqlite.is_some() {

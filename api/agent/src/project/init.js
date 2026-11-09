@@ -6,6 +6,8 @@
 // { smallFileThreshold, wholeFileDepth, chunkDepth, metadataDepth }, is sent
 // as `policy`: JSON that is not such an object is refused here, and the
 // native code's refusal of a field is named after the variable too.
+// LAYERFS_STORE_PROFILE selects the global Store profile at Init; Workspaces
+// still have disposable overlays and cannot recover uncommitted writes.
 import { invoke, projectArgs, storeArgs, transportOf } from "../client.js";
 import { LayerFSError } from "../errors.js";
 
@@ -17,8 +19,12 @@ export async function init(client, sourcePath, timeout = INIT_TIMEOUT_MS) {
     throw new LayerFSError("InvalidInput", "timeout must be a positive whole number of milliseconds", null);
   }
   const policy = storePolicy(client.options.storePolicy);
+  const profile = client.options.storeProfile;
+  if (profile !== undefined && !["durable", "disposable"].includes(profile)) {
+    throw new LayerFSError("InvalidInput", "LAYERFS_STORE_PROFILE must be durable or disposable", null);
+  }
   try {
-    return await invoke("project.init", { ...projectArgs(client), ...storeArgs(client), path: sourcePath, name: client.projectName, ...(policy ? { policy } : {}), timeoutMs: timeout }, client.options, transportOf(client));
+    return await invoke("project.init", { ...projectArgs(client), ...storeArgs(client), path: sourcePath, name: client.projectName, ...(policy ? { policy } : {}), ...(profile ? { storeProfile: profile } : {}), timeoutMs: timeout }, client.options, transportOf(client));
   } catch (error) {
     // the native check runs before Init makes anything: `policy.<field> …` or `policy: …`
     const field = policy && error?.code === "InvalidInput" && /^InvalidInput: (policy[.:].*)$/s.exec(error.message);

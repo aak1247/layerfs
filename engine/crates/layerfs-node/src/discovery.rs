@@ -220,6 +220,10 @@ fn no_follow() -> i32 {
 }
 
 pub(crate) fn save(path: &Path, value: SdkValue) -> Result<()> {
+    save_with_sync(path, value, false)
+}
+
+fn save_with_sync(path: &Path, value: SdkValue, durable: bool) -> Result<()> {
     let bytes = layerfs_bridge::control::Answer {
         id: 1,
         reply: Reply::Sdk(value),
@@ -239,8 +243,25 @@ pub(crate) fn save(path: &Path, value: SdkValue) -> Result<()> {
         .open(&temp)
         .map_err(failed)?;
     file.write_all(&bytes).map_err(failed)?;
+    if durable {
+        file.sync_all().map_err(failed)?;
+    }
     drop(file);
-    fs::rename(temp, path).map_err(failed)
+    fs::rename(temp, path).map_err(failed)?;
+    if durable {
+        let parent = path
+            .parent()
+            .ok_or_else(|| refused("Unknown", "record has no parent"))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                refused(
+                    "Unknown",
+                    format!("record published but its directory sync failed: {error}"),
+                )
+            })?;
+    }
+    Ok(())
 }
 /// A small private text file, written once (0600, not a symlink).
 pub(crate) fn save_text(path: &Path, text: &str) -> Result<()> {
@@ -281,7 +302,7 @@ fn bytes<const N: usize>(value: &SdkValue, key: &str) -> Result<[u8; N]> {
     }
 }
 pub(crate) fn save_project(path: &Path, project: &Project) -> Result<()> {
-    save(
+    save_with_sync(
         &path.join("project.record"),
         SdkValue::map([
             (
@@ -299,6 +320,7 @@ pub(crate) fn save_project(path: &Path, project: &Project) -> Result<()> {
                     .unwrap_or_default(),
             ),
         ]),
+        project.manifest.profile == layerfs_bridge::provision::StoreProfile::Durable,
     )
 }
 pub(crate) fn project(args: &SdkValue) -> Result<Project> {
@@ -309,18 +331,26 @@ pub(crate) fn project(args: &SdkValue) -> Result<Project> {
         _ => Err(refused("NoSuchProject", "no complete project manifest")),
     };
     let manifest = decode("manifest")?;
-    if manifest.profile != layerfs_bridge::provision::StoreProfile::Disposable {
-        return Err(refused("InvalidInput", "Disposable required"));
-    }
     let installed = if matches!(value.get("installed"), Some(SdkValue::Bytes(_))) {
         Some(decode("installed")?)
     } else {
         None
     };
+    if let Some(installed) = &installed {
+        let mut expected = manifest.clone();
+        expected.daemon_sqlite = installed.daemon_sqlite.clone();
+        if installed.daemon_sqlite.is_none() || *installed != expected {
+            return Err(refused("InvalidInput", "installed Store manifest differs"));
+        }
+    }
+    let profile = match manifest.profile {
+        layerfs_bridge::provision::StoreProfile::Disposable => SqlitePersistenceProfile::Disposable,
+        layerfs_bridge::provision::StoreProfile::Durable => SqlitePersistenceProfile::Durable,
+    };
     Ok(Project {
         store: SealedStore {
             path: path.join("sealed.sqlite"),
-            profile: SqlitePersistenceProfile::Disposable,
+            profile,
             sqlite_version: manifest.host_sqlite.clone(),
             bytes: manifest.bytes,
         },

@@ -144,8 +144,11 @@ build inside a test. From `api`, `npm run build:isolated -- ...` and
 
 Each run receives its own named Store volume, private SDK home, unique container
 prefix, trace and retained output directory. The SDK process opens the same local
-Linux volume its daemons use. The native SDK selects Disposable explicitly;
-Durable remains disabled. Several daemons created by one test intentionally share
+Linux volume its daemons use. The launcher selects Disposable by default;
+`--store-profile durable` requests the Durable global Store for that run and
+records the request in its receipt; tests must verify the profile they use.
+Mounted Workspace overlays still have
+no crash durability. Several daemons created by one test intentionally share
 that run's Store. Other runs have different volumes. No fixed host port is chosen
 by this launcher; SDK daemon endpoint allocation keeps its existing behavior.
 Docker Desktop uses the Linux engine socket and `host.docker.internal`; native

@@ -667,8 +667,8 @@ Source: [Save lifecycle](../../core/crates/layerfs-storage/src/save/operation.rs
 
 | Choice | Current behavior |
 | --- | --- |
-| Durable | Retained WAL / FULL source may compile; execution disabled until explicit owner reauthorization |
-| Disposable | Sole active profile, selected explicitly: SQLite WAL / OFF; process-crash survival, no kernel/VM-crash durability |
+| Durable | Fork owner reauthorized WAL / FULL on 2026-11-09; global Store Commit is synchronized, but Workspace overlay recovery remains unimplemented |
+| Disposable | SQLite WAL / OFF; process-crash survival, no kernel/VM-crash durability |
 | Monolithic | Creation layout schema1; complete pack BLOBs |
 | GroupRows | Creation layout schema2; independently stored complete encoded units |
 | GroupRowsIndexed | Creation layout schema3; group rows with covering mapping index |
@@ -729,8 +729,8 @@ container filesystem, never a host-share bind mount. Each daemon's overlay is a
 separate MEMORY/OFF database and receives no global-Store profile change.
 
 The [foundation checkpoint](../../core/docs/issues/307/PRE-S8-F1-F4-20261007.md) owns
-functional evidence and remaining integration work. Durable builds but new Durable
-execution is NOT_RUN — deferred by owner for Disposable-only development. All
+functional evidence and remaining integration work. Its historical Durable
+execution was NOT_RUN under the then-active Disposable-only policy. All
 historical timing/storage failures below retain their original mechanisms,
 profiles, identities and verdicts. Removal of allocation is not an optimization
 claim or a pass of the old strict-allocation gate.

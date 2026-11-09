@@ -216,5 +216,6 @@ Simplification retains all five capped-edit cases because their untouched
 payload/source-offset oracle is stricter than their twins, with their distinct
 Commit watchdog preserved. The expected simplified harness is 157 cases in two
 tiers and a 23-family kept-sibling gate; every replacement uses its own terminal
-count row. Durable execution remains NOT_RUN — disabled by owner until explicit
-reauthorization. Repository history remains NOT_RUN — set aside by owner.
+count row. This historical qualification left Durable execution NOT_RUN under
+the then-active policy; the fork owner reauthorized it on 2026-11-09.
+Repository history remains NOT_RUN — set aside by owner.

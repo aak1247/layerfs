@@ -406,12 +406,11 @@ fixtures, examples and tools do not contribute to production LOC.
   attempt; they do not permit replay after failed/unknown publication.
 - Preserve definite-failure atomicity, original errors and exact uncertain
   custody. No resend, rollback/delete or success claim based on an unfenced read.
-- Global Persistence uses **Disposable/WAL/OFF only**, on macOS and Linux,
-  under the [owner's active-profile rule](../AGENTS.md#active-persistence-profile--owner-direction-2026-10-07).
-  Durable execution is disabled indefinitely until explicit owner reauthorization;
-  retained Durable source may compile but no test, diagnostic, measurement or
-  application invocation may execute it. Select Disposable explicitly rather than
-  relying on a default argument. Disposable claims process-crash survival only.
+- The fork owner reauthorized Durable persistence and Workspace recovery on
+  2026-11-09; see the [root policy](../AGENTS.md#persistence-profiles--fork-owner-direction-2026-11-09).
+  Select each profile explicitly and preserve Disposable's existing behavior.
+  Disposable claims process-crash survival only; current Workspace overlays do
+  not acquire crash recovery from the global Store's profile.
   Open verifies WAL and never converts an
   existing Store. Select profile/layout before open; Postgres stays unavailable.
   Owner supersession2026-10-07 keeps WAL throughout Init and Commit; no private
@@ -426,7 +425,7 @@ fixtures, examples and tools do not contribute to production LOC.
   See the [foundation checkpoint](../core/docs/issues/307/PRE-S8-F1-F4-20261007.md).
 - Target (owner direction 2026-10-07): the same Store opened directly by every
   Linux daemon from a shared volume, several writer processes, no host in the
-  data path, using only Disposable/WAL/OFF. A contended
+  data path. A contended
   write still has one SQL attempt and exact failure/unknown custody. Owner
   clarification2026-10-12 requires one ongoing Commit per Workspace and allows
   concurrent Commits on different Workspaces. Bounded before-effect admission

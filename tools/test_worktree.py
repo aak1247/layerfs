@@ -4,19 +4,20 @@ import contextlib
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from cleanup_state import Refused, git
+import worktree
 import worktree_build as builds
 import worktree_resources as resources
 import worktree_run as runs
+from cleanup_state import Refused, git
 
 
 class WorktreeTests(unittest.TestCase):
@@ -144,6 +145,11 @@ class WorktreeTests(unittest.TestCase):
         ):
             with self.assertRaises(Refused):
                 builds.cargo_arguments(args)
+
+    def test_run_profile_is_explicit_and_defaults_to_disposable(self):
+        base = ["run", "--resources", "/tmp/resources.json", "--bundle", "/tmp/bundle"]
+        self.assertEqual(worktree.parser().parse_args(base).store_profile, "disposable")
+        self.assertEqual(worktree.parser().parse_args([*base, "--store-profile", "durable"]).store_profile, "durable")
 
     def test_source_identity_includes_new_source_but_excludes_target(self):
         before = resources.inputs(self.record)

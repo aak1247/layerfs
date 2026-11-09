@@ -96,11 +96,6 @@ pub(crate) fn initialize(
     let mut initialized = None;
     let mut branch = None;
     let result = (|| {
-        if request.store.sqlite_profile != SqlitePersistenceProfile::Disposable {
-            return Err(InitError::Manifest(
-                "explicit Disposable Store profile required",
-            ));
-        }
         check_destination(
             &request.locator,
             &request.catalog.binding_key,
@@ -209,7 +204,7 @@ impl ProjectApi {
         Self
     }
     /// Imports the complete supported host tree, publishes genesis/Branch and seals.
-    /// An explicit Disposable profile is required before any Store creation.
+    /// The request selects the Store profile before creation.
     pub fn init(
         &self,
         request: InitRequest,

@@ -87,8 +87,10 @@ New Store schema versions are 16–18 (pack layouts) and 22–24 (with acquisiti
 with history identity format 3. Old Disposable Stores are rejected without
 migration. Select a fresh project/Store for the new format.
 
-Disposable/WAL/synchronous=OFF only. Durable execution is NOT_RUN — disabled by
-owner until explicit reauthorization. One attempted operation; no retry or replay.
+The fork supports an explicitly selected Durable/WAL/FULL global Store as well
+as the default Disposable/WAL/OFF Store. Mounted Workspace overlays remain
+disposable and cannot recover uncommitted changes after a crash; see the
+[agent settings](docs/agent.md#settings). One attempted operation; no retry or replay.
 Zombie reaping and the existing replaced-inode FUSE policy remain owner-deferred.
 
 ## Tests

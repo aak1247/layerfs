@@ -106,7 +106,7 @@ def launch(args):
         "store_volume": prefix + "store",
         "command": command,
         "timeout_seconds": args.timeout,
-        "store_profile": "Disposable (SDK native route)",
+        "requested_store_profile": args.store_profile,
         "released": False,
     }
     receipt = directory / "receipt.json"
@@ -139,6 +139,7 @@ def launch(args):
     env = {
         "LAYERFS_HOME": "/layerfs-store/sdk-home",
         "LAYERFS_STORE_PATH": "/layerfs-store/global/store.sqlite",
+        "LAYERFS_STORE_PROFILE": args.store_profile,
         "LAYERFS_DOCKER": "/var/run/docker.sock",
         "LAYERFS_IMAGE": resources["images"]["sandbox"],
         "LAYERFS_VOLUME": state["store_volume"],

@@ -13,10 +13,18 @@ use std::{
     ffi::{c_char, c_int, c_void, CStr, CString},
     fs,
     mem::{align_of, size_of},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     ptr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
 };
+
+// The observer temporarily replaces SQLite's process-wide default VFS.
+static VFS_LOCK: Mutex<()> = Mutex::new(());
 
 struct Counters {
     opens: [AtomicU64; 4],
@@ -326,23 +334,20 @@ impl Drop for Observer {
 }
 struct Fixture(PathBuf);
 impl Fixture {
-    fn new() -> Self {
+    fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "layerfs-disposable-startup-sync-{}",
+            "layerfs-{name}-startup-sync-{}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
-        eprintln!("DISPOSABLE_SYNC_FIXTURE {}", path.display());
+        eprintln!("SYNC_FIXTURE {}", path.display());
         Self(path)
     }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!(
-                "RETAINED_FAILED_DISPOSABLE_SYNC_FIXTURE {}",
-                self.0.display()
-            );
+            eprintln!("RETAINED_FAILED_SYNC_FIXTURE {}", self.0.display());
         } else {
             fs::remove_dir_all(&self.0).unwrap();
         }
@@ -351,7 +356,8 @@ impl Drop for Fixture {
 
 #[test]
 fn disposable_create_save_reopen_seal_never_calls_vfs_sync() {
-    let fixture = Fixture::new();
+    let _lock = VFS_LOCK.lock().unwrap();
+    let fixture = Fixture::new("disposable");
     let observer = Observer::new();
     observer.calibrate(&fixture.0.join("non-store-observer-control"));
     let authority = HistoryCatalogConfig {
@@ -444,4 +450,109 @@ fn disposable_create_save_reopen_seal_never_calls_vfs_sync() {
         syncs, 0,
         "public Disposable startup/save/seal issued actual delegated VFS xSync"
     );
+}
+
+#[test]
+fn durable_completed_save_delegates_sync_to_the_wal() {
+    let _lock = VFS_LOCK.lock().unwrap();
+    let fixture = Fixture::new("durable");
+    let observer = Observer::new();
+    observer.calibrate(&fixture.0.join("non-store-observer-control"));
+    let config = PersistenceConfig::sqlite(fixture.0.join("store.sqlite"))
+        .with_sqlite_profile(SqlitePersistenceProfile::Durable);
+    let authority = HistoryCatalogConfig {
+        binding_key: b"durable-sync-proof".to_vec(),
+        cursor_key: [83; 32],
+        incarnation: 1,
+    };
+    let handles = Handles::create(config, StoragePolicy::frozen_default(), &authority).unwrap();
+    assert_eq!(handles.profile().journal_mode, "wal");
+    assert_eq!(handles.profile().synchronous, 2);
+    observer.context.counts.reset();
+    let storage = Storage::new(handles.storage.clone()).unwrap();
+    let object = FinalizedObject::new(
+        ObjectRole::FileState,
+        layerfs_content::object::codec::encode_bytes_object(b"Durable canonical object").unwrap(),
+    )
+    .unwrap();
+    let save = storage.begin_save().unwrap();
+    save.accept(object).unwrap();
+    save.finish().unwrap();
+    assert!(
+        observer.context.counts.syncs[1].load(Ordering::Relaxed) > 0,
+        "a completed Durable save must delegate xSync to the WAL"
+    );
+    assert_eq!(observer.context.counts.errors.load(Ordering::Relaxed), 0);
+    drop(storage);
+    handles.seal().unwrap();
+}
+
+#[test]
+fn durable_completed_save_reopens_after_writer_process_is_killed() {
+    let _lock = VFS_LOCK.lock().unwrap();
+    const CHILD_PATH: &str = "LAYERFS_DURABLE_PROCESS_TEST_PATH";
+    let object = FinalizedObject::new(
+        ObjectRole::FileState,
+        layerfs_content::object::codec::encode_bytes_object(b"durable crash recovery").unwrap(),
+    )
+    .unwrap();
+    let authority = HistoryCatalogConfig {
+        binding_key: b"durable-process-recovery".to_vec(),
+        cursor_key: [84; 32],
+        incarnation: 1,
+    };
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let path = Path::new(&path);
+        let config = PersistenceConfig::sqlite(path.join("store.sqlite"))
+            .with_sqlite_profile(SqlitePersistenceProfile::Durable);
+        let handles = Handles::create(config, StoragePolicy::frozen_default(), &authority).unwrap();
+        let storage = Storage::new(handles.storage.clone()).unwrap();
+        let save = storage.begin_save().unwrap();
+        save.accept(object).unwrap();
+        save.finish().unwrap();
+        fs::write(path.join("committed"), b"ready").unwrap();
+        // The parent kills this process while its Store is still open.
+        std::thread::sleep(Duration::from_secs(15));
+        panic!("parent did not terminate the writer");
+    }
+
+    let fixture = Fixture::new("durable-process");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durable_completed_save_reopens_after_writer_process_is_killed",
+        ])
+        .env(CHILD_PATH, &fixture.0)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.0.join("committed").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("writer exited before its save acknowledgement: {status}");
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("writer did not acknowledge its save in time");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    let config = PersistenceConfig::sqlite(fixture.0.join("store.sqlite"))
+        .with_sqlite_profile(SqlitePersistenceProfile::Durable);
+    let reopened =
+        Handles::open_writable(config, &authority.binding_key, authority.cursor_key).unwrap();
+    let storage = Storage::new(reopened.storage.clone()).unwrap();
+    assert_eq!(
+        storage
+            .reader()
+            .unwrap()
+            .read_objects(&[object.id()])
+            .unwrap(),
+        vec![object.canonical().to_vec()]
+    );
+    drop(storage);
+    reopened.seal().unwrap();
 }

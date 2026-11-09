@@ -65,7 +65,7 @@ async function opened(client) {
 /** The removed options argument (#431 follow-up) is refused, never ignored. */
 function noOptions(method, given) {
   if (given) {
-    throw new LayerFSError("InvalidInput", `${method} takes no options: settings come from the environment (LAYERFS_STORE_PATH, LAYERFS_DAEMON_HOST, LAYERFS_TRACE, LAYERFS_TRACE_STEP, LAYERFS_STORE_POLICY)`, null);
+    throw new LayerFSError("InvalidInput", `${method} takes no options: settings come from the environment (LAYERFS_STORE_PATH, LAYERFS_DAEMON_HOST, LAYERFS_TRACE, LAYERFS_TRACE_STEP, LAYERFS_STORE_POLICY, LAYERFS_STORE_PROFILE, LAYERFS_MAX_WORKSPACES)`, null);
   }
 }
 
@@ -132,6 +132,7 @@ export class LayerFS {
         ...(env("DAEMON_HOST") ? { daemonHost: env("DAEMON_HOST") } : {}),
       },
       storePolicy: env("STORE_POLICY"),
+      storeProfile: env("STORE_PROFILE"),
       storePath: env("STORE_PATH"),
       maxWorkspaces: env("MAX_WORKSPACES"),
     };

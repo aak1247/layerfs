@@ -63,11 +63,6 @@ fn install_manifest(
     let result = (|| {
         let mut manifest = manifest?;
         retained.manifest = Some(manifest.clone());
-        if manifest.profile != StoreProfile::Disposable {
-            return Err(InstallError::Protocol(ControlError(
-                "explicit Disposable Store profile required",
-            )));
-        }
         if Path::new(&manifest.locator) != destination || manifest.daemon_sqlite.is_some() {
             return Err(InstallError::Protocol(ControlError(
                 "provisioned install destination",

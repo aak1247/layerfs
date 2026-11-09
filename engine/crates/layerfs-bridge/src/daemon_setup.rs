@@ -150,8 +150,8 @@ impl DaemonSetup {
         }
         if let Some(m) = &self.existing_store {
             m.check().map_err(ControlError)?;
-            if m.locator != self.store || m.profile != crate::provision::StoreProfile::Disposable {
-                return Err(ControlError("explicit existing Disposable Store"));
+            if m.locator != self.store {
+                return Err(ControlError("existing Store locator differs"));
             }
         }
         Ok(())

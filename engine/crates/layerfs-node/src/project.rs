@@ -3,7 +3,7 @@
 //! (required, a positive whole number) bounds Init from when this call
 //! starts it; the caller owns its default (#431: @layerfs/agent's 180 s).
 //!
-//! The Store is Disposable and sealed under `home/<name>/`, then installed in
+//! The Store's explicit profile is sealed under `home/<name>/`, then installed in
 //! this process at `storePath`, the project volume's Store file that every
 //! Sandbox opens (#373: no Sandbox is started to install it). Once the
 //! install is recorded, the sealed copy is deleted (owner 2026-10-23):
@@ -37,7 +37,28 @@ fn sixteen(bytes: [u8; 32]) -> [u8; 16] {
 pub(crate) fn init(args: &SdkValue) -> Outcome {
     let name = text(args, "name")?;
     let source = PathBuf::from(text(args, "path")?);
+    let store_profile = match args.get("storeProfile") {
+        None => SqlitePersistenceProfile::Disposable,
+        Some(SdkValue::Text(profile)) if profile == "disposable" => {
+            SqlitePersistenceProfile::Disposable
+        }
+        Some(SdkValue::Text(profile)) if profile == "durable" => SqlitePersistenceProfile::Durable,
+        _ => {
+            return Err(refused(
+                "InvalidInput",
+                "storeProfile must be durable or disposable",
+            ))
+        }
+    };
     let home = crate::discovery::home(args)?;
+    if store_profile == SqlitePersistenceProfile::Durable {
+        let parent = home
+            .parent()
+            .ok_or_else(|| refused("InvalidInput", "LAYERFS_HOME has no parent"))?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(failed)?;
+    }
     // checked first: a refused policy, timeout or Store path leaves no project entry
     let policy = policy(args)?;
     let deadline = deadline(args)?;
@@ -68,12 +89,22 @@ pub(crate) fn init(args: &SdkValue) -> Outcome {
         std::fs::Permissions::from_mode(0o700)
     })
     .map_err(failed)?;
+    if store_profile == SqlitePersistenceProfile::Durable {
+        std::fs::File::open(&home)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                refused(
+                    "Unknown",
+                    format!("project directory created but home sync failed: {error}"),
+                )
+            })?;
+    }
     let _guard = crate::discovery::guard(&directory)?;
     let history = |text: &str| HistoryName::new(text).map_err(failed);
     let request = InitRequest {
         source,
         store: PersistenceConfig::sqlite(directory.join("sealed.sqlite"))
-            .with_sqlite_profile(SqlitePersistenceProfile::Disposable),
+            .with_sqlite_profile(store_profile),
         locator: LOCATOR.into(),
         policy,
         catalog: HistoryCatalogConfig {
@@ -96,6 +127,14 @@ pub(crate) fn init(args: &SdkValue) -> Outcome {
     });
     drop(running);
     let sealed = sealed.map_err(|failure| init_failure(*failure, &directory))?;
+    if store_profile == SqlitePersistenceProfile::Durable {
+        std::fs::File::open(&sealed.store.path)
+            .and_then(|file| file.sync_all())
+            .map_err(failed)?;
+        std::fs::File::open(&directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(failed)?;
+    }
     let layer = SdkValue::text(hex(sealed.branch.branch.base_layer.as_slice()));
     let root = SdkValue::text(hex(sealed.branch.effective_root.as_bytes()));
     let mut project = Project {
@@ -109,7 +148,14 @@ pub(crate) fn init(args: &SdkValue) -> Outcome {
         &project.manifest,
         &store_path,
     )
-    .map_err(|failure| refused("Failed", failure.to_string()))?;
+    .map_err(|failure| {
+        let code = if failure.published {
+            "Unknown"
+        } else {
+            "Failed"
+        };
+        refused(code, failure.to_string())
+    })?;
     project.installed = Some(installed);
     crate::discovery::save_project(&directory, &project)?;
     let mut answer = vec![

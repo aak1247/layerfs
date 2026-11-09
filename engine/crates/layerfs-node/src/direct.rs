@@ -27,6 +27,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 struct Opened {
     service: Arc<StoreService>,
     clients: usize,
+    binding: Vec<u8>,
+    cursor_key: [u8; 32],
+    profile: layerfs_persistence::SqlitePersistenceProfile,
     /// This service's private overlay directory.
     directory: PathBuf,
 }
@@ -45,24 +48,27 @@ fn path(args: &SdkValue) -> Result<PathBuf, SdkRefusal> {
 }
 
 /// Opens the Store at `store` for this process, or refuses.
-fn open(store: &Path, args: &SdkValue) -> Result<Opened, SdkRefusal> {
-    let project = crate::discovery::project(args)?;
+fn open(store: &Path, project: &crate::registry::Project) -> Result<Opened, SdkRefusal> {
     let directory = std::env::temp_dir().join(format!(
         "layerfs-store-{}-{}",
         std::process::id(),
         layerfs_bridge::sdk_values::hex(&crate::registry::random()?[..12])
     ));
     std::fs::create_dir(&directory).map_err(failed)?;
-    let opened = StoreService::open_direct(
+    let opened = StoreService::open_direct_with_profile(
         store,
         &project.manifest.binding,
         project.manifest.cursor_key,
         &directory.join("overlay.sqlite"),
+        project.store.profile,
     );
     match opened {
         Ok(service) => Ok(Opened {
             service: Arc::new(service),
             clients: 0,
+            binding: project.manifest.binding.clone(),
+            cursor_key: project.manifest.cursor_key,
+            profile: project.store.profile,
             directory,
         }),
         Err(refusal) => {
@@ -79,12 +85,28 @@ fn open(store: &Path, args: &SdkValue) -> Result<Opened, SdkRefusal> {
 /// `storeOpen`: one more client of the Store a call names, opening it first.
 pub(crate) fn acquire(args: &SdkValue) -> Outcome {
     let store = path(args)?;
+    let project = crate::discovery::project(args)?;
+    if project.installed.is_none() {
+        return Err(refused(
+            "NoStore",
+            "the project Store has not been installed",
+        ));
+    }
     let mut stores = lock(&STORES)?;
     if !stores.contains_key(&store) {
-        let opened = open(&store, args)?;
+        let opened = open(&store, &project)?;
         stores.insert(store.clone(), opened);
     }
     let opened = stores.get_mut(&store).expect("opened above");
+    if opened.binding != project.manifest.binding
+        || opened.cursor_key != project.manifest.cursor_key
+        || opened.profile != project.store.profile
+    {
+        return Err(refused(
+            "InvalidInput",
+            "Store path is already open with different authority or profile",
+        ));
+    }
     opened.clients += 1;
     Ok(SdkValue::map([(
         "clients",

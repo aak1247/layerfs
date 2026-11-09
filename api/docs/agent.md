@@ -46,7 +46,7 @@ async and return a ready client, and `new LayerFS()` is refused
 environment, read once when the client is made, by its `LAYERFS_` name only:
 `LAYERFS_HOME`, `_STORE_PATH`, `_DOCKER`, `_IMAGE`,
 `_VOLUME`, `_DAEMON`, `_CONTAINER_PREFIX`, `_DAEMON_HOST`, `_TRACE`,
-`_STORE_POLICY`, `_MAX_WORKSPACES` (and `_TRACE_STEP`, read at each call). An object passed where
+`_STORE_POLICY`, `_STORE_PROFILE`, `_MAX_WORKSPACES` (and `_TRACE_STEP`, read at each call). An object passed where
 the options went (`LayerFS.open(name, {…})`, or an object as `LayerFS.init`'s
 third argument) is refused `InvalidInput`, never ignored. `open` opens the project's Store and makes one project lookup
 on it, so a missing project is `NoSuchProject` at once; if either fails,
@@ -141,6 +141,7 @@ Keep each agent's operations on a Workspace sequential.
 | `LAYERFS_VOLUME` | Existing named local VM volume shared by the project's daemons. |
 | `LAYERFS_DAEMON` | Host path to the built Linux daemon executable. |
 | `LAYERFS_MAX_WORKSPACES` | Optional positive integer for new Sandboxes, default 16. `sandbox.create({ maxWorkspaces })` overrides it. The value is fixed in the Sandbox's record until it closes. |
+| `LAYERFS_STORE_PROFILE` | `disposable` (default) or `durable`, selected only when initializing a project and recorded in its manifest. Reopening uses that manifest; changing the environment does not convert an existing Store. |
 | `LAYERFS_NATIVE` | Optional path of the real addon; defaults to `engine/crates/layerfs-node/layerfs.node`. |
 | `LAYERFS_WORKER_ENDPOINT` | macOS and Windows: the endpoint file of the LayerFS home's worker, which then makes every binding call. Any integration may set it. |
 | `LAYERFS_STORE_PATH` | The installed Store file this client's Store calls open: `global/store.sqlite` in the project's volume. On Linux this process opens it, so it must be on a local filesystem the daemons share, such as `/layerfs-store/global/store.sqlite` where the volume is mounted at `/layerfs-store`; otherwise Store calls fail `Unsupported`. On macOS and Windows the worker opens it, so it is the path inside the worker's Linux, `/var/lib/docker/volumes/<volume>/_data/global/store.sqlite`. On any other platform Store calls fail `Unsupported`. Unset, they fail `InvalidInput` everywhere. |
@@ -211,6 +212,15 @@ All clients read the selected value from the Sandbox record, including after
 reopening it in another process. Records from before this setting use 16;
 changing the environment never changes a running Sandbox. A larger number
 does not change the separate limit on control connections or Store writers.
+
+A `durable` global Store uses SQLite WAL with FULL synchronization for
+completed Store publications. Its installation and project discovery record
+are synchronized before Init acknowledges success. **This does not make a
+mounted Workspace durable**: its uncommitted overlay still uses MEMORY/OFF,
+and its `fsync` calls do not establish stable storage. Commit changes to the
+global Store before depending on them after a crash. Process termination and
+SQLite synchronization are covered by tests; power-loss and complete Workspace
+recovery have not yet been qualified.
 
 A Sandbox closes when idle: its daemon ends itself after 2 minutes with no
 Workspace and no call, and its container stops. Open connections do not keep

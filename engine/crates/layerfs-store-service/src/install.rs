@@ -152,8 +152,8 @@ pub fn install_local(
         cause: String::new(),
     };
     let result = (|| {
-        if manifest.profile != StoreProfile::Disposable || manifest.daemon_sqlite.is_some() {
-            return Err("a sealed, not yet installed, Disposable Store is required".to_owned());
+        if manifest.daemon_sqlite.is_some() {
+            return Err("a sealed, not yet installed Store is required".to_owned());
         }
         let directory = destination
             .parent()
@@ -167,6 +167,11 @@ pub fn install_local(
                 .mode(0o700)
                 .create(directory)
                 .map_err(text)?;
+            if manifest.profile == StoreProfile::Durable {
+                File::open(directory.parent().ok_or("Store directory has no parent")?)
+                    .and_then(|parent| parent.sync_all())
+                    .map_err(text)?;
+            }
         }
         let (target, temporary) = paths(destination).map_err(text)?;
         let mut file = claim(&target, &temporary).map_err(text)?;
@@ -180,13 +185,23 @@ pub fn install_local(
             return Err("the sealed file changed while it was copied".to_owned());
         }
         file.flush().map_err(text)?;
+        if manifest.profile == StoreProfile::Durable {
+            file.sync_all().map_err(text)?;
+        }
         drop(file);
         fs::rename(&temporary, &target).map_err(text)?;
         left.published = true;
         left.temporary = Some(target.clone());
+        if manifest.profile == StoreProfile::Durable {
+            File::open(directory)
+                .and_then(|parent| parent.sync_all())
+                .map_err(text)?;
+        }
         let opened = open_store_observed(
-            PersistenceConfig::sqlite(&target)
-                .with_sqlite_profile(SqlitePersistenceProfile::Disposable),
+            PersistenceConfig::sqlite(&target).with_sqlite_profile(match manifest.profile {
+                StoreProfile::Disposable => SqlitePersistenceProfile::Disposable,
+                StoreProfile::Durable => SqlitePersistenceProfile::Durable,
+            }),
             &manifest.binding,
             manifest.cursor_key,
             1,
