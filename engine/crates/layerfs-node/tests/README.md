@@ -53,3 +53,9 @@ process exit or mounts from record contents.
 `external_mount_reply` similarly checks a retained mount fixture supplied by
 `LAYERFS_MOUNT_PROOF`: it matches the original Bound and pre-sync Ready replies
 without claiming that unsynced bytes survive power loss or proving a fence.
+
+`fixtures/durable_git_workspaces.cjs` was run in a separate SDK/Docker/FUSE
+experiment with a private synthetic Git source, SDK home and Durable Store.
+It tests independent Git commits on two LayerFS Branches and normal
+close/remount. Its harness requirements, evidence and limitations are recorded
+in [the Git Workspace proof](../../../../docs/general/sdk-git-workspaces-proof.md).
