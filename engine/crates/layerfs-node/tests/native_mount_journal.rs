@@ -126,6 +126,9 @@ enum Mode {
     Ready,
     TwoReady,
     ConcurrentReady,
+    MissingWorkspace,
+    MismatchedWorkspace,
+    MissingMount,
     LostReady,
     BoundSync,
     BoundSwap,
@@ -414,6 +417,51 @@ fn run(mode: Mode) {
             .to_string_lossy()
             .starts_with("workspace-")));
     }
+    if matches!(
+        mode,
+        Mode::MissingWorkspace | Mode::MismatchedWorkspace | Mode::MissingMount
+    ) {
+        let entries = directory
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let workspace = entries
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("workspace-")
+            })
+            .unwrap();
+        if mode == Mode::MissingWorkspace {
+            fs::remove_file(workspace).unwrap();
+        } else if mode == Mode::MismatchedWorkspace {
+            let mut record = read_value(workspace);
+            if let SdkValue::Map(fields) = &mut record {
+                fields
+                    .iter_mut()
+                    .find(|(name, _)| name == "path")
+                    .unwrap()
+                    .1 = SdkValue::text("/workspaces/other");
+            }
+            write_value(workspace, record);
+        } else {
+            let mount = entries
+                .iter()
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("mount-intent-")
+                })
+                .unwrap();
+            fs::remove_file(mount).unwrap();
+        }
+        fs::remove_file(home.0.join("docker.sock")).unwrap();
+        home.node("const r=await native.call('sandbox.list_workspaces',{...args,project:'durable-project'}); assert.equal(r.refused?.code,'RecoveryRequired',JSON.stringify(r.refused));", None, Duration::from_secs(20));
+    }
 }
 #[test]
 fn mount_intent_precedes_both_sends_and_ready_is_recorded() {
@@ -426,6 +474,18 @@ fn completed_receipts_allow_another_distinct_mount() {
 #[test]
 fn concurrent_mount_waits_for_an_active_intent() {
     run(Mode::ConcurrentReady)
+}
+#[test]
+fn completed_mount_with_missing_workspace_requires_recovery() {
+    run(Mode::MissingWorkspace)
+}
+#[test]
+fn completed_mount_with_mismatched_workspace_requires_recovery() {
+    run(Mode::MismatchedWorkspace)
+}
+#[test]
+fn workspace_with_missing_mount_receipt_requires_recovery() {
+    run(Mode::MissingMount)
 }
 #[test]
 fn lost_ready_keeps_the_original_intent_and_blocks_another_mount() {

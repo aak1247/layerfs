@@ -10,7 +10,7 @@ use layerfs_api::{
 use layerfs_bridge::control::{Answer, ControlCode, Reply, SdkRefusal, SdkValue, WorkspaceToken};
 use layerfs_history::WorkspaceId;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
@@ -146,6 +146,14 @@ pub(crate) fn check_at(path: &Path, sandbox: [u8; 32]) -> Result<(), SdkRefusal>
         ));
     }
     let directory = Directory::open(path).map_err(failed)?;
+    closed_in(&directory, sandbox).map(|_| ())
+}
+
+/// Validated terminal close identities, read while the caller holds the guard.
+pub(crate) fn closed_in(
+    directory: &Directory,
+    sandbox: [u8; 32],
+) -> Result<BTreeSet<(WorkspaceId, i64)>, SdkRefusal> {
     directory.verify().map_err(failed)?;
     let mut settled = Vec::new();
     for entry in std::fs::read_dir(directory.path()).map_err(failed)? {
@@ -160,7 +168,7 @@ pub(crate) fn check_at(path: &Path, sandbox: [u8; 32]) -> Result<(), SdkRefusal>
                 format!("a durable close intent cannot be read: {}", error.message),
             )
         })?;
-        let Some(record) = valid_settled(&directory, &value, sandbox, &name) else {
+        let Some(record) = valid_settled(directory, &value, sandbox, &name) else {
             return Err(refused(
                 "RecoveryRequired",
                 "a durable Workspace close is unresolved; its original intent is retained",
@@ -168,12 +176,17 @@ pub(crate) fn check_at(path: &Path, sandbox: [u8; 32]) -> Result<(), SdkRefusal>
         };
         settled.push(record);
     }
+    let closed = settled
+        .iter()
+        .filter_map(|record| match record {
+            Settlement::Closed(token) => Some((token.workspace, token.namespace)),
+            Settlement::NoEffect(_, _) => None,
+        })
+        .collect::<BTreeSet<_>>();
     for record in &settled {
         if let Settlement::NoEffect(token, path) = record {
-            let subsequently_closed = settled
-                .iter()
-                .any(|other| matches!(other, Settlement::Closed(closed) if closed == token));
-            if !subsequently_closed && !original_workspace(&directory, *token, path) {
+            let subsequently_closed = closed.contains(&(token.workspace, token.namespace));
+            if !subsequently_closed && !original_workspace(directory, *token, path) {
                 return Err(refused(
                     "RecoveryRequired",
                     "a refused durable close has lost its original Workspace record",
@@ -181,7 +194,8 @@ pub(crate) fn check_at(path: &Path, sandbox: [u8; 32]) -> Result<(), SdkRefusal>
             }
         }
     }
-    directory.verify().map_err(failed)
+    directory.verify().map_err(failed)?;
+    Ok(closed)
 }
 
 impl Journal {

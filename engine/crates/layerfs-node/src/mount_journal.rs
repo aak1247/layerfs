@@ -9,7 +9,7 @@ use layerfs_api::{
     sandbox::{MountMilestone, MountObservation, ObservedMountFailure},
     MountedWorkspace,
 };
-use layerfs_bridge::control::{Answer, Reply, SdkRefusal, SdkValue};
+use layerfs_bridge::control::{Answer, Reply, SdkRefusal, SdkValue, WorkspaceToken};
 use layerfs_history::{BranchId, WorkspaceId};
 use std::{
     collections::BTreeMap,
@@ -50,55 +50,120 @@ fn field<'a>(value: &'a SdkValue, key: &str) -> Option<&'a [u8]> {
         _ => None,
     }
 }
-fn valid_complete(value: &SdkValue, sandbox: [u8; 32], name: &str) -> bool {
-    let Some(workspace) = field(value, "workspace").and_then(|b| WorkspaceId::from_slice(b).ok())
-    else {
-        return false;
-    };
-    let Some(branch) = field(value, "branchId").and_then(|b| BranchId::from_slice(b).ok()) else {
-        return false;
-    };
+struct CompletedMount {
+    token: WorkspaceToken,
+    branch: String,
+    path: String,
+}
+
+fn completed(value: &SdkValue, sandbox: [u8; 32], name: &str) -> Option<CompletedMount> {
+    let workspace = field(value, "workspace").and_then(|b| WorkspaceId::from_slice(b).ok())?;
+    let branch = field(value, "branchId").and_then(|b| BranchId::from_slice(b).ok())?;
     if field(value, "sandbox") != Some(sandbox.as_slice())
         || value.get_text("phase") != Some("complete")
-        || value.get_text("branch").is_none()
         || name
             != format!(
                 "mount-intent-{}.record",
                 layerfs_bridge::sdk_values::hex(workspace.as_slice())
             )
     {
-        return false;
+        return None;
     }
+    let branch_name = value.get_text("branch")?;
     let bound = field(value, "bound").and_then(|b| Answer::decode(b).ok());
     let ready = field(value, "ready").and_then(|b| Answer::decode(b).ok());
-    matches!((bound, ready),
-        (Some(Answer { id: 1, reply: Reply::Bound { token, binding } }),
-         Some(Answer { id: 1, reply: Reply::Ready(ready) }))
-        if token.workspace == workspace && binding.branch.id == branch && ready.token == token)
+    match (bound, ready) {
+        (
+            Some(Answer {
+                id: 1,
+                reply: Reply::Bound { token, binding },
+            }),
+            Some(Answer {
+                id: 1,
+                reply: Reply::Ready(ready),
+            }),
+        ) if token.workspace == workspace
+            && binding.branch.id == branch
+            && ready.token == token =>
+        {
+            Some(CompletedMount {
+                token,
+                branch: branch_name.to_owned(),
+                path: ready.directory.clone(),
+            })
+        }
+        _ => None,
+    }
 }
 
-/// Incomplete or malformed records are not permission to repeat a mount.
+/// Check each mount against its Workspace record or its completed close.
 fn check_pending(directory: &Directory, sandbox: [u8; 32]) -> Result<(), SdkRefusal> {
     directory.verify().map_err(failed)?;
+    let closed = crate::close_journal::closed_in(directory, sandbox)?;
+    let mut workspaces = BTreeMap::new();
+    let mut mounts = Vec::new();
     for entry in std::fs::read_dir(directory.path()).map_err(failed)? {
         let entry = entry.map_err(failed)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("mount-intent-") || !name.ends_with(".record") {
+        let is_mount = name.starts_with("mount-intent-") && name.ends_with(".record");
+        let is_workspace = name.starts_with("workspace-") && name.ends_with(".record");
+        if !is_mount && !is_workspace {
             continue;
         }
         let value = crate::discovery::load(&entry.path()).map_err(|error| {
             refused(
                 "RecoveryRequired",
-                format!("a durable mount intent cannot be read: {}", error.message),
+                format!(
+                    "a durable Workspace record cannot be read: {}",
+                    error.message
+                ),
             )
         })?;
-        if !valid_complete(&value, sandbox, &name) {
-            return Err(refused(
-                "RecoveryRequired",
-                "a durable Workspace mount is unresolved; its original intent is retained",
-            ));
+        if is_mount {
+            let mount = completed(&value, sandbox, &name).ok_or_else(|| {
+                refused(
+                    "RecoveryRequired",
+                    "a durable Workspace mount is unresolved; its original intent is retained",
+                )
+            })?;
+            mounts.push(mount);
+        } else {
+            let workspace = field(&value, "workspace")
+                .and_then(|bytes| WorkspaceId::from_slice(bytes).ok())
+                .ok_or_else(|| refused("RecoveryRequired", "invalid Workspace identity"))?;
+            let expected = format!(
+                "workspace-{}.record",
+                layerfs_bridge::sdk_values::hex(workspace.as_slice())
+            );
+            if name != expected || workspaces.insert(workspace, value).is_some() {
+                return Err(refused(
+                    "RecoveryRequired",
+                    "Workspace record identity mismatch",
+                ));
+            }
         }
+    }
+    for mount in mounts {
+        match workspaces.remove(&mount.token.workspace) {
+            Some(record)
+                if record.get_int("namespace") == Some(mount.token.namespace)
+                    && record.get_text("branch") == Some(mount.branch.as_str())
+                    && record.get_text("path") == Some(mount.path.as_str()) => {}
+            None if closed.contains(&(mount.token.workspace, mount.token.namespace)) => {}
+            _ => {
+                return Err(refused(
+                    "RecoveryRequired",
+                    "a completed mount has lost or mismatched its Workspace record",
+                ))
+            }
+        }
+    }
+    if !workspaces.is_empty() {
+        return Err(refused(
+            "RecoveryRequired",
+            "a Workspace record has no matching completed mount",
+        ));
     }
     directory.verify().map_err(failed)
 }

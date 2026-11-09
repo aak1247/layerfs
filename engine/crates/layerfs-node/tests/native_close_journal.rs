@@ -147,12 +147,66 @@ fn run(mode: Mode) {
         &file,
         SdkValue::map([
             ("path", SdkValue::text("/workspaces/fixture")),
-            ("branch", SdkValue::text("main")),
+            ("branch", SdkValue::text("feature")),
             (
                 "workspace",
                 SdkValue::Bytes(token.workspace.to_bytes().to_vec()),
             ),
             ("namespace", SdkValue::Int(token.namespace)),
+        ]),
+    );
+    let ready = ReadyMount {
+        token,
+        directory: "/workspaces/fixture".into(),
+        receipt: MountReceipt {
+            mount: 2,
+            root: 7,
+            mount_id: 911,
+            device_major: 0,
+            device_minor: 64,
+            abi_major: 7,
+            abi_minor: 41,
+            offered: 1,
+            selected: 1,
+            max_write: 131072,
+            max_readahead: 65536,
+            max_background: 12,
+            congestion_threshold: 9,
+            page_size: 4096,
+            loops: 2,
+            abort_bound: true,
+        },
+    };
+    let encoded = |reply| Answer { id: 1, reply }.encode().unwrap();
+    let mount_intent = directory.join(format!(
+        "mount-intent-{}.record",
+        layerfs_bridge::sdk_values::hex(token.workspace.as_slice())
+    ));
+    write_value(
+        &mount_intent,
+        SdkValue::map([
+            ("phase", SdkValue::text("complete")),
+            ("sandbox", SdkValue::Bytes(vec![8; 32])),
+            (
+                "workspace",
+                SdkValue::Bytes(token.workspace.to_bytes().to_vec()),
+            ),
+            (
+                "branchId",
+                SdkValue::Bytes(binding.branch.id.to_bytes().to_vec()),
+            ),
+            ("branch", SdkValue::text("feature")),
+            (
+                "bound",
+                SdkValue::Bytes(encoded(Reply::Bound {
+                    token,
+                    binding: binding.clone(),
+                })),
+            ),
+            (
+                "ready",
+                SdkValue::Bytes(encoded(Reply::Ready(Box::new(ready.clone())))),
+            ),
         ]),
     );
     let original_record = fs::read(&file).unwrap();
@@ -187,28 +241,6 @@ fn run(mode: Mode) {
                 store_sqlite: Some("3.50.4".into()),
             }),
         );
-        let ready = ReadyMount {
-            token,
-            directory: "/workspaces/fixture".into(),
-            receipt: MountReceipt {
-                mount: 2,
-                root: 7,
-                mount_id: 911,
-                device_major: 0,
-                device_minor: 64,
-                abi_major: 7,
-                abi_minor: 41,
-                offered: 1,
-                selected: 1,
-                max_write: 131072,
-                max_readahead: 65536,
-                max_background: 12,
-                congestion_threshold: 9,
-                page_size: 4096,
-                loops: 2,
-                abort_bound: true,
-            },
-        };
         let status = || {
             Reply::Status(Box::new(WorkspaceStatus {
                 token,
@@ -375,6 +407,10 @@ fn run(mode: Mode) {
             assert!(saved
                 .iter()
                 .any(|value| value.get_text("phase") == Some("noEffect")));
+        }
+        if mode == Mode::Closed {
+            fs::remove_file(home.0.join("docker.sock")).unwrap();
+            home.node("const r=await native.call('sandbox.list_workspaces',args); assert.equal(r.refused?.code,'Failed',JSON.stringify(r.refused));", None, Duration::from_secs(20));
         }
         // A terminal receipt and an unexpectedly reappearing Workspace record
         // cannot be mistaken for a fresh, safely mounted Workspace.

@@ -159,12 +159,17 @@ result and directory in the running process. Project inventory can still inspect
 the container separately and is not evidence that the intent completed.
 Checks wait for the Sandbox discovery guard, so another active mount can finish
 before its intent is classified. Reopening never replays the old request. Completed records
-are checked against the Sandbox, Workspace, Branch and receipt identities
-before another mount is admitted. This does not recover an old daemon or prove
-its physical consumers have exited. The native Node tests use an authenticated
+are checked against the Sandbox, Workspace, Branch and receipt identities.
+Each completed mount must match its Workspace record or an exact completed
+close receipt; an orphan, missing or mismatched record requires recovery.
+Durable records lacking the required mount intent are not automatically
+converted. These checks scan the saved records; they are not evidence of
+sustained performance at large workspace counts. This does not recover an old
+daemon or prove its physical consumers have exited. The native Node tests use an authenticated
 simulated daemon and a real local Store: they cover distinct successful mounts,
-lost Ready, failed intent sync, directory replacement, two concurrent mounts
-and process reopen without access to the Docker socket. The
+lost Ready, failed intent sync, directory replacement, two concurrent mounts,
+missing or mismatched records, completed closes and process reopen without
+access to the Docker socket. The
 separate Docker/FUSE proof above exercises actual SDK-created mounts.
 
 The Linux Node binding also synchronizes a close intent before sending a durable
