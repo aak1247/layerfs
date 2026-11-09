@@ -574,6 +574,14 @@ impl Roster {
         self.ensure()
     }
 
+    /// Retain this catalog lock when an adjacent durable owner loses identity.
+    pub(crate) fn quarantine(&mut self, reason: &'static str) -> RosterError {
+        if let Some(cause) = &self.failure {
+            return RosterError::Retained(cause.clone());
+        }
+        self.retain(RosterError::Invalid(reason), false)
+    }
+
     fn ensure(&mut self) -> Result<(), RosterError> {
         if let Some(cause) = &self.failure {
             return Err(RosterError::Retained(cause.clone()));

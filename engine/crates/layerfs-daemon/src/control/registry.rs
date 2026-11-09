@@ -35,6 +35,8 @@ pub struct Service {
     pub(super) entries: Mutex<BTreeMap<WorkspaceId, Entry>>,
     /// Absent for a control-only Service: Attach is then refused before effects.
     pub(super) kernel: Option<Arc<KernelServing>>,
+    #[cfg(target_os = "linux")]
+    pub(super) durable: Option<super::durable_control::DurableControl>,
 }
 /// A failed pre-effect registration retains the original bound Workspace.
 pub struct DurableRegistrationFailure {
@@ -68,6 +70,8 @@ impl Service {
             capacity: owner.configuration().namespaces,
             entries: Mutex::new(BTreeMap::new()),
             kernel: None,
+            #[cfg(target_os = "linux")]
+            durable: None,
         }
     }
     /// Binds control and kernel serving to the same Store and overlay owner.
@@ -85,6 +89,13 @@ impl Service {
         &self,
         workspace: BoundWorkspace,
     ) -> Result<WorkspaceToken, Box<DurableRegistrationFailure>> {
+        #[cfg(target_os = "linux")]
+        if self.durable.is_some() {
+            return Err(Box::new(DurableRegistrationFailure {
+                cause: Failure::Rejected(ControlCode::Invalid, "durable control owns admission"),
+                workspace: Box::new(workspace),
+            }));
+        }
         self.register_durable_with_recording(workspace, false)
     }
 
@@ -153,6 +164,8 @@ impl Service {
         &self,
         token: WorkspaceToken,
     ) -> Result<crate::store::StoreOperation, Failure> {
+        #[cfg(target_os = "linux")]
+        self.check_durable_state()?;
         let workspace = {
             let entries = self.entries.lock().map_err(|_| Failure::Poisoned)?;
             let value = bound(&entries, token)?;

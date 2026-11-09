@@ -216,10 +216,7 @@ impl std::error::Error for DurableAdmissionFailure {}
 impl Owner {
     /// Reserve capacity and a fresh namespace before writing a discovery intent.
     pub fn reserve_durable(&self, identity: [u8; 32]) -> Result<DurableReservation, OwnerError> {
-        self.client
-            .roster()
-            .ok_or(OwnerError::InvalidAdmission)?
-            .reserve_durable(identity)
+        self.client.reserve_durable(identity)
     }
 
     /// Transfers an already authorized durable owner into this bounded roster.
@@ -369,6 +366,13 @@ fn admission(spec: &DurableWorkspace<'_>) -> Result<[u8; 32], OwnerError> {
 }
 
 impl OwnerClient {
+    /// Reserve capacity from this exact roster before attempting creation.
+    pub fn reserve_durable(&self, identity: [u8; 32]) -> Result<DurableReservation, OwnerError> {
+        self.roster()
+            .ok_or(OwnerError::InvalidAdmission)?
+            .reserve_durable(identity)
+    }
+
     /// Only owners created or recovered through the durable boundary have one.
     pub(crate) fn durable_identity(&self) -> Result<Option<[u8; 32]>, OwnerError> {
         Ok(self.connection()?.durable_identity)

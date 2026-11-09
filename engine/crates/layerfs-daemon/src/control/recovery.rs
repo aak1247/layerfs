@@ -82,6 +82,12 @@ impl Service {
         minimum_namespace: i64,
     ) -> Result<Vec<WorkspaceToken>, Box<CatalogRecoveryFailure>> {
         let mut completed = Vec::new();
+        if self.durable.is_some() {
+            return Err(failed(
+                CatalogRecoveryCause::Invalid("durable control owns admission"),
+                completed,
+            ));
+        }
         if minimum_namespace <= 0 || minimum_namespace == i64::MAX {
             return Err(failed(
                 CatalogRecoveryCause::Invalid("recovery namespace floor"),

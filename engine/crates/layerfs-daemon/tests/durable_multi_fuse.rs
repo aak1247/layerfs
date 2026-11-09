@@ -11,7 +11,7 @@ use layerfs_bridge::control::{
 use layerfs_daemon::{
     bootstrap::open_store,
     control::{
-        Failure, KernelConfig, KernelServing, RecordedCloseFailure, RecordedMountRequest, Service,
+        DurableControlConfig, Failure, KernelConfig, KernelServing, RecordedCloseFailure, Service,
     },
     durable_roster::{Authority, Roster, RosterError, WorkspaceRecord},
     store::BindRequest,
@@ -110,22 +110,29 @@ fn child(directory: &Path) {
     let branch = BranchId::from_authority([24; 16]);
     let roster = roster(&directory.join("writer-template.sqlite"));
     let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
-    let mut discovery = Roster::create(&directory.join("catalog"), authority).unwrap();
-    let service = Service::with_kernel(store.clone(), &roster, kernel(&directory.join("mounts")));
+    let discovery = Roster::create(&directory.join("catalog"), authority).unwrap();
+    let mut service =
+        Service::with_kernel(store.clone(), &roster, kernel(&directory.join("mounts")));
+    assert!(service
+        .activate_durable_control(
+            &roster,
+            DurableControlConfig {
+                catalog: discovery,
+                overlay_directory: directory.join("durable"),
+                sandbox: [8; 32],
+                profile: ProfileConfig::default(),
+                minimum_namespace: 1,
+            }
+        )
+        .unwrap()
+        .is_empty());
     for (identity, namespace, text) in ITEMS {
         let workspace_id = WorkspaceId::from_authority([identity; 32]).unwrap();
         let reply = service
-            .mount_recorded(
-                &mut discovery,
-                &roster,
-                &directory.join("durable"),
-                RecordedMountRequest {
-                    sandbox: [8; 32],
-                    profile: ProfileConfig::default(),
-                    workspace: workspace_id,
-                    branch,
-                },
-            )
+            .execute_control(&Request::Mount {
+                workspace: workspace_id,
+                branch,
+            })
             .unwrap()
             .reply;
         let Reply::Bound { token, .. } = reply else {
@@ -480,7 +487,7 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     let roster = roster(&directory.join("reader-template.sqlite"));
     let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
     let mut discovery = Roster::open(&directory.join("catalog"), authority).unwrap();
-    let service = Service::with_kernel(store.clone(), &roster, kernel(&mounts));
+    let mut service = Service::with_kernel(store.clone(), &roster, kernel(&mounts));
     let mut records = Vec::new();
     discovery.visit(|record| records.push(record)).unwrap();
     records.sort_by_key(|record| record.workspace.to_bytes());
@@ -504,13 +511,15 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
         .is_err());
     }
     let tokens = service
-        .recover_catalog(
-            &mut discovery,
+        .activate_durable_control(
             &roster,
-            &directory.join("durable"),
-            [8; 32],
-            ProfileConfig::default(),
-            3,
+            DurableControlConfig {
+                catalog: discovery,
+                overlay_directory: directory.join("durable"),
+                sandbox: [8; 32],
+                profile: ProfileConfig::default(),
+                minimum_namespace: 3,
+            },
         )
         .unwrap();
     assert_eq!(tokens.len(), ITEMS.len());
@@ -547,31 +556,23 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     assert_eq!(service.workspaces(), Some(2));
     for token in tokens {
         let refused = service
-            .unmount_recorded(
-                &mut discovery,
-                UnmountControl {
-                    token,
-                    discard: false,
-                },
-            )
+            .execute_control(&Request::Unmount(UnmountControl {
+                token,
+                discard: false,
+            }))
             .unwrap();
         assert!(matches!(refused.reply, Reply::Dirty(_)));
-        assert_eq!(discovery.pending_close().unwrap(), None);
         let done = service
-            .unmount_recorded(
-                &mut discovery,
-                UnmountControl {
-                    token,
-                    discard: true,
-                },
-            )
+            .execute_control(&Request::Unmount(UnmountControl {
+                token,
+                discard: true,
+            }))
             .unwrap();
         assert_eq!(done.reply, Reply::Unmounted(token));
     }
     cleanup.0.clear();
     drop(service);
     roster.stop().unwrap();
-    drop(discovery);
     let mut reopened = Roster::open(&directory.join("catalog"), authority).unwrap();
     let mut active = Vec::new();
     reopened.visit(|record| active.push(record)).unwrap();

@@ -5,6 +5,10 @@ mod cleanup;
 #[cfg(target_os = "linux")]
 mod detach;
 mod dirty;
+#[cfg(target_os = "linux")]
+mod durable_control;
+#[cfg(target_os = "linux")]
+mod durable_root;
 mod failure;
 mod force;
 mod inspect;
@@ -27,6 +31,8 @@ mod serving;
 mod status;
 mod types;
 mod unmount;
+#[cfg(target_os = "linux")]
+pub use durable_control::{DurableControlCause, DurableControlConfig, DurableControlFailure};
 pub use kernel::{KernelConfig, KernelServing};
 pub(crate) use observation::{reply_token, request_token};
 #[cfg(target_os = "linux")]

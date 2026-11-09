@@ -36,6 +36,25 @@ impl Failure {
                 "control owner poisoned".into(),
                 None,
             ),
+            #[cfg(target_os = "linux")]
+            Self::RecordedMount(failure) => return recorded_mount(failure),
+            #[cfg(target_os = "linux")]
+            Self::RecordedClose(failure) => return recorded_close(failure),
+            #[cfg(target_os = "linux")]
+            Self::DurableRoot(cause) => (
+                ControlCode::Unknown,
+                None,
+                "durable Overlay directory".into(),
+                cause.to_string(),
+                None,
+            ),
+            #[cfg(target_os = "linux")]
+            Self::AfterFailure { cause, .. } => {
+                let mut refusal = cause.wire();
+                refusal.code = ControlCode::Unknown;
+                refusal.phase = "control settlement".into();
+                return refusal;
+            }
             Self::History(error) => {
                 let (code, moved) = history(error);
                 (code, moved, "history".into(), error.to_string(), None)
@@ -146,6 +165,46 @@ impl Failure {
     /// kernel custody stays in the registry entry, not in the reply's carrier.
     pub(crate) fn uncertain(&self) -> bool {
         !matches!(self, Self::Retained(_)) && self.wire().code == ControlCode::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recorded_mount(failure: &super::RecordedMountFailure) -> ControlRefusal {
+    use super::RecordedMountFailure as F;
+    use crate::durable_roster::RosterError;
+    let code = match failure {
+        F::Before(cause) => return cause.wire(),
+        F::Invalid(_) | F::Discovery(RosterError::Invalid(_) | RosterError::AlreadyExists) => {
+            ControlCode::Invalid
+        }
+        F::MissingBranch(_) => ControlCode::Missing,
+        F::Snapshot(cause) => history(cause).0,
+        F::Reservation(cause) => owner(cause),
+        _ => ControlCode::Unknown,
+    };
+    ControlRefusal {
+        code,
+        moved: None,
+        phase: "durable mount".into(),
+        detail: super::kernel::bounded(&failure.to_string()),
+        published: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recorded_close(failure: &super::RecordedCloseFailure) -> ControlRefusal {
+    use super::RecordedCloseFailure as F;
+    let code = match failure {
+        F::Before(cause) | F::Refused(cause) => return cause.wire(),
+        F::Invalid(_) => ControlCode::Invalid,
+        _ => ControlCode::Unknown,
+    };
+    ControlRefusal {
+        code,
+        moved: None,
+        phase: "durable unmount".into(),
+        detail: super::kernel::bounded(&failure.to_string()),
+        published: None,
     }
 }
 fn history(error: &HistoryError) -> (ControlCode, Option<MovedState>) {

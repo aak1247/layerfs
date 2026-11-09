@@ -94,6 +94,11 @@ pub struct Store {
     merge_work: Mutex<layerfs_persistence::MergeRecordsWork>,
 }
 impl Store {
+    /// True only when the concrete bootstrap supplied a verified Durable writer.
+    pub fn has_durable_writer(&self) -> bool {
+        self.durable_writer.is_some()
+    }
+
     /// Takes the control reader and a mount-time factory under explicit capacity.
     pub fn new(
         writer: Arc<dyn PackPersistence>,

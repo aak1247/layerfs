@@ -62,6 +62,19 @@ impl Service {
         roster: &mut Roster,
         control: UnmountControl,
     ) -> Result<Success, RecordedCloseFailure> {
+        if self.durable.is_some() {
+            return Err(RecordedCloseFailure::Invalid(
+                "durable control owns admission",
+            ));
+        }
+        self.unmount_recorded_on_catalog(roster, control)
+    }
+
+    pub(super) fn unmount_recorded_on_catalog(
+        &self,
+        roster: &mut Roster,
+        control: UnmountControl,
+    ) -> Result<Success, RecordedCloseFailure> {
         let authority = Authority::for_catalog(roster.authority().sandbox, self.store.history())
             .map_err(RecordedCloseFailure::Discovery)?;
         if authority != roster.authority() {

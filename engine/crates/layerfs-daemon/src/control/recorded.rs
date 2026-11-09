@@ -57,6 +57,15 @@ impl Service {
                 workspace: Box::new(workspace),
             })
         };
+        if self.durable.is_some() {
+            return Err(reject(
+                RecordedRegistrationError::Control(Failure::Rejected(
+                    layerfs_bridge::control::ControlCode::Invalid,
+                    "durable control owns admission",
+                )),
+                workspace,
+            ));
+        }
         let expected = Authority::for_catalog(roster.authority().sandbox, self.store.history());
         if !expected.is_ok_and(|expected| expected.store == roster.authority().store) {
             return Err(reject(RecordedRegistrationError::StoreMismatch, workspace));

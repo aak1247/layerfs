@@ -173,16 +173,32 @@ impl Service {
         overlay_directory: &Path,
         request: RecordedMountRequest,
     ) -> Result<Success, Box<RecordedMountFailure>> {
+        if self.durable.is_some() {
+            return Err(Box::new(RecordedMountFailure::Invalid(
+                "durable control owns admission",
+            )));
+        }
+        if !self.owner.same_roster(&owner.client()) {
+            return Err(Box::new(RecordedMountFailure::Invalid(
+                "recorded mount owner",
+            )));
+        }
+        self.mount_recorded_on_roster(catalog, overlay_directory, request)
+    }
+
+    pub(super) fn mount_recorded_on_roster(
+        &self,
+        catalog: &mut Roster,
+        overlay_directory: &Path,
+        request: RecordedMountRequest,
+    ) -> Result<Success, Box<RecordedMountFailure>> {
         let RecordedMountRequest {
             sandbox,
             profile,
             workspace,
             branch,
         } = request;
-        if !self.owner.same_roster(&owner.client())
-            || profile.pager_kib == 0
-            || profile.max_pages.is_some()
-        {
+        if profile.pager_kib == 0 || profile.max_pages.is_some() {
             return Err(Box::new(RecordedMountFailure::Invalid(
                 "recorded mount owner or profile",
             )));
@@ -202,7 +218,7 @@ impl Service {
             .ok_or_else(|| Box::new(RecordedMountFailure::MissingBranch(branch)))?;
         self.reserve_recorded_binding(workspace)
             .map_err(|cause| Box::new(RecordedMountFailure::Before(cause)))?;
-        let reservation = match owner.reserve_durable(workspace.to_bytes()) {
+        let reservation = match self.owner.reserve_durable(workspace.to_bytes()) {
             Ok(reservation) => reservation,
             Err(cause) => {
                 return Err(self.cleanup_recorded_preflight(

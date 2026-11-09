@@ -59,6 +59,8 @@ impl Service {
     ) -> Result<Success, Failure> {
         match request {
             Request::Commit(control) => {
+                #[cfg(target_os = "linux")]
+                self.check_durable_state()?;
                 self.commit(control.token, |workspace| workspace.commit(construct))
             }
             other => self.execute_control(other),
@@ -68,6 +70,13 @@ impl Service {
     /// frontier and constructs it with the captured namespace producer on
     /// this caller's thread; retained original custody refuses it first.
     pub fn execute_control(&self, request: &Request) -> Result<Success, Failure> {
+        #[cfg(target_os = "linux")]
+        if !matches!(
+            request,
+            Request::EndSession | Request::Hello(_) | Request::Status(_) | Request::Locate(_)
+        ) {
+            self.check_durable_state()?;
+        }
         match request {
             Request::Observed { .. } => Err(Failure::Rejected(
                 ControlCode::Invalid,
@@ -95,6 +104,10 @@ impl Service {
             )),
             Request::Mount { workspace, branch } => {
                 crate::telemetry::timed("sandbox.mount.bind", |timing| {
+                    #[cfg(target_os = "linux")]
+                    if let Some(result) = self.durable_mount(*workspace, *branch) {
+                        return result;
+                    }
                     self.mount(*workspace, *branch, timing)
                 })
             }
@@ -106,7 +119,13 @@ impl Service {
                     message: control.message.clone(),
                 })
             }),
-            Request::Unmount(control) => self.unmount(*control),
+            Request::Unmount(control) => {
+                #[cfg(target_os = "linux")]
+                if let Some(result) = self.durable_unmount(*control) {
+                    return result;
+                }
+                self.unmount(*control)
+            }
             Request::ForceUnmount {
                 token,
                 relinquish_unknown,

@@ -49,6 +49,21 @@ pub enum Failure {
     /// the exact owners; this is the bounded summary sent to the caller.
     Retained(Box<layerfs_bridge::control::TeardownCustody>),
     Poisoned,
+    /// Catalog-backed creation retains its original phase and owner custody.
+    #[cfg(target_os = "linux")]
+    RecordedMount(Box<super::RecordedMountFailure>),
+    /// Catalog-backed close retains the original receipt or failure.
+    #[cfg(target_os = "linux")]
+    RecordedClose(Box<super::RecordedCloseFailure>),
+    /// The original Overlay directory identity or permissions changed.
+    #[cfg(target_os = "linux")]
+    DurableRoot(std::sync::Arc<std::io::Error>),
+    /// Both a failed control attempt and its subsequent check failure are retained.
+    #[cfg(target_os = "linux")]
+    AfterFailure {
+        cause: Box<Failure>,
+        original: Box<Failure>,
+    },
     After {
         cause: Box<Failure>,
         original: Box<Success>,

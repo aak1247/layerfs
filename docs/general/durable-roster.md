@@ -37,8 +37,21 @@ daemon. It returns the original failure and keeps the reserved control slot,
 owner or bound Workspace when a later step is uncertain. Full capacity and a
 duplicate identity refuse before creating an Overlay; a consumed namespace is
 not reused. The caller authenticates and serializes the catalog and selects a
-verified physical Store. The normal application daemon's wire Mount and
-AutoTask do not yet use this method.
+verified physical Store.
+
+An explicitly activated, manually assembled Service can own the catalog and
+route its existing Mount and Unmount control requests through those operations.
+Activation requires a concrete Durable Store, verifies the private local Overlay
+directory and performs one complete catalog recovery before admitting calls.
+The directory inode is retained and checked before and after each creation or
+close; replacement or loss of privacy quarantines the original directory and
+catalog lock. After that quarantine, Attach, Commit and other effectful
+controls are refused even if a token was already exposed; read-only status and
+Locate remain available. An uncertain operation is sent as Unknown while
+retaining its original error or successful receipt. The caller must still independently
+authenticate the physical Store, fence old processes/mounts and consumers,
+and reconcile unknown operations before activation. The normal application
+daemon and AutoTask do not yet activate this control path.
 
 The directory contains an authority-bound owner file, immutable Workspace and
 lifecycle event files, a fixed-width hash-chained ledger and a durable ledger
@@ -192,3 +205,14 @@ and a failed discovery directory sync. The FUSE test output and hashes are in
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-mount-fuse-20261109/`.
 This remains a manually assembled and manually fenced test, not automatic
 container/Pod reconstruction or physical host power-loss evidence.
+
+An authenticated local TCP test exercised the unchanged control wire for
+creation, capacity refusal and terminal close, and injected a directory-sync
+failure to verify an Unknown reply with its original custody retained. A
+separate isolated FUSE test used the same request dispatch for two Workspaces,
+then killed and manually fenced the original owner before recovery; its output
+is in
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-control-exclusive-fuse-20261109/`.
+Additional injected directory replacement during creation covered both a
+completed binding and a creation refusal: each kept the original outcome and
+the replaced-root failure, and neither allowed a later Attach.
