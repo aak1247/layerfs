@@ -181,6 +181,14 @@ impl Owner {
             .roster()
             .map_or(OwnerConfig { namespaces: 1 }, |pool| pool.configuration())
     }
+    /// Snapshot of the next available namespace in an empty roster. The caller
+    /// must exclude concurrent admissions until it finishes recovery.
+    pub fn vacant_namespace_floor(&self) -> Result<i64, OwnerError> {
+        self.client
+            .roster()
+            .ok_or(OwnerError::InvalidAdmission)?
+            .vacant_namespace_floor()
+    }
     pub fn client(&self) -> OwnerClient {
         self.client.clone()
     }
@@ -587,6 +595,13 @@ impl OwnerClient {
     pub(crate) fn same_workspace(&self, other: &Self) -> bool {
         match (&self.context, &other.context) {
             (Context::Workspace(left), Context::Workspace(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+    /// True only when both clients address the exact same in-process roster.
+    pub fn same_roster(&self, other: &Self) -> bool {
+        match (&self.context, &other.context) {
+            (Context::Roster(left), Context::Roster(right)) => Arc::ptr_eq(left, right),
             _ => false,
         }
     }

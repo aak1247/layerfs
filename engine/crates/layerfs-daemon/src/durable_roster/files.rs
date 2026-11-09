@@ -348,6 +348,11 @@ impl Roster {
         Ok(result)
     }
 
+    /// Recheck the original directory, owner, ledger and head under its lock.
+    pub(crate) fn check_live(&mut self) -> Result<(), RosterError> {
+        self.ensure()
+    }
+
     fn ensure(&mut self) -> Result<(), RosterError> {
         if let Some(cause) = &self.failure {
             return Err(RosterError::Retained(cause.clone()));

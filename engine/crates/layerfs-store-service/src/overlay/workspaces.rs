@@ -104,6 +104,16 @@ impl Workspaces {
     pub fn configuration(&self) -> OwnerConfig {
         self.config
     }
+    pub(super) fn vacant_namespace_floor(&self) -> Result<i64, OwnerError> {
+        let state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
+        if state.stopping || !state.slots.is_empty() {
+            return Err(OwnerError::InvalidAdmission);
+        }
+        if state.next == i64::MAX {
+            return Err(OwnerError::IdentityExhausted);
+        }
+        Ok(state.next)
+    }
     pub fn client(&self, namespace: i64) -> Result<OwnerClient, OwnerError> {
         let state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
         if state.stopping {

@@ -205,16 +205,14 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
     let mut discovery = Roster::open(&directory.join("catalog"), authority).unwrap();
     let service = Service::with_kernel(store.clone(), &roster, kernel(&mounts));
-    let mut tokens = Vec::new();
     let mut records = Vec::new();
     discovery.visit(|record| records.push(record)).unwrap();
     records.sort_by_key(|record| record.workspace.to_bytes());
     assert_eq!(records.len(), ITEMS.len());
-    let mut minimum_namespace = 3;
-    for record in records {
+    for record in &records {
         let workspace_id = record.workspace;
         let identity = workspace_id.to_bytes()[0];
-        let (_, old_namespace, expected) = ITEMS
+        let (_, old_namespace, _) = ITEMS
             .iter()
             .copied()
             .find(|item| item.0 == identity)
@@ -228,38 +226,36 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
             old_namespace,
         )
         .is_err());
-        let (owner, snapshot) = Owner::recover_recorded_next(
-            &path,
+    }
+    let tokens = service
+        .recover_catalog(
+            &mut discovery,
+            &roster,
+            &directory.join("durable"),
+            [8; 32],
             ProfileConfig::default(),
-            [identity; 32],
-            minimum_namespace,
+            3,
         )
         .unwrap();
-        let recovered_namespace = owner.client().bound_route().unwrap().namespace();
-        assert!(recovered_namespace >= minimum_namespace && recovered_namespace > old_namespace);
-        minimum_namespace = recovered_namespace.checked_add(1).unwrap();
-        let client = roster.adopt_durable(owner).unwrap();
-        let workspace = store
-            .bind_durable(
-                client,
-                BindRequest {
-                    workspace: workspace_id,
-                    branch: fixture.branch,
-                },
-                snapshot,
-            )
-            .unwrap()
-            .workspace;
-        let token = service
-            .register_recorded(&mut discovery, workspace)
+    assert_eq!(tokens.len(), ITEMS.len());
+    let mut minimum_namespace = 3;
+    for token in &tokens {
+        let workspace_id = token.workspace;
+        let identity = workspace_id.to_bytes()[0];
+        let (_, old_namespace, expected) = ITEMS
+            .iter()
+            .copied()
+            .find(|item| item.0 == identity)
             .unwrap();
+        assert!(token.namespace >= minimum_namespace && token.namespace > old_namespace);
+        minimum_namespace = token.namespace.checked_add(1).unwrap();
         assert!(service
             .execute_control(&Request::Status(WorkspaceToken {
                 workspace: workspace_id,
                 namespace: old_namespace,
             }))
             .is_err());
-        let mount = attach(&service, token);
+        let mount = attach(&service, *token);
         let file = mount.join("file-000000");
         let output = Command::new("/bin/cat")
             .arg(&file)
@@ -271,7 +267,6 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
         assert_eq!(output.stdout, expected.as_bytes());
         fs::File::open(file).unwrap().sync_all().unwrap();
         fs::File::open(mount).unwrap().sync_all().unwrap();
-        tokens.push(token);
     }
     assert_eq!(service.workspaces(), Some(2));
     for token in tokens {

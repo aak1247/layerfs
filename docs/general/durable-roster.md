@@ -48,6 +48,17 @@ manually assembled daemon may pass the catalog to `Service::register_recorded`
 to require the bound Workspace and Branch to match it. This check does not
 itself authenticate the Sandbox or physical Store. It rejects a different
 history catalog identity or incarnation.
+`Service::recover_catalog` provides one explicitly invoked recovery attempt:
+it verifies the complete catalog, authority, available capacity and empty owner
+roster before opening any Overlay. It then opens records in order with fresh
+namespaces, validates their saved snapshots against the Store and registers the
+bindings without mounting them. If an entry fails, it returns the original
+failure, completed tokens and any unadmitted owner; the caller must retain the
+same Service and Owner, reconcile the result and not automatically replay it.
+An incomplete creation, terminally closed Workspace or missing file is an
+error, not permission to skip an entry or create replacement data. The caller
+must keep admissions serialized and independently prove the old mounts and
+consumers stopped before invoking this operation.
 Even after a successful scan the caller must separately authorize each
 Workspace and Branch, prove the Store and original file identities, fence old
 processes and mounts, and reconcile unknown operations before exposing data.
@@ -66,12 +77,17 @@ An isolated FUSE test recorded two Workspace/Branch identities before creating
 their overlays, mounted both, wrote different bytes as an unprivileged user and
 synchronized them. It killed and reaped the original daemon, detached its old
 mounts, reopened the catalog against the same Store catalog identity and
-incarnation, discovered the two overlay filenames from its records and manually
-selected fresh namespaces, rebound and remounted them. The old tokens were
-rejected and the separate bytes survived. The test-only container used
-`/dev/fuse`, CAP_SYS_ADMIN and unconfined AppArmor and seccomp, without network
-or a Docker socket. The runner output,
+incarnation, invoked one catalog recovery to discover the overlay filenames,
+select fresh namespaces and register both bindings, then explicitly remounted
+them. The old tokens were rejected and the separate bytes survived. The test-only
+container used `/dev/fuse`, CAP_SYS_ADMIN and unconfined AppArmor and seccomp,
+without network or a Docker socket. The runner output,
 exit status, image and source hashes are under
-`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-multi-next-20261109/`.
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-catalog-batch-final-20261109/`.
 This is a manually fenced, single-host process-loss test, not automatic daemon
 startup, container/Pod reconstruction, physical host power loss or scale qualification.
+
+A separate control-only test recovered 64 distinct durable Overlay bindings
+from one catalog, checked their identities and namespaces, then closed them.
+It used a Disposable test Store and no FUSE mounts; it is a functional capacity
+check, not a crash, throughput or latency qualification.

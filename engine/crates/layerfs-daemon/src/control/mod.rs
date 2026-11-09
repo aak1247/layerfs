@@ -14,6 +14,8 @@ mod observation;
 mod operations;
 #[cfg(target_os = "linux")]
 mod recorded;
+#[cfg(target_os = "linux")]
+mod recovery;
 mod registry;
 mod serve;
 #[cfg(target_os = "linux")]
@@ -25,6 +27,8 @@ pub use kernel::{KernelConfig, KernelServing};
 pub(crate) use observation::{reply_token, request_token};
 #[cfg(target_os = "linux")]
 pub use recorded::{RecordedRegistrationError, RecordedRegistrationFailure};
+#[cfg(target_os = "linux")]
+pub use recovery::{CatalogRecoveryCause, CatalogRecoveryFailure};
 pub use registry::{DurableRegistrationFailure, Service};
 pub(crate) use serve::answer_call;
 pub use serve::{ServeCause, ServeFailure, Served};
