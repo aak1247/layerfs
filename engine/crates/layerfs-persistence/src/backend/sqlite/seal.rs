@@ -8,6 +8,28 @@ impl Session {
         if !self.writable {
             return Err(BackendError::ReadOnly.into());
         }
+        #[cfg(target_os = "linux")]
+        let writer = {
+            {
+                let state = self.state.lock().map_err(|_| PersistenceError::Uncertain)?;
+                if state.quarantined || !state.connection.is_autocommit() {
+                    return Err(PersistenceError::Uncertain);
+                }
+            }
+            let writer = self.acquire_writer()?;
+            if let Err(cause) = self.verify_durable_directory() {
+                // No checkpoint was attempted. Preserve the exact connection
+                // and its original directory owner until process exit.
+                if let Ok(mut state) = self.state.lock() {
+                    state.sync_failure = Some(cause);
+                    state.quarantined = true;
+                }
+                std::mem::forget(writer);
+                std::mem::forget(self);
+                return Err(PersistenceError::Uncertain);
+            }
+            writer
+        };
         let state = self
             .state
             .into_inner()
@@ -16,9 +38,9 @@ impl Session {
             return Err(PersistenceError::Uncertain);
         }
         #[cfg(target_os = "linux")]
-        let state = {
+        let mut state = {
             let mut state = state;
-            state.writer_hold = Some(super::writer_admission::Writer::acquire(&self.path)?);
+            state.writer_hold = Some(writer);
             state
         };
         #[cfg(target_os = "macos")]
@@ -39,6 +61,17 @@ impl Session {
             .connection
             .close()
             .map_err(|(_, error)| rows::error(error))?;
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &self.durable_directory {
+            if directory.sync().is_err() {
+                // Checkpoint/close already ran, so the handoff is unknown.
+                // Keep the cooperative lock; do not retry or expose a seal.
+                if let Some(writer) = state.writer_hold.take() {
+                    std::mem::forget(writer);
+                }
+                return Err(PersistenceError::Uncertain);
+            }
+        }
         // SQLite has checked-closed before advisory ownership is released.
         // Earlier error exits drop State.connection before its retained owner.
         if let Some(writer) = state.writer_hold {

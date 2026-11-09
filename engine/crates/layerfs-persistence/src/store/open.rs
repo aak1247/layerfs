@@ -35,14 +35,15 @@ impl Handles {
             .map_err(|e| PersistenceError::Refused {
                 status: e.kind().to_string(),
             })?;
-        let session = Arc::new(Session::connect(
+        let session = Session::connect(
             &config.path,
             true,
             true,
             config.sqlite_profile,
             config.sqlite_pack_layout,
             config.sqlite_acquisition,
-        )?);
+        )?
+        .shared();
         session.initialize(policy, history, catalog_id)?;
         let directory = config.path.parent().map(Path::to_path_buf);
         Self::validated(session, directory, &history.binding_key, history.cursor_key)
@@ -75,14 +76,15 @@ impl Handles {
             return Err(PersistenceError::BackendUnavailable);
         }
         let directory = config.path.parent().map(Path::to_path_buf);
-        let session = Arc::new(Session::connect(
+        let session = Session::connect(
             &config.path,
             writable,
             false,
             config.sqlite_profile,
             config.sqlite_pack_layout,
             config.sqlite_acquisition,
-        )?);
+        )?
+        .shared();
         if writable {
             session.add_binding_hints()?;
             session.add_lineage(crate::history::backfill_lineage)?;

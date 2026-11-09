@@ -35,6 +35,34 @@ This tests a completed global Store save. The Workspace overlay is a separate
 disposable database, and this proof does **not** demonstrate its durability,
 uncommitted file recovery, commit-outcome reconciliation, or mount recovery.
 
+## Checked WAL directory synchronization
+
+On Linux, the Durable writer retains an open handle to its original Store
+directory and checks that directory and the database path still have their
+original identities. Each successful SQLite write transaction is followed by a
+checked directory `fsync` before its result is acknowledged. This also covers
+the newly created WAL directory entry: the pinned SQLite Unix VFS can ignore a
+directory-sync error. A checked seal synchronizes the directory again after
+SQLite closes. Disposable writers keep their previous behavior.
+
+If a write's directory sync or identity check fails, the result is unknown;
+the original connection, error and cooperative writer lock remain held until
+process exit, including through a publication lane and ordinary handle drops.
+After a failed post-close seal, its writer lock is retained. Other cooperative
+writers may wait for that owner to exit; no unknown operation is replayed.
+This requires a trusted Store directory and cooperative access on the same
+kernel; raw SQLite clients can bypass the cooperative lock. It does not make
+an earlier write, acknowledged before this check existed, retroactively durable.
+The per-transaction directory-sync cost has not been benchmarked.
+
+Injected `EIO` tests cover ordinary writes, writes inside a publication lane,
+and the post-close seal. They verify no success acknowledgement, retained
+writer ownership after handle drops, and reopening after the owner process exits.
+Separate tests move the database and its parent directory and verify that the
+original directory lock and file are retained rather than adopting the new
+path. These are error-injection and process-loss tests, not proof against a
+storage device that falsely reports synchronization.
+
 ## Recorded run
 
 On 2026-11-09, the probe built over parent `5bfed282c7239143da3073e4d8ef861c7033a950`
@@ -48,3 +76,10 @@ second guest reopened the original disk and verified the saved bytes.
 - Guest kernel SHA-256: `d820688f039cb28deea210c1c75eb377437ba832ddd415460b79b88d4bb02761`.
 - The local receipt and logs are retained under
   `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-vm-20261109/proof-final/`.
+
+The checked-directory implementation was also run with the same VM and disk
+profile. Its acknowledged live WAL and recovered object were verified after
+guest termination. The receipt and logs are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-store-vm-20261109-directory-sync/`;
+the test executable SHA-256 was
+`bcdab5b4a97b3e74d2c82d96ea20f7e96724a3ff348b7e92ddc9bfdb061c830c`.

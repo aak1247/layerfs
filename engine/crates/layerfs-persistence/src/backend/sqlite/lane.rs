@@ -27,7 +27,13 @@ impl Session {
         if turn.nested {
             return Err(BackendError::Integrity);
         }
-        let writer = Writer::acquire(&self.path)?;
+        {
+            let state = self.state.lock().map_err(|_| BackendError::Unknown)?;
+            if state.quarantined {
+                return Err(BackendError::Unknown);
+            }
+        }
+        let writer = self.acquire_writer()?;
         turn.hold()?;
         Ok(LaneHold {
             session: self.clone(),
@@ -40,11 +46,34 @@ impl Session {
 impl Drop for LaneHold {
     fn drop(&mut self) {
         if let Some(writer) = self.writer.take() {
+            // A nested transaction did not own `state.writer_hold`: the lane
+            // still owns its lock. Transfer it to the retained session when a
+            // durable outcome is unknown, including a poisoned unwind.
+            let state = self.session.state.lock();
+            let poisoned = state.is_err();
+            let mut state = state.unwrap_or_else(|error| error.into_inner());
+            if self.session.profile.persistence == crate::SqlitePersistenceProfile::Durable
+                && (state.quarantined || poisoned || std::thread::panicking())
+            {
+                self.session.quarantine(&mut state);
+                if state.writer_hold.is_none() {
+                    state.writer_hold = Some(writer);
+                } else {
+                    std::mem::forget(writer);
+                }
+                drop(state);
+                self.session.admission.release_hold();
+                return;
+            }
+            drop(state);
             if let Err(retained) = writer.release() {
                 // As a failed per-job release: keep the lock, refuse later work.
                 if let Ok(mut state) = self.session.state.lock() {
-                    state.quarantined = true;
+                    self.session.quarantine(&mut state);
                     state.writer_hold = Some(retained);
+                } else {
+                    self.session.retain_uncertain();
+                    std::mem::forget(retained);
                 }
             }
         }

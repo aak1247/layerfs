@@ -15,6 +15,14 @@ pub(crate) struct Transaction<'a> {
     uncertain: Cell<bool>,
     owner: &'a Session,
 }
+struct RetainOnPanic<'a>(&'a Session);
+impl Drop for RetainOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.retain_uncertain();
+        }
+    }
+}
 impl Transaction<'_> {
     pub(crate) fn layout(&self) -> crate::SqlitePackLayout {
         self.owner.layout
@@ -146,6 +154,7 @@ impl Session {
             .state
             .lock()
             .map_err(|_| E::from(BackendError::Unknown))?;
+        let _panic = RetainOnPanic(self);
         super::thread_work::attributed(&mut state, |state| {
             if state.quarantined {
                 return Err(BackendError::Unknown.into());
@@ -153,7 +162,7 @@ impl Session {
             // An earlier uncertain transaction may still exist. It cannot be
             // inherited by an independently owned snapshot or guessed complete.
             if !state.connection.is_autocommit() {
-                state.quarantined = true;
+                self.quarantine(state);
                 return Err(BackendError::Unknown.into());
             }
             let result = (|| {
@@ -171,7 +180,7 @@ impl Session {
             if !state.connection.is_autocommit()
                 || result.as_ref().err().is_some_and(OutcomeError::uncertain)
             {
-                state.quarantined = true;
+                self.quarantine(state);
                 return Err(BackendError::Unknown.into());
             }
             if result.is_ok() {
@@ -205,13 +214,14 @@ impl Session {
             .state
             .lock()
             .map_err(|_| E::from(BackendError::Unknown))?;
+        let _panic = RetainOnPanic(self);
         super::thread_work::attributed(&mut state, |state| {
             if state.quarantined {
                 return Err(BackendError::Unknown.into());
             }
             // An earlier uncertain transaction cannot be inherited or guessed done.
             if !state.connection.is_autocommit() {
-                state.quarantined = true;
+                self.quarantine(state);
                 return Err(BackendError::Unknown.into());
             }
             let tx = Transaction {
@@ -226,7 +236,7 @@ impl Session {
             // Every statement and BLOB handle has been released: a read leaves
             // autocommit intact, anything else keeps the session quarantined.
             if uncertain || !state.connection.is_autocommit() {
-                state.quarantined = true;
+                self.quarantine(state);
                 return Err(BackendError::Unknown.into());
             }
             result
@@ -247,6 +257,7 @@ impl Session {
             .state
             .lock()
             .map_err(|_| E::from(BackendError::Unknown))?;
+        let _panic = RetainOnPanic(self);
         super::thread_work::attributed(&mut s, |s| {
             if s.quarantined {
                 return Err(BackendError::Unknown.into());
@@ -254,8 +265,16 @@ impl Session {
             // A held publication lane already owns the writer for its nested work.
             if writable && !turn.nested {
                 // State owns this before BEGIN, including across a poisoned unwind.
-                s.writer_hold =
-                    Some(super::writer_admission::Writer::acquire(&self.path).map_err(E::from)?);
+                s.writer_hold = Some(self.acquire_writer().map_err(E::from)?);
+            }
+            if writable {
+                if let Err(cause) = self.verify_durable_directory() {
+                    s.sync_failure = Some(cause);
+                    self.quarantine(s);
+                    self.finish_writer(s).map_err(E::from)?;
+                    s.work.borrow_mut().transaction_ns += start.elapsed().as_nanos() as u64;
+                    return Err(BackendError::Unknown.into());
+                }
             }
             let tx = Transaction {
                 connection: &s.connection,
@@ -265,9 +284,9 @@ impl Session {
             };
             if let Err(e) = tx.query(if writable { "BEGIN IMMEDIATE" } else { "BEGIN" }, vec![]) {
                 if e == BackendError::Unknown {
-                    s.quarantined = true;
+                    self.quarantine(s);
                 }
-                s.finish_writer().map_err(E::from)?;
+                self.finish_writer(s).map_err(E::from)?;
                 s.work.borrow_mut().transaction_ns += start.elapsed().as_nanos() as u64;
                 return Err(e.into());
             }
@@ -279,14 +298,27 @@ impl Session {
             let uncertain =
                 tx.uncertain.get() || result.as_ref().err().is_some_and(OutcomeError::uncertain);
             if uncertain {
-                s.quarantined = true;
-                s.finish_writer().map_err(E::from)?;
+                self.quarantine(s);
+                self.finish_writer(s).map_err(E::from)?;
                 s.work.borrow_mut().transaction_ns += start.elapsed().as_nanos() as u64;
                 return Err(BackendError::Unknown.into());
             }
             let result = match result {
                 Ok(value) => match query::run(&s.connection, "COMMIT", vec![], &s.work) {
                     Ok(_) => {
+                        // SQLite's unix VFS may ignore a failure syncing the
+                        // newly created WAL directory. Never acknowledge the
+                        // commit until our exact directory sync succeeds.
+                        if writable {
+                            if let Err(cause) = self.sync_durable_directory() {
+                                s.sync_failure = Some(cause);
+                                self.quarantine(s);
+                                self.finish_writer(s).map_err(E::from)?;
+                                s.work.borrow_mut().transaction_ns +=
+                                    start.elapsed().as_nanos() as u64;
+                                return Err(BackendError::Unknown.into());
+                            }
+                        }
                         s.work.borrow_mut().commits += 1;
                         if writable {
                             s.work.borrow_mut().write_commits += 1;
@@ -295,12 +327,12 @@ impl Session {
                     }
                     Err(e) => {
                         if e == BackendError::Unknown {
-                            s.quarantined = true;
+                            self.quarantine(s);
                             Err(e.into())
                         } else if !s.connection.is_autocommit()
                             && query::run(&s.connection, "ROLLBACK", vec![], &s.work).is_err()
                         {
-                            s.quarantined = true;
+                            self.quarantine(s);
                             Err(BackendError::Unknown.into())
                         } else {
                             s.work.borrow_mut().rollbacks += 1;
@@ -319,7 +351,7 @@ impl Session {
                                 Err(e)
                             }
                             Err(_) => {
-                                s.quarantined = true;
+                                self.quarantine(s);
                                 Err(BackendError::Unknown.into())
                             }
                         }
@@ -328,7 +360,7 @@ impl Session {
                     }
                 }
             };
-            s.finish_writer().map_err(E::from)?;
+            self.finish_writer(s).map_err(E::from)?;
             s.work.borrow_mut().transaction_ns += start.elapsed().as_nanos() as u64;
             result
         })

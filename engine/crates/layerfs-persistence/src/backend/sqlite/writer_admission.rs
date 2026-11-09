@@ -37,15 +37,7 @@ impl Writer {
             {
                 return Err(BackendError::Integrity);
             }
-            // One blocking kernel wait, taken after the Session's FIFO turn,
-            // so at most one thread per Session waits here. Its exits: the lock
-            // (a holder process that exits releases it); `Cancelled` when a
-            // signal interrupts the wait. No BEGIN/body has been attempted.
-            match Flock::lock(file, FlockArg::LockExclusive) {
-                Ok(lock) => Ok(Self { lock }),
-                Err((_, Errno::EINTR)) => Err(BackendError::Cancelled),
-                Err(_) => Err(BackendError::Integrity),
-            }
+            Self::acquire_file(file)
         }
         #[cfg(target_os = "macos")]
         {
@@ -58,6 +50,17 @@ impl Writer {
         {
             let _ = path;
             Err(BackendError::Integrity)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn acquire_file(file: File) -> Result<Self, BackendError> {
+        // One blocking kernel wait after the Session's FIFO turn. A holder
+        // exiting releases it; EINTR cancels before any BEGIN/body attempt.
+        match Flock::lock(file, FlockArg::LockExclusive) {
+            Ok(lock) => Ok(Self { lock }),
+            Err((_, Errno::EINTR)) => Err(BackendError::Cancelled),
+            Err(_) => Err(BackendError::Integrity),
         }
     }
 

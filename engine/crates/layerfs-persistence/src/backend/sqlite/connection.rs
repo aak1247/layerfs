@@ -6,7 +6,10 @@ use rusqlite::{limits::Limit, Connection, OpenFlags};
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
 };
 /// The selected SQLite settings and actual runtime capabilities.
 #[derive(Clone, Debug)]
@@ -135,6 +138,8 @@ pub(crate) struct State {
     pub(crate) quarantined: bool,
     pub(crate) work: RefCell<SqlWork>,
     pub(crate) writer_hold: Option<super::writer_admission::Writer>,
+    /// First observed directory failure, retained with an uncertain writer.
+    pub(crate) sync_failure: Option<std::io::Error>,
 }
 pub(crate) struct Session {
     pub(crate) admission: super::admission::Admission,
@@ -144,6 +149,10 @@ pub(crate) struct Session {
     pub(crate) layout: crate::SqlitePackLayout,
     pub(crate) acquisition: crate::SqliteAcquisitionSchema,
     pub(crate) path: PathBuf,
+    #[cfg(target_os = "linux")]
+    pub(super) durable_directory: Option<super::durable_directory::DurableDirectory>,
+    owner: OnceLock<Weak<Session>>,
+    retained: AtomicBool,
 }
 impl Session {
     pub(crate) fn connect(
@@ -157,6 +166,12 @@ impl Session {
         if !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Err(BackendError::Integrity);
         }
+        #[cfg(target_os = "linux")]
+        let durable_directory = if writable && selected == SqlitePersistenceProfile::Durable {
+            Some(super::durable_directory::DurableDirectory::open(path)?)
+        } else {
+            None
+        };
         let flags = if writable {
             OpenFlags::SQLITE_OPEN_READ_WRITE
         } else {
@@ -253,6 +268,10 @@ impl Session {
                 .map_err(rows::error)? as usize,
         };
         profile::check(&profile)?;
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &durable_directory {
+            directory.verify().map_err(|_| BackendError::Unknown)?;
+        }
         super::thread_work::add(&work.borrow());
         Ok(Self {
             admission: super::admission::Admission::default(),
@@ -262,12 +281,76 @@ impl Session {
                 quarantined: false,
                 work,
                 writer_hold: None,
+                sync_failure: None,
             }),
             writable,
             profile,
             layout,
             acquisition,
+            #[cfg(target_os = "linux")]
+            durable_directory,
+            owner: OnceLock::new(),
+            retained: AtomicBool::new(false),
         })
+    }
+    /// Register the session's own weak handle before any Store transaction.
+    pub(crate) fn shared(self) -> Arc<Self> {
+        let session = Arc::new(self);
+        assert!(session.owner.set(Arc::downgrade(&session)).is_ok());
+        session
+    }
+    /// An uncertain durable writer must keep its exact connection and any
+    /// cooperative writer lock until process exit, even if all callers drop it.
+    pub(crate) fn retain_uncertain(&self) {
+        if !self.writable || self.profile.persistence != SqlitePersistenceProfile::Durable {
+            return;
+        }
+        if let Some(owner) = self.owner.get().and_then(Weak::upgrade) {
+            if !self.retained.swap(true, Ordering::AcqRel) {
+                std::mem::forget(owner);
+            }
+        }
+    }
+    pub(crate) fn quarantine(&self, state: &mut State) {
+        state.quarantined = true;
+        self.retain_uncertain();
+    }
+    pub(crate) fn finish_writer(&self, state: &mut State) -> Result<(), BackendError> {
+        let result = state.finish_writer();
+        if state.quarantined {
+            self.retain_uncertain();
+        }
+        result
+    }
+    pub(crate) fn acquire_writer(&self) -> Result<super::writer_admission::Writer, BackendError> {
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &self.durable_directory {
+            let file = directory.writer_file().map_err(|_| BackendError::Unknown)?;
+            return super::writer_admission::Writer::acquire_file(file);
+        }
+        super::writer_admission::Writer::acquire(&self.path)
+    }
+    pub(crate) fn sync_durable_directory(&self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &self.durable_directory {
+            directory.sync()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn verify_durable_directory(&self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &self.durable_directory {
+            directory.verify()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn seal_refusal(&self) -> layerfs_storage::port::PersistenceError {
+        use layerfs_storage::port::PersistenceError;
+        match self.state.try_lock() {
+            Ok(state) if state.quarantined => PersistenceError::Uncertain,
+            Err(std::sync::TryLockError::Poisoned(_)) => PersistenceError::Uncertain,
+            _ => PersistenceError::Busy,
+        }
     }
     /// Stored schema version: the pack layout's, offset by the acquisition tables.
     pub(crate) fn schema_version(&self) -> i64 {

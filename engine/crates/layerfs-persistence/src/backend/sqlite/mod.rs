@@ -2,6 +2,8 @@
 pub(crate) mod acquisition;
 mod admission;
 pub(crate) mod connection;
+#[cfg(target_os = "linux")]
+mod durable_directory;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod file_control;

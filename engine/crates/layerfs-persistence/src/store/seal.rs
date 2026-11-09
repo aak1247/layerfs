@@ -36,7 +36,7 @@ impl Handles {
         drop(history);
         drop(acquisition);
         let storage = Arc::try_unwrap(storage).map_err(|_| PersistenceError::Busy)?;
-        let session = Arc::try_unwrap(storage.session).map_err(|_| PersistenceError::Busy)?;
+        let session = Arc::try_unwrap(storage.session).map_err(|session| session.seal_refusal())?;
         session.seal()
     }
 }
