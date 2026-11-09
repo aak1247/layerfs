@@ -128,6 +128,9 @@ pub fn open_store_observed(
     reservations.validate()?;
     let writer = Handles::open_writable(config.clone(), binding, cursor_key)?;
     let sqlite_version = writer.profile().sqlite_version.clone();
+    let durable_writer = (cfg!(target_os = "linux")
+        && writer.profile().persistence == layerfs_persistence::SqlitePersistenceProfile::Durable)
+        .then(|| writer.storage.clone());
     let observations = Arc::new(Mutex::new(ReaderObservations {
         live: BTreeMap::new(),
         retired: Some(SqlWork::default()),
@@ -161,18 +164,20 @@ pub fn open_store_observed(
         }))
     });
     let control = factory(0)?;
-    let store = Arc::new(
-        Store::new(
-            writer.storage.clone(),
-            Arc::new(writer.history),
-            control,
-            factory,
-            cache_bytes,
-            reservations,
-            workspace_capacity,
-        )?
-        .with_merge_scratch(writer.storage.merge_scratch()),
-    );
+    let mut store = Store::new(
+        writer.storage.clone(),
+        Arc::new(writer.history),
+        control,
+        factory,
+        cache_bytes,
+        reservations,
+        workspace_capacity,
+    )?
+    .with_merge_scratch(writer.storage.merge_scratch());
+    if let Some(provider) = durable_writer {
+        store = store.with_durable_writer(provider);
+    }
+    let store = Arc::new(store);
     Ok(OpenedStore {
         store,
         sqlite_version,

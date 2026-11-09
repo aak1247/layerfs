@@ -25,7 +25,7 @@ pub use storage::merge_records::{
 };
 pub(crate) use storage::provider as storage_provider;
 pub(crate) use storage::publication;
-pub use storage_provider::StorageProvider;
+pub use storage_provider::{DurableBarrierError, StorageProvider};
 pub use store::seal::SealedStore;
 
 mod metadata;

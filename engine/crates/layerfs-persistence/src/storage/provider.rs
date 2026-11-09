@@ -10,11 +10,51 @@ use layerfs_storage::{
     StoragePolicy,
 };
 use std::sync::Arc;
+/// A durable Store barrier stopped before its sync or failed with its exact
+/// existing persistence outcome.
+#[derive(Debug)]
+pub enum DurableBarrierError {
+    /// Waiting ended before the synchronization attempt began.
+    Cancelled,
+    /// The operation's original persistence outcome, possibly uncertain.
+    Failed(PersistenceError),
+}
+impl std::fmt::Display for DurableBarrierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "durable Store barrier: {self:?}")
+    }
+}
+impl std::error::Error for DurableBarrierError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cancelled => None,
+            Self::Failed(cause) => Some(cause),
+        }
+    }
+}
 /// Application-owned bounded physical persistence over the combined Store.
 pub struct StorageProvider {
     pub(crate) session: Arc<Session>,
 }
 impl StorageProvider {
+    /// Check a Linux Durable Store under its original cooperative writer
+    /// ownership. Its initial installed file must already be durable.
+    pub fn durable_barrier(&self) -> Result<(), PersistenceError> {
+        self.session.durable_barrier().map_err(Into::into)
+    }
+    /// Wait for the Store owner, unless `stopped` ends the still-unattempted
+    /// wait. Once synchronization begins, its original result is returned.
+    pub fn durable_barrier_cancellable(
+        &self,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(), DurableBarrierError> {
+        self.session
+            .durable_barrier_cancellable(stopped)
+            .map_err(|cause| match cause {
+                crate::backend::records::BackendError::Cancelled => DurableBarrierError::Cancelled,
+                other => DurableBarrierError::Failed(other.into()),
+            })
+    }
     /// Merge build records over this session (#355); writable sessions only.
     pub fn merge_scratch(&self) -> crate::MergeScratch {
         crate::MergeScratch {

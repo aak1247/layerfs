@@ -4,9 +4,18 @@ mod support;
 
 use layerfs_content::{FinalizedObject, ObjectRole};
 use layerfs_history::{HistoryCatalog, HistoryCatalogConfig};
-use layerfs_persistence::{Handles, PersistenceConfig};
+use layerfs_persistence::{DurableBarrierError, Handles, PersistenceConfig, StorageProvider};
 use layerfs_storage::{location::PackInfo, port::*, Storage, StoragePolicy};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    time::Duration,
+};
 
 fn authority() -> HistoryCatalogConfig {
     HistoryCatalogConfig {
@@ -130,10 +139,20 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
             fs::write(directory.join("inject-directory"), b"1").unwrap();
             (path, directory.to_owned())
         };
-        assert!(matches!(
-            handles.storage.reserve(reserve()),
+        let outcome = if mode == "barrier-stop" {
+            assert!(matches!(
+                handles
+                    .storage
+                    .durable_barrier_cancellable(&|| directory.join("failed").exists()),
+                Err(DurableBarrierError::Failed(PersistenceError::Uncertain))
+            ));
             Err(PersistenceError::Uncertain)
-        ));
+        } else if mode == "barrier" {
+            handles.storage.durable_barrier()
+        } else {
+            handles.storage.reserve(reserve()).map(|_| ())
+        };
+        assert!(matches!(outcome, Err(PersistenceError::Uncertain)));
         drop(lane);
         assert!(matches!(
             handles.storage.reserve(reserve()),
@@ -164,6 +183,8 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
     for mode in [
         "ordinary",
         "lane",
+        "barrier",
+        "barrier-stop",
         "seal",
         "replace",
         "replace-dir",
@@ -215,4 +236,104 @@ fn failed_directory_sync_keeps_the_original_writer_and_never_acknowledges() {
         .unwrap();
         reopened.storage.reserve(reserve()).unwrap();
     }
+}
+
+fn cancel_waiting_barrier(provider: Arc<StorageProvider>) {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let thread_stopped = stopped.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result =
+            provider.durable_barrier_cancellable(&|| thread_stopped.load(Ordering::Acquire));
+        done_tx.send(result).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let premature = done_rx.recv_timeout(Duration::from_millis(100)).ok();
+    stopped.store(true, Ordering::Release);
+    let early = premature.is_some();
+    let result = premature.unwrap_or_else(|| done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    waiter.join().unwrap();
+    assert!(!early, "barrier escaped its held owner before cancellation");
+    assert!(matches!(result, Err(DurableBarrierError::Cancelled)));
+}
+
+#[test]
+fn barrier_cancels_before_attempt_while_waiting_for_directory_owner() {
+    use nix::fcntl::{Flock, FlockArg};
+    let temp = support::Temp::new("store-barrier-owner-stop");
+    let handles = Handles::create(
+        PersistenceConfig::sqlite(temp.join("store.sqlite")),
+        StoragePolicy::frozen_default(),
+        &authority(),
+    )
+    .unwrap();
+    let held = Flock::lock(
+        fs::File::open(temp.path()).unwrap(),
+        FlockArg::LockExclusiveNonblock,
+    )
+    .unwrap();
+    cancel_waiting_barrier(handles.storage.clone());
+    held.unlock().unwrap();
+    handles.storage.durable_barrier().unwrap();
+    handles.seal().unwrap();
+}
+
+#[test]
+fn barrier_cancels_before_attempt_while_queued_for_a_publication_lane() {
+    let temp = support::Temp::new("store-barrier-lane-stop");
+    let handles = Handles::create(
+        PersistenceConfig::sqlite(temp.join("store.sqlite")),
+        StoragePolicy::frozen_default(),
+        &authority(),
+    )
+    .unwrap();
+    std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let history = &handles.history;
+        let owner = scope.spawn(move || {
+            let lane = history.publish_lane().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(lane);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancel_waiting_barrier(handles.storage.clone());
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+    });
+    handles.storage.durable_barrier().unwrap();
+    handles.seal().unwrap();
+}
+
+#[test]
+fn only_writable_durable_store_can_establish_a_barrier() {
+    let temp = support::Temp::new("store-barrier-profile");
+    let durable = PersistenceConfig::sqlite(temp.join("durable.sqlite"));
+    let handles = Handles::create(
+        durable.clone(),
+        StoragePolicy::frozen_default(),
+        &authority(),
+    )
+    .unwrap();
+    handles.storage.durable_barrier().unwrap();
+    let reader =
+        Handles::open_read_only(durable, &authority().binding_key, authority().cursor_key).unwrap();
+    assert!(matches!(
+        reader.storage.durable_barrier(),
+        Err(PersistenceError::Malformed)
+    ));
+    drop(reader);
+    handles.seal().unwrap();
+    let disposable = PersistenceConfig::sqlite(temp.join("disposable.sqlite"))
+        .with_sqlite_profile(layerfs_persistence::SqlitePersistenceProfile::Disposable);
+    let handles =
+        Handles::create(disposable, StoragePolicy::frozen_default(), &authority()).unwrap();
+    assert!(matches!(
+        handles.storage.durable_barrier(),
+        Err(PersistenceError::Malformed)
+    ));
+    handles.seal().unwrap();
 }

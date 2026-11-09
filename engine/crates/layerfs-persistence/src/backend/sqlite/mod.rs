@@ -2,6 +2,7 @@
 pub(crate) mod acquisition;
 mod admission;
 pub(crate) mod connection;
+mod durable_barrier;
 #[cfg(target_os = "linux")]
 mod durable_directory;
 #[cfg(target_os = "macos")]

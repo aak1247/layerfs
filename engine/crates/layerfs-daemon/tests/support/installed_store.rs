@@ -31,9 +31,25 @@ impl Fixture {
             count
         })
     }
+    #[allow(dead_code)]
+    pub fn new_durable(count: usize, label: &str) -> Self {
+        Self::built_profile(label, SqlitePersistenceProfile::Durable, |source| {
+            for n in 0..count {
+                std::fs::write(source.join(format!("file-{n:06}")), bytes(n)).unwrap();
+            }
+            count
+        })
+    }
     /// `build` fills the kernel source and returns its entry count below the
     /// root; it may read the finished tree before the source is removed.
     pub fn built(label: &str, build: impl FnOnce(&std::path::Path) -> usize) -> Self {
+        Self::built_profile(label, SqlitePersistenceProfile::Disposable, build)
+    }
+    fn built_profile(
+        label: &str,
+        profile: SqlitePersistenceProfile,
+        build: impl FnOnce(&std::path::Path) -> usize,
+    ) -> Self {
         let directory =
             std::env::temp_dir().join(format!("layerfs-installed-{}-{label}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
@@ -42,7 +58,7 @@ impl Fixture {
         let count = build(&source);
         let sealed = directory.join("sealed.sqlite");
         let config = PersistenceConfig::sqlite(&sealed)
-            .with_sqlite_profile(SqlitePersistenceProfile::Disposable)
+            .with_sqlite_profile(profile)
             .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables);
         let handles = Handles::create(
             config.clone(),
@@ -87,6 +103,11 @@ impl Fixture {
         let sealed = handles.seal().unwrap();
         let installed = directory.join("store.sqlite");
         std::fs::copy(sealed.path, &installed).unwrap();
+        if profile == SqlitePersistenceProfile::Durable {
+            // This test install is complete before any consumer opens it.
+            std::fs::File::open(&installed).unwrap().sync_all().unwrap();
+            std::fs::File::open(&directory).unwrap().sync_all().unwrap();
+        }
         // No source or sealed original remains available to the consumer.
         std::fs::remove_dir_all(source).unwrap();
         std::fs::remove_file(&config.path).unwrap();

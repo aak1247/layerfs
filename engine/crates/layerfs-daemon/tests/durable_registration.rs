@@ -81,6 +81,7 @@ fn registration_checks_exact_ownership_and_retains_files_on_unmount() {
     };
     let first_binding = bind(&first, 42);
     let second_binding = bind(&second, 43);
+    assert!(!first_binding.has_durable_store());
     let service = Service::new(store.clone(), &first);
     let rejected = service.register_durable(second_binding).unwrap_err();
     assert_eq!(rejected.workspace.snapshot().unwrap(), snapshot);
@@ -114,6 +115,53 @@ fn registration_checks_exact_ownership_and_retains_files_on_unmount() {
     drop(service);
     first.stop().unwrap();
     assert!(first_path.is_file() && second_path.is_file());
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn concrete_durable_store_exposes_its_checked_barrier_to_a_bound_owner() {
+    let fixture = support::Fixture::new_durable(1, "durable-store-barrier");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let snapshot = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let owner = Owner::create_durable(spec(
+        &directory.join("overlay.sqlite"),
+        46,
+        1,
+        snapshot.effective_root.to_bytes(),
+    ))
+    .unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: WorkspaceId::from_authority([46; 32]).unwrap(),
+                branch: fixture.branch,
+            },
+            snapshot,
+        )
+        .unwrap()
+        .workspace;
+    assert!(workspace.has_durable_store());
+    workspace.operation().unwrap().durable_barrier().unwrap();
+    workspace.close().unwrap();
+    drop(workspace);
+    owner.stop().unwrap();
     drop(store);
     fixture.cleanup();
 }

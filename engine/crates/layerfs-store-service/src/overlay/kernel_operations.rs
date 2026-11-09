@@ -18,6 +18,7 @@ impl OwnerClient {
         directory: bool,
     ) -> Result<(), OwnerError> {
         self.call(route, ServiceClass::General, None, move |db| {
+            db.require_recorded_recovery_ready()?;
             db.synchronize_kernel(mount, serial, handle, directory)
         })
     }

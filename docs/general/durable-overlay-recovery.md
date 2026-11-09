@@ -67,6 +67,11 @@ disposable database or a nested atomic job cannot claim this barrier. Tests
 inject failures into each sync and exercise stale and mismatched handles. This
 primitive does not establish that the Store or its base is durable and is not
 wired to a successful FUSE reply.
+The service-owner variant also requires a recorded root-matched binding and
+applies reopening's capture, volatile-custody, operation-record and cleanup
+refusals. Its checks use the existing generation and cleanup indexes; they do
+not repeat `quick_check` or authorize recovery of an old mount or unknown
+external action.
 
 The durable profile is SQLite DELETE/EXTRA/EXCLUSIVE. SQLite documents that
 [FULL alone is not necessarily durable in DELETE mode](https://sqlite.org/pragma.html#pragma_synchronous).

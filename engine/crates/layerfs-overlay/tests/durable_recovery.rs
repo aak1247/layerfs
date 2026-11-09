@@ -225,11 +225,15 @@ fn legacy_durable_database_reopens_without_implicit_conversion() {
 fn durable_binding_never_follows_an_unrecorded_install() {
     let fixture = Fixture::new();
     let db = create(&fixture.path());
+    assert!(db.require_recorded_recovery_ready().is_err());
     db.initialize_durable_binding(ROOT, b"original snapshot")
         .unwrap();
+    db.require_recorded_recovery_ready().unwrap();
     assert!(db.initialize_durable_binding(ROOT, b"replacement").is_err());
     let capture = db.capture().unwrap();
+    assert!(db.require_recorded_recovery_ready().is_err());
     db.install(capture, [18; 32]).unwrap();
+    assert!(db.require_recorded_recovery_ready().is_err());
     assert!(matches!(
         db.durable_binding(),
         Err(OverlayError::Invalid(
@@ -240,6 +244,7 @@ fn durable_binding_never_follows_an_unrecorded_install() {
     db.install_recorded(resolved, [19; 32], b"resolved snapshot")
         .unwrap();
     assert_eq!(db.durable_binding().unwrap().unwrap(), b"resolved snapshot");
+    db.require_recorded_recovery_ready().unwrap();
     db.close_database().unwrap();
 }
 
@@ -335,11 +340,14 @@ fn durable_overlay_retains_uncertain_capture_and_volatile_owners() {
     for capture in [false, true] {
         let fixture = Fixture::new();
         let db = create(&fixture.path());
+        db.initialize_durable_binding(ROOT, b"original snapshot")
+            .unwrap();
         if capture {
             db.capture().unwrap();
         } else {
             db.acquire_operation(7).unwrap();
         }
+        assert!(db.require_recorded_recovery_ready().is_err());
         drop(db);
         assert!(matches!(
             Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY),

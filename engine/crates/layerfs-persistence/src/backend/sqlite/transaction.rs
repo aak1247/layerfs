@@ -15,7 +15,7 @@ pub(crate) struct Transaction<'a> {
     uncertain: Cell<bool>,
     owner: &'a Session,
 }
-struct RetainOnPanic<'a>(&'a Session);
+pub(super) struct RetainOnPanic<'a>(pub(super) &'a Session);
 impl Drop for RetainOnPanic<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {

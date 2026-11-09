@@ -68,6 +68,8 @@ pub struct MergeCounters {
 /// composition owns that selection; this adapter knows only the public ports.
 pub struct Store {
     pub(super) writer: Arc<dyn PackPersistence>,
+    /// Only the concrete validated bootstrap can supply this Linux writer.
+    pub(super) durable_writer: Option<Arc<layerfs_persistence::StorageProvider>>,
     pub(super) history: Arc<dyn HistoryCatalog>,
     pub(super) readers: Arc<ReadSet>,
     policy: StoragePolicy,
@@ -112,6 +114,7 @@ impl Store {
         let readers = ReadSet::new(control, factory, counts.clone(), workspace_capacity, policy);
         Ok(Self {
             writer,
+            durable_writer: None,
             history,
             readers,
             policy,
@@ -127,6 +130,13 @@ impl Store {
             merge_scratch: None,
             merge_work: Mutex::default(),
         })
+    }
+    pub(crate) fn with_durable_writer(
+        mut self,
+        writer: Arc<layerfs_persistence::StorageProvider>,
+    ) -> Self {
+        self.durable_writer = Some(writer);
+        self
     }
     /// Merge build records over the Store's writable session (#355).
     #[must_use]

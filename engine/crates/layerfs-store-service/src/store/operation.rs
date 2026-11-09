@@ -21,6 +21,7 @@ pub struct StoreOperation {
     ports: Arc<StorePorts>,
     client: Arc<CanonicalClient>,
     owner: OwnerClient,
+    durable_writer: Option<Arc<layerfs_persistence::StorageProvider>>,
 }
 impl BoundWorkspace {
     /// Terminal local close, then the Workspace's opened Store reader.
@@ -43,6 +44,7 @@ impl BoundWorkspace {
             ports,
             client,
             owner: self.owner.clone(),
+            durable_writer: self.store.durable_writer.clone(),
         })
     }
     pub fn snapshot(&self) -> WorkspaceResult<BranchSnapshot> {
@@ -71,8 +73,31 @@ impl BoundWorkspace {
             .durable_identity()
             .map_or(true, |identity| identity.is_some())
     }
+    /// True only for a concrete Linux Durable Store opened by this adapter.
+    pub fn has_durable_store(&self) -> bool {
+        self.store.durable_writer.is_some()
+    }
 }
 impl StoreOperation {
+    /// Verify the concrete Store under its original writer ownership.
+    pub fn durable_barrier(&self) -> Result<(), layerfs_storage::port::PersistenceError> {
+        self.durable_writer
+            .as_ref()
+            .ok_or(layerfs_storage::port::PersistenceError::Malformed)?
+            .durable_barrier()
+    }
+    /// A cancellable readiness wait followed by the Store's original barrier.
+    pub fn durable_barrier_cancellable(
+        &self,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(), layerfs_persistence::DurableBarrierError> {
+        self.durable_writer
+            .as_ref()
+            .ok_or(layerfs_persistence::DurableBarrierError::Failed(
+                layerfs_storage::port::PersistenceError::Malformed,
+            ))?
+            .durable_barrier_cancellable(stopped)
+    }
     pub fn client_handle(&self) -> Arc<CanonicalClient> {
         self.client.clone()
     }

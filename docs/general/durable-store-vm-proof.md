@@ -55,6 +55,14 @@ kernel; raw SQLite clients can bypass the cooperative lock. It does not make
 an earlier write, acknowledged before this check existed, retroactively durable.
 The per-transaction directory-sync cost has not been benchmarked.
 
+A concrete Linux Durable writer also offers a checked Store barrier for a
+separately synchronized Workspace. Its initial Store installation must already
+have synchronized the file and directory. A caller may cancel while waiting
+for the FIFO publication lane or another process's directory lock; after the
+sync starts, the caller gets its original success or uncertainty. Tests cover
+both waits and an injected failure whose stop signal arrives during the sync.
+This is not yet a successful FUSE `fsync` acknowledgement.
+
 Injected `EIO` tests cover ordinary writes, writes inside a publication lane,
 and the post-close seal. They verify no success acknowledgement, retained
 writer ownership after handle drops, and reopening after the owner process exits.

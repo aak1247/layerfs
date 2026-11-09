@@ -64,6 +64,29 @@ impl Writer {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn acquire_file_cancellable(
+        mut file: File,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Self, BackendError> {
+        loop {
+            if stopped() {
+                return Err(BackendError::Cancelled);
+            }
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Ok(Self { lock }),
+                Err((returned, error)) if error == Errno::EWOULDBLOCK => {
+                    file = returned;
+                    // Readiness only: no transaction or synchronization has
+                    // been attempted while the prior owner holds the lock.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err((_, Errno::EINTR)) => return Err(BackendError::Cancelled),
+                Err(_) => return Err(BackendError::Integrity),
+            }
+        }
+    }
+
     pub(crate) fn release(self) -> Result<(), Self> {
         #[cfg(target_os = "linux")]
         {

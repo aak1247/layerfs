@@ -12,6 +12,20 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 const APPLICATION_ID: i64 = 1_279_676_211;
 
+/// Reconciliation conditions shared by reopening and the recorded barrier.
+pub(super) const BOUND_PENDING_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM fs_inode WHERE generation=-1)\
+     OR EXISTS(SELECT 1 FROM fs_data WHERE generation=-1)\
+     OR EXISTS(SELECT 1 FROM fs_data_ref WHERE generation=-1)\
+     OR EXISTS(SELECT 1 FROM fs_truncate WHERE generation=-1)\
+     OR EXISTS(SELECT 1 FROM commit_record)\
+     OR EXISTS(SELECT 1 FROM cleanup_task WHERE ready=0)\
+     OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind IN(1,2,6,7,8,9,10,11))\
+     OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource>0)\
+     OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource=0 AND target<=0)\
+     OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource=0 AND \
+        target>(SELECT installed FROM durable_state WHERE id=1))";
+
 /// The separate owner file is never deleted or replaced by this engine.
 pub(crate) struct Lease {
     #[cfg(target_os = "linux")]
@@ -420,14 +434,7 @@ mod linux {
             false
         };
         let pending_sql = if bound {
-            "SELECT EXISTS(SELECT 1 FROM fs_inode WHERE generation=-1)\
-             OR EXISTS(SELECT 1 FROM fs_data WHERE generation=-1)\
-             OR EXISTS(SELECT 1 FROM fs_data_ref WHERE generation=-1)\
-             OR EXISTS(SELECT 1 FROM fs_truncate WHERE generation=-1)\
-             OR EXISTS(SELECT 1 FROM commit_record)\
-             OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind NOT IN(3,4,5,12) OR ready<>1 \
-                OR (kind=3 AND (resource<>0 OR target<=0 OR \
-                    target>(SELECT installed FROM durable_state WHERE id=1))))"
+            BOUND_PENDING_SQL
         } else {
             "SELECT EXISTS(SELECT 1 FROM fs_inode WHERE generation=-1)\
              OR EXISTS(SELECT 1 FROM fs_data WHERE generation=-1)\

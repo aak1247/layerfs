@@ -58,6 +58,42 @@ impl Overlay {
         Ok(Some(snapshot))
     }
 
+    /// Check the same local reconciliation conditions required by recovery.
+    /// The caller still validates the recorded base against its durable Store
+    /// and must fence the previous mount and external operations after loss.
+    pub fn require_recorded_recovery_ready(&self) -> OverlayResult<()> {
+        self.available()?;
+        if self.transaction.get() != super::connection::Transaction::None {
+            return Err(OverlayError::Invalid("recovery check inside atomic job"));
+        }
+        if self.durable_binding()?.is_none() {
+            return Err(OverlayError::Invalid("durable binding is absent"));
+        }
+        let state = self.state()?;
+        if state.closed
+            || state.captured.is_some()
+            || state.consolidating.is_some()
+            || super::durable::volatile(self)
+        {
+            return Err(OverlayError::Invalid(
+                "durable overlay requires reconciliation",
+            ));
+        }
+        let pending = self.query(
+            StatementKind::Frontier,
+            super::durable::BOUND_PENDING_SQL,
+            &[],
+            0,
+            |row| row.get::<_, bool>(0),
+        )?;
+        if pending.as_slice() != [false] {
+            return Err(OverlayError::Invalid(
+                "durable overlay requires reconciliation",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn invalidate_durable_binding(&self, root: [u8; 32]) -> OverlayResult<()> {
         if self.durable.is_some() && self.profile.schema_version == 40 {
             self.execute(

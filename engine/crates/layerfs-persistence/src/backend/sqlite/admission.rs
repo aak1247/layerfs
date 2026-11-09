@@ -59,8 +59,26 @@ impl Admission {
     /// Waits, first come first served, for this connection's turn. Time spent
     /// queued is added to the calling thread's wait total for `kind`.
     pub(crate) fn enter(&self, kind: Wait) -> Result<Turn<'_>, BackendError> {
+        self.enter_with(kind, None)
+    }
+    /// A stopped mount may withdraw its still-unattempted queued request.
+    pub(crate) fn enter_cancellable(
+        &self,
+        kind: Wait,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Turn<'_>, BackendError> {
+        self.enter_with(kind, Some(stopped))
+    }
+    fn enter_with(
+        &self,
+        kind: Wait,
+        stopped: Option<&dyn Fn() -> bool>,
+    ) -> Result<Turn<'_>, BackendError> {
         let mut queue = self.queue.lock().map_err(|_| BackendError::Unknown)?;
         let thread = std::thread::current().id();
+        if stopped.is_some_and(|check| check()) {
+            return Err(BackendError::Cancelled);
+        }
         // The job in progress finishes, even after `close`.
         if queue.holder == Some(thread) {
             return Ok(Turn {
@@ -87,6 +105,11 @@ impl Admission {
         queue.pending.push_back(ticket);
         let _waited = Waited(Instant::now(), kind);
         loop {
+            if stopped.is_some_and(|check| check()) {
+                queue.pending.retain(|value| *value != ticket);
+                self.changed.notify_all();
+                return Err(BackendError::Cancelled);
+            }
             if queue.closed {
                 queue.pending.retain(|value| *value != ticket);
                 return Err(BackendError::Closed);
@@ -99,10 +122,16 @@ impl Admission {
                     nested: false,
                 });
             }
-            queue = self
-                .changed
-                .wait(queue)
-                .map_err(|_| BackendError::Unknown)?;
+            queue = if stopped.is_some() {
+                self.changed
+                    .wait_timeout(queue, std::time::Duration::from_millis(20))
+                    .map_err(|_| BackendError::Unknown)?
+                    .0
+            } else {
+                self.changed
+                    .wait(queue)
+                    .map_err(|_| BackendError::Unknown)?
+            };
         }
     }
 
