@@ -93,6 +93,7 @@ pub(crate) fn setup(private: [u8; 32], peer: [u8; 32], max_workspaces: u32) -> D
         },
         existing_store: None,
         fresh_workspace: None,
+        host_export: None,
     }
 }
 

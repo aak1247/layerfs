@@ -8,6 +8,7 @@ use std::fmt;
 const LEGACY_MAGIC: &[u8] = b"LFSD\x05";
 const PRECREATED_MAGIC: &[u8] = b"LFSD\x06";
 const MAGIC: &[u8] = b"LFSD\x07";
+const HOST_EXPORT_MAGIC: &[u8] = b"LFSD\x08";
 /// The daemon reads at most this many bytes from its private config file.
 pub const MAX_DAEMON_SETUP_BYTES: usize = 8192;
 /// Explicit daemon startup resources; these are windows/admission, not file caps.
@@ -80,6 +81,20 @@ impl FreshWorkspaceSetup {
         Ok(Some(volume.to_owned()))
     }
 }
+/// Identity of an explicitly provisioned host export, compared in the daemon's
+/// own mount namespace before it serves a Workspace. Mount IDs differ across
+/// namespaces and are deliberately not used as a cross-namespace identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostExportIdentity {
+    /// Host kernel boot identity as a lowercase UUID.
+    pub boot_id: String,
+    /// Device of the exported directory as observed on the host.
+    pub device: u64,
+    /// Inode of the exported directory as observed on the host.
+    pub inode: u64,
+    /// Shared mount propagation group expected in both namespaces.
+    pub shared_peer: u64,
+}
 /// Private configuration for one real daemon; caller supplies all policy/resource values.
 #[derive(Clone, Eq, PartialEq)]
 pub struct DaemonSetup {
@@ -106,12 +121,19 @@ pub struct DaemonSetup {
     pub existing_store: Option<StoreManifest>,
     /// Creates a new durable Workspace catalog. None keeps disposable overlays.
     pub fresh_workspace: Option<FreshWorkspaceSetup>,
+    /// Requires verification of an explicitly bound host export root. None
+    /// preserves the existing container-local mount behavior and wire format.
+    pub host_export: Option<HostExportIdentity>,
 }
 impl DaemonSetup {
     /// Encodes one bounded private config. No operation/flow byte limit is implied.
     pub fn encode(&self) -> Result<Vec<u8>, ControlError> {
         self.check()?;
-        let mut out = Writer::new(MAGIC);
+        let mut out = Writer::new(if self.host_export.is_some() {
+            HOST_EXPORT_MAGIC
+        } else {
+            MAGIC
+        });
         for v in [&self.listen, &self.store, &self.overlay, &self.mounts] {
             out.blob(v.as_bytes())?;
         }
@@ -139,6 +161,12 @@ impl DaemonSetup {
             out.blob(value.overlay_directory.as_bytes())?;
             out.byte(u8::from(value.create_directories))?;
         }
+        if let Some(value) = &self.host_export {
+            out.blob(value.boot_id.as_bytes())?;
+            out.put(&value.device.to_be_bytes())?;
+            out.put(&value.inode.to_be_bytes())?;
+            out.put(&value.shared_peer.to_be_bytes())?;
+        }
         if out.0.len() > MAX_DAEMON_SETUP_BYTES {
             return Err(ControlError("daemon config size"));
         }
@@ -151,12 +179,15 @@ impl DaemonSetup {
         }
         let legacy = bytes.starts_with(LEGACY_MAGIC);
         let precreated = bytes.starts_with(PRECREATED_MAGIC);
+        let host_export = bytes.starts_with(HOST_EXPORT_MAGIC);
         let mut input = Reader::new(
             bytes,
             if legacy {
                 LEGACY_MAGIC
             } else if precreated {
                 PRECREATED_MAGIC
+            } else if host_export {
+                HOST_EXPORT_MAGIC
             } else {
                 MAGIC
             },
@@ -211,6 +242,16 @@ impl DaemonSetup {
                 _ => return Err(ControlError("daemon fresh Workspace boolean")),
             }
         };
+        let host_export = if host_export {
+            Some(HostExportIdentity {
+                boot_id: input.text(36)?,
+                device: u64::from_be_bytes(input.array()?),
+                inode: u64::from_be_bytes(input.array()?),
+                shared_peer: u64::from_be_bytes(input.array()?),
+            })
+        } else {
+            None
+        };
         input.finish()?;
         let value = Self {
             listen,
@@ -224,6 +265,7 @@ impl DaemonSetup {
             limits,
             existing_store,
             fresh_workspace,
+            host_export,
         };
         value.check()?;
         Ok(value)
@@ -255,6 +297,22 @@ impl DaemonSetup {
         let l = self.limits;
         if l.handshake_ms == 0 || l.connections == 0 || l.namespaces == 0 || l.pager_kib == 0 {
             return Err(ControlError("daemon resources"));
+        }
+        if let Some(export) = &self.host_export {
+            let boot = export.boot_id.as_bytes();
+            if boot.len() != 36
+                || !boot.iter().enumerate().all(|(i, byte)| {
+                    if [8, 13, 18, 23].contains(&i) {
+                        *byte == b'-'
+                    } else {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+                    }
+                })
+                || export.inode == 0
+                || export.shared_peer == 0
+            {
+                return Err(ControlError("host export identity"));
+            }
         }
         if let Some(m) = &self.existing_store {
             m.check().map_err(ControlError)?;
@@ -323,6 +381,7 @@ impl fmt::Debug for DaemonSetup {
             .field("limits", &self.limits)
             .field("existing_store", &self.existing_store)
             .field("fresh_workspace", &self.fresh_workspace)
+            .field("host_export", &self.host_export)
             .finish()
     }
 }

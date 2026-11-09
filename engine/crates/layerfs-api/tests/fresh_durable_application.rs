@@ -90,6 +90,7 @@ fn setup(f: &support::Fixture, label: &str) -> (DaemonSetup, PathBuf) {
             overlay_directory: f.directory.join("durable").to_str().unwrap().into(),
             create_directories: false,
         }),
+        host_export: None,
     };
     (setup, mounts)
 }

@@ -51,6 +51,15 @@ pub struct Application {
 }
 impl Application {
     pub(super) fn start(setup: DaemonSetup) -> Result<Arc<Self>, ApplicationError> {
+        // Until this application can retain and revalidate the host binding,
+        // accepting its identity as ordinary container-local setup would be
+        // an unsafe downgrade. Refuse before any Overlay or Store effect.
+        if setup.host_export.is_some() {
+            return Err(ApplicationError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "host Workspace export verification is not assembled",
+            )));
+        }
         let l = setup.limits;
         let usize_value = |n| {
             usize::try_from(n).map_err(|_| {

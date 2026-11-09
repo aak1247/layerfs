@@ -86,6 +86,7 @@ fn configure(f: &support::Fixture, deployment: &Deployment) -> PathBuf {
         },
         existing_store: deployment.existing_store.clone(),
         fresh_workspace: None,
+        host_export: None,
     };
     let config = f.directory.join("daemon.config");
     fs::write(&config, setup.encode().unwrap()).unwrap();

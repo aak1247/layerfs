@@ -38,6 +38,7 @@ fn setup(private: [u8; 32], peer: [u8; 32]) -> DaemonSetup {
         },
         existing_store: None,
         fresh_workspace: None,
+        host_export: None,
     }
 }
 fn ordinary(owner: &ManagedSandbox) -> Result<(), Box<dyn std::error::Error>> {

@@ -124,6 +124,7 @@ fn start(f: &support::Fixture, mounts: &Path) -> (Process, SocketAddr) {
         },
         existing_store: None,
         fresh_workspace: None,
+        host_export: None,
     };
     let config = f.directory.join("daemon.config");
     fs::write(&config, setup.encode().unwrap()).unwrap();

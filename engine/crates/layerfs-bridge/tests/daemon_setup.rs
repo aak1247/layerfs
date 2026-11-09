@@ -1,6 +1,6 @@
 //! Private startup configuration keeps older disposable records readable.
 use layerfs_bridge::{
-    daemon_setup::{DaemonLimits, DaemonSetup, FreshWorkspaceSetup},
+    daemon_setup::{DaemonLimits, DaemonSetup, FreshWorkspaceSetup, HostExportIdentity},
     provision::{ProviderKind, StoreManifest, StoreProfile},
 };
 
@@ -25,7 +25,49 @@ fn setup() -> DaemonSetup {
         },
         existing_store: None,
         fresh_workspace: None,
+        host_export: None,
     }
+}
+
+#[test]
+fn host_export_has_a_new_bounded_format_and_preserves_v7_without_it() {
+    let mut value = setup();
+    let ordinary = value.encode().unwrap();
+    assert_eq!(&ordinary[..5], b"LFSD\x07");
+    value.host_export = Some(HostExportIdentity {
+        boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+        device: 1031,
+        inode: 42,
+        shared_peer: 18,
+    });
+    let exported = value.encode().unwrap();
+    assert_eq!(&exported[..5], b"LFSD\x08");
+    assert_eq!(DaemonSetup::decode(&exported).unwrap(), value);
+    for end in 0..exported.len() {
+        assert!(DaemonSetup::decode(&exported[..end]).is_err());
+    }
+    let mut trailing = exported;
+    trailing.push(0);
+    assert!(DaemonSetup::decode(&trailing).is_err());
+    for invalid in [
+        "",
+        "01234567-89ab-cdef-0123-456789abcdeX",
+        "0123456789ab-cdef-0123-456789abcdef",
+    ] {
+        let mut changed = value.clone();
+        changed.host_export.as_mut().unwrap().boot_id = invalid.into();
+        assert!(changed.encode().is_err());
+    }
+    for invalid in [0, 1] {
+        let mut changed = value.clone();
+        if invalid == 0 {
+            changed.host_export.as_mut().unwrap().inode = 0;
+        } else {
+            changed.host_export.as_mut().unwrap().shared_peer = 0;
+        }
+        assert!(changed.encode().is_err());
+    }
+    assert_eq!(DaemonSetup::decode(&ordinary).unwrap().host_export, None);
 }
 
 #[test]

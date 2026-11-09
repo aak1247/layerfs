@@ -62,6 +62,7 @@ fn actual_daemon_install_hello_bind_status_no_constructor_and_session_end() {
         },
         existing_store: None,
         fresh_workspace: None,
+        host_export: None,
     };
     let config = f.directory.join("daemon.config");
     fs::write(&config, setup.encode().unwrap()).unwrap();
