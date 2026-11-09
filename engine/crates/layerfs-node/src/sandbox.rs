@@ -250,6 +250,8 @@ fn start_claimed(
                 image,
                 store_volume,
                 port: PORT,
+                #[cfg(target_os = "linux")]
+                host_export: None,
                 labels: labels(name, id),
             },
             setup: daemon_setup,

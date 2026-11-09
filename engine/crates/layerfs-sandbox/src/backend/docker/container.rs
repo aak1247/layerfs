@@ -35,6 +35,12 @@ impl SandboxRequest {
         w.write_all(b"],\"Mounts\":[{\"Type\":\"volume\",\"Source\":")?;
         quoted(w, &self.store_volume)?;
         w.write_all(b",\"Target\":\"/layerfs-store\",\"ReadOnly\":false,\"VolumeOptions\":{\"NoCopy\":true}}")?;
+        #[cfg(target_os = "linux")]
+        if let Some(export) = &self.host_export {
+            w.write_all(b",{\"Type\":\"bind\",\"Source\":")?;
+            quoted(w, export.root().path().to_str().expect("verified UTF-8"))?;
+            w.write_all(b",\"Target\":\"/workspaces\",\"ReadOnly\":false,\"BindOptions\":{\"Propagation\":\"rshared\"}}")?;
+        }
         w.write_all(b"],\"PortBindings\":{")?;
         quoted(w, &format!("{}/tcp", self.port))?;
         w.write_all(b":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"\"}]}}}")
@@ -100,6 +106,18 @@ impl Docker {
             phase = CreatePhase::Volume;
             self.plain_volume(&request.store_volume)?;
             phase = CreatePhase::Create;
+            #[cfg(target_os = "linux")]
+            if let Some(export) = &request.host_export {
+                export.reserve_create().map_err(|_| {
+                    super::http::failure(
+                        false,
+                        0,
+                        None,
+                        RuntimeError::Protocol("host export create admission"),
+                        None,
+                    )
+                })?;
+            }
             // `naming` admitted only characters that need no URL escape.
             let path = match &self.container_name {
                 Some(name) => format!("/containers/create?name={name}"),
@@ -171,6 +189,13 @@ impl Sandbox {
                 transfer: self.invalid("running command admission"),
             }));
         }
+        self.verify_export().map_err(|transfer| {
+            Box::new(super::ExecCreateFailure {
+                container: self.id,
+                request: request.clone(),
+                transfer,
+            })
+        })?;
         self.docker.create_exec(self.id, request)
     }
 
@@ -179,9 +204,11 @@ impl Sandbox {
         if !self.uploaded || self.start_attempted || self.delete_attempted || self.stop_attempted {
             return Err(self.invalid("original container Start admission"));
         }
+        self.verify_export()?;
         self.start_attempted = true;
         self.empty("POST", &format!("/containers/{}/start", self.id), 204)?;
         self.started = true;
+        self.verify_export()?;
         Ok(())
     }
     /// Explicit whole-Sandbox process stop, once. This is crash teardown, not graceful FS drain.
@@ -191,6 +218,7 @@ impl Sandbox {
         if self.stop_attempted || self.delete_attempted {
             return Err(self.invalid("original container Stop admission"));
         }
+        self.verify_export()?;
         self.stop_attempted = true;
         let path = format!("/containers/{}/stop?t={seconds}", self.id);
         self.empty("POST", &path, 204)
@@ -206,6 +234,7 @@ impl Sandbox {
         if self.delete_attempted || (self.start_attempted && !self.stopped) {
             return Err(self.invalid("original container Delete admission; known stop required"));
         }
+        self.verify_export()?;
         self.delete_attempted = true;
         self.empty(
             "DELETE",

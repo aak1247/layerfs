@@ -558,6 +558,8 @@ pub(crate) fn runtime(value: &SdkValue) -> Result<(Docker, ContainerId, SandboxR
         image: registry::text(value, "image")?.to_owned(),
         store_volume: registry::text(value, "volume")?.to_owned(),
         port: 30421,
+        #[cfg(target_os = "linux")]
+        host_export: None,
         // a record written before #373 has no labels, nor has its container
         labels: match value.get("labels") {
             Some(SdkValue::List(items)) => items

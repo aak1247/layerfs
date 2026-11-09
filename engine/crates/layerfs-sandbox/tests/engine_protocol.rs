@@ -27,6 +27,8 @@ fn sandbox_request() -> SandboxRequest {
         image: format!("sha256:{}", "d".repeat(64)),
         store_volume: "project-store".into(),
         port: 30421,
+        #[cfg(target_os = "linux")]
+        host_export: None,
         labels: vec![("layerfs.role".into(), "sandbox".into())],
     }
 }

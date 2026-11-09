@@ -105,6 +105,21 @@ fn lease_rechecks_freshness_after_the_original_observation() {
 }
 
 #[test]
+#[ignore = "requires root and a caller-owned group-restricted export"]
+fn held_lease_refuses_permission_widening() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let path = std::env::var_os("LAYERFS_EXPORT_ROOT").expect("owned export root");
+    let root = HostExportRoot::open_fresh(Path::new(&path)).unwrap();
+    let lease = HostExportLease::try_acquire(root).unwrap();
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode & 0o007, 0);
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode | 0o005)).unwrap();
+    let refused = lease.verify().is_err();
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    assert!(refused, "held export must refuse newly granted access");
+}
+
+#[test]
 #[ignore = "requires a separate root-owned test mount in a parent propagation group"]
 fn refuses_parent_propagation_group() {
     let path = std::env::var_os("LAYERFS_EXPORT_BAD_GROUP").expect("owned bad-group root");

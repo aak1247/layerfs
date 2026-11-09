@@ -10,6 +10,9 @@ pub struct SandboxRequest {
     /// Container labels (`layerfs.project`, for instance): each key once.
     /// A reopened container must carry every one; the image may add more.
     pub labels: Vec<(String, String)>,
+    /// One live, exclusively leased host export; only one create may use it.
+    #[cfg(target_os = "linux")]
+    pub host_export: Option<std::sync::Arc<crate::export_lease::HostExportLease>>,
 }
 /// A Docker volume name, short enough for the inspection to compare it whole.
 fn volume_name(name: &str) -> bool {
@@ -53,6 +56,12 @@ impl SandboxRequest {
                 return Err(RuntimeError::Protocol("container label"));
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Some(export) = &self.host_export {
+            export
+                .verify()
+                .map_err(|_| RuntimeError::Protocol("host export lease"))?;
+        }
         Ok(())
     }
 }
@@ -87,6 +96,15 @@ pub struct Sandbox {
     pub(super) deleted: bool,
 }
 impl Sandbox {
+    pub(super) fn verify_export(&self) -> Result<(), Box<WireFailure>> {
+        #[cfg(target_os = "linux")]
+        if let Some(export) = &self.request.host_export {
+            export
+                .verify()
+                .map_err(|_| self.invalid("host export lease changed"))?;
+        }
+        Ok(())
+    }
     /// Original full acknowledged identity. Names and partial IDs are never adopted.
     pub fn identity(&self) -> ContainerId {
         self.id

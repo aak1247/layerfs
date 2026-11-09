@@ -315,6 +315,8 @@ pub(crate) fn start(
                 image: inputs.image,
                 store_volume: inputs.volume,
                 port: PORT,
+                #[cfg(target_os = "linux")]
+                host_export: None,
                 labels: sandbox::labels(&project_name, &journal.dirs.id),
             },
             setup,

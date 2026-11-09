@@ -4,7 +4,11 @@ use nix::{
     fcntl::{open, Flock, FlockArg, OFlag},
     sys::stat::Mode,
 };
-use std::{fs::File, io};
+use std::{
+    fs::File,
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 /// Holds an advisory lock on the export directory's actual inode. This only
 /// excludes other cooperating live owners; it is not a durable intent, an
@@ -13,6 +17,7 @@ use std::{fs::File, io};
 pub struct HostExportLease {
     root: HostExportRoot,
     lock: Flock<File>,
+    create_attempted: AtomicBool,
 }
 
 impl HostExportLease {
@@ -26,7 +31,11 @@ impl HostExportLease {
         root.matches_descriptor(&file)?;
         let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
             .map_err(|(_, error)| io::Error::from(error))?;
-        let lease = Self { root, lock };
+        let lease = Self {
+            root,
+            lock,
+            create_attempted: AtomicBool::new(false),
+        };
         lease.verify()?;
         lease.root.verify_fresh()?;
         Ok(lease)
@@ -43,4 +52,25 @@ impl HostExportLease {
         self.root.verify()?;
         self.root.matches_descriptor(&self.lock)
     }
+
+    pub(crate) fn reserve_create(&self) -> io::Result<()> {
+        self.verify()?;
+        self.root.verify_fresh()?;
+        self.create_attempted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "host export create already attempted",
+                )
+            })?;
+        self.root.verify_fresh()
+    }
 }
+
+impl PartialEq for HostExportLease {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+impl Eq for HostExportLease {}

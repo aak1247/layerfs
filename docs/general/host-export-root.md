@@ -1,14 +1,17 @@
 # Host export root admission
 
-Status: Linux host- and daemon-side validation primitives. They are not
-connected to SDK Sandbox creation, AutoTask, or a Kubernetes node service.
+Status: Linux host- and daemon-side validation and an explicit Rust Sandbox
+adapter. The JavaScript SDK, AutoTask, and a Kubernetes node service do not
+yet use the host export.
 
 `layerfs_sandbox::host_export::HostExportRoot::open_fresh` checks an explicitly
 provisioned, empty mount root before a trusted local adapter considers exposing
 Workspace mounts. It creates, mounts, changes and removes nothing. Every path
 component is opened with no symlink following; the held descriptors must name
 root-owned directories without group or other write permission, in the initial
-user namespace. The final directory must be traversable by ordinary consumers.
+user namespace. Provision the final directory with only the intended consumer
+access, for example a dedicated group and mode `0750`; it need not be open to
+all host users. The checking process must itself be able to read the directory.
 
 The root must be an exact, unstacked shared mount in the caller's current mount
 namespace, with a propagation peer distinct from its parent and every other
@@ -19,7 +22,8 @@ child mounts. This rejects the duplicate-propagation setup observed in the
 The guard retains the ancestor descriptors and the observed boot, directory,
 mount and peer identifiers. `verify` reopens and compares each named ancestor
 against its held descriptor, including its kernel mount ID, and rechecks the
-propagation topology. `reopen` compares saved fields, but a match after the guard
+original ownership and mode of each component and the propagation topology.
+`reopen` compares saved fields, but a match after the guard
 has been lost does **not** prove uninterrupted identity: kernel identifiers can
 be reused. A match is not an owner-exit proof or an authorization to replay a
 mount, close, commit or other operation.
@@ -57,6 +61,22 @@ consumer exit, or authorize adoption or recovery after a crash. A lifecycle
 adapter must retain both its lease and its separate durable evidence, including
 when a create or close result is unknown.
 
+The Rust Docker adapter accepts one live lease as an explicit Sandbox creation
+input, consumes it for at most one Create attempt, and retains it in the
+original runtime owner. The deployment setup must name the same host identity;
+the adapter checks the Engine's exact source, destination, read/write state and
+`rshared` propagation, along with its existing topology checks. The startup
+archive omits the export mountpoint itself: writing a directory header there
+would let Docker change the host directory's ownership and permissions. The
+adapter verifies the lease during startup and refuses an exported Sandbox
+reopen until an independent fenced recovery protocol exists.
+
+This low-level adapter does not yet provide a durable, globally exclusive
+export claim across controller crashes, host-path mapping or host guard checks
+around every Workspace operation. A caller must supply and retain those
+authorities itself. In particular, a released advisory lock does not prove
+that an old daemon, mount or external consumer has stopped.
+
 External tests used separate, newly provisioned mount roots on the local host.
 They verified an isolated shared root, a path containing a space, refusal of a
 root in its parent's peer group, refusal of a nonempty fresh root, and failure
@@ -76,7 +96,12 @@ normally closed. In a second run, changing the producer's propagation caused
 the first recorded close to retain its original connection; the next close was
 refused by that pending intent. After the test owner and consumer exited, only
 the exact test mounts were normally unmounted. These are manually assembled
-Service proofs, not SDK or AutoTask integration or automatic recovery.
+Service proofs. A separate real Rust `SandboxApi` Docker run used a `0750`
+root owned by root and the authorized user's group: the matching host and
+container identities accessed a Workspace, an unrelated uid without that
+group could not traverse or read it, and the root's ownership and mode stayed
+unchanged through startup and normal close. That run used a Disposable Store;
+it is not JavaScript SDK or AutoTask integration or automatic recovery.
 
 An adapter still needs its own exclusive lifecycle authority, a durable intent
 and receipt, proof that its Docker or node runtime addresses this same root,

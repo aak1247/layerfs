@@ -81,6 +81,20 @@ fn daemon_refuses_a_later_propagation_change() {
 }
 
 #[test]
+#[ignore = "requires root and a caller-owned group-restricted export"]
+fn daemon_refuses_permission_widening() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = env::var("LAYERFS_TEST_EXPORT_PATH").unwrap();
+    let guard = ContainerExportRoot::open_fresh(Path::new(&path), &expected()).unwrap();
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode & 0o007, 0);
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode | 0o005)).unwrap();
+    let refused = guard.verify().is_err();
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    assert!(refused, "daemon must refuse newly granted access");
+}
+
+#[test]
 #[ignore = "requires a caller-owned shared export and a FUSE-capable container"]
 fn configured_daemon_starts_with_the_verified_export() {
     let directory = env::temp_dir().join(format!("layerfs-export-start-{}", std::process::id()));

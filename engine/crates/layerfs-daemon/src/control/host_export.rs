@@ -20,6 +20,7 @@ use std::{
 pub struct ContainerExportRoot {
     path: PathBuf,
     directories: Vec<File>,
+    permissions: Vec<(u32, u32, u32)>,
     expected: HostExportIdentity,
     mount_id: u64,
 }
@@ -32,6 +33,10 @@ impl ContainerExportRoot {
     /// The caller retains this guard for the whole daemon lifetime.
     pub fn open_fresh(path: &Path, expected: &HostExportIdentity) -> io::Result<Self> {
         let directories = open_chain(path)?;
+        let permissions = directories
+            .iter()
+            .map(|directory| directory.metadata().map(|value| permissions(&value)))
+            .collect::<io::Result<_>>()?;
         let mount_id = observe(path, &directories, expected)?;
         if fs::read_dir(path)?.next().transpose()?.is_some()
             || mount_entries()?
@@ -43,6 +48,7 @@ impl ContainerExportRoot {
         let guard = Self {
             path: path.to_owned(),
             directories,
+            permissions,
             expected: expected.clone(),
             mount_id,
         };
@@ -57,11 +63,15 @@ impl ContainerExportRoot {
         if current.len() != self.directories.len() {
             return Err(invalid("host Workspace export directory chain changed"));
         }
-        for (held, named) in self.directories.iter().zip(&current) {
+        for ((held, named), expected) in
+            self.directories.iter().zip(&current).zip(&self.permissions)
+        {
             let old = held.metadata()?;
             let new = named.metadata()?;
             check_directory(&old)?;
-            if old.dev() != new.dev()
+            if permissions(&old) != *expected
+                || permissions(&new) != *expected
+                || old.dev() != new.dev()
                 || old.ino() != new.ino()
                 || descriptor_mount_id(held)? != descriptor_mount_id(named)?
             {
@@ -128,7 +138,7 @@ fn open_chain(path: &Path) -> io::Result<Vec<File>> {
         }
     }
     let leaf = directories.last().expect("root is held").metadata()?;
-    if directories.len() < 2 || leaf.mode() & 0o705 != 0o705 {
+    if directories.len() < 2 || leaf.mode() & 0o700 != 0o700 {
         return Err(invalid("host Workspace export access"));
     }
     Ok(directories)
@@ -139,6 +149,10 @@ fn check_directory(metadata: &Metadata) -> io::Result<()> {
         return Err(invalid("host Workspace export ownership or mode"));
     }
     Ok(())
+}
+
+fn permissions(metadata: &Metadata) -> (u32, u32, u32) {
+    (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777)
 }
 
 fn observe(path: &Path, directories: &[File], expected: &HostExportIdentity) -> io::Result<u64> {

@@ -442,6 +442,20 @@ fn create_observed(
     let mut observed = None;
     let result = (|| {
         let config = request.setup.encode().map_err(SandboxCause::Setup)?;
+        #[cfg(target_os = "linux")]
+        let export_matches = match (&request.deployment.host_export, &request.setup.host_export) {
+            (None, None) => true,
+            (Some(lease), Some(expected)) => {
+                let observed = lease.root().identity();
+                observed.boot_id == expected.boot_id
+                    && observed.device == expected.device
+                    && observed.inode == expected.inode
+                    && observed.shared_peer == expected.shared_peer
+            }
+            _ => false,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let export_matches = request.setup.host_export.is_none();
         if let Some(fresh) = &request.setup.fresh_workspace {
             let volume = std::path::Path::new("/layerfs-store");
             if fresh
@@ -462,7 +476,8 @@ fn create_observed(
                 }
             }
         }
-        if request.setup.listen != format!("0.0.0.0:{}", request.deployment.port)
+        if !export_matches
+            || request.setup.listen != format!("0.0.0.0:{}", request.deployment.port)
             || request.setup.store != "/layerfs-store/global/store.sqlite"
             || request.setup.overlay != "/layerfs-local/overlay/overlay.sqlite"
             || request.setup.mounts != "/workspaces"
@@ -565,6 +580,11 @@ fn create_observed(
         observed = Some(status.clone());
         if status.phase != expected {
             return Err(SandboxCause::Setup(ControlError("original startup phase")));
+        }
+        #[cfg(target_os = "linux")]
+        if request.deployment.host_export.is_some() {
+            phase = SandboxPhase::Endpoint;
+            owner.endpoint().map_err(SandboxCause::Runtime)?;
         }
         phase = SandboxPhase::Record;
         record(

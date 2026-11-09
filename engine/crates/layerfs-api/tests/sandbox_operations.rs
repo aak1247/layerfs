@@ -145,6 +145,8 @@ impl Fixture {
                 image: IMAGE.into(),
                 store_volume: "lfs-test-borrowed".into(),
                 port: 30421,
+                #[cfg(target_os = "linux")]
+                host_export: None,
                 labels: vec![],
             },
             setup: deployment_setup,
@@ -443,6 +445,8 @@ fn create_mismatched_existing_project_refuses_before_any_deployment_or_control_e
                 image: IMAGE.into(),
                 store_volume: "lfs-test-borrowed".into(),
                 port: 30421,
+                #[cfg(target_os = "linux")]
+                host_export: None,
                 labels: vec![],
             },
             setup: deployment_setup,
@@ -459,6 +463,92 @@ fn create_mismatched_existing_project_refuses_before_any_deployment_or_control_e
     };
     assert_eq!(failure.phase, SandboxPhase::Validate);
     assert!(failure.sandbox.is_none() && failure.control.is_none() && failure.installed.is_none());
+    assert!(peer.finish().is_empty());
+}
+
+#[test]
+fn host_export_setup_without_its_lease_is_refused_before_deployment() {
+    let project = ProjectFixture::new();
+    let (docker, peer) = Peer::new(vec![], 4096);
+    let mut deployment_setup = setup([32; 32], duplex::public_key(&[31; 32]).unwrap());
+    deployment_setup.host_export = Some(layerfs_bridge::daemon_setup::HostExportIdentity {
+        boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+        device: 1,
+        inode: 2,
+        shared_peer: 3,
+    });
+    let result = SandboxApi::new(docker).create(
+        SandboxCreate {
+            deployment: layerfs_sandbox::backend::docker::SandboxRequest {
+                image: IMAGE.into(),
+                store_volume: "lfs-test-borrowed".into(),
+                port: 30421,
+                #[cfg(target_os = "linux")]
+                host_export: None,
+                labels: vec![],
+            },
+            setup: deployment_setup,
+            executable: project.project.store.path.clone(),
+            controller_private: [31; 32],
+            daemon_peer: duplex::public_key(&[32; 32]).unwrap(),
+            startup_wait: Duration::from_secs(2),
+            connect_host: None,
+        },
+        &project.project,
+    );
+    let Err(failure) = result else {
+        panic!("unleased export must be refused before effects")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Validate);
+    assert!(matches!(failure.cause, SandboxCause::Setup(_)));
+    assert!(failure.sandbox.is_none() && failure.control.is_none());
+    assert!(peer.finish().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a caller-owned empty shared host export"]
+fn host_export_setup_with_a_different_identity_is_refused_before_deployment() {
+    use layerfs_sandbox::{export_lease::HostExportLease, host_export::HostExportRoot};
+    use std::sync::Arc;
+    let root = std::env::var_os("LAYERFS_EXPORT_ROOT").unwrap();
+    let lease = Arc::new(
+        HostExportLease::try_acquire(HostExportRoot::open_fresh(root.as_ref()).unwrap()).unwrap(),
+    );
+    let observed = lease.root().identity();
+    let project = ProjectFixture::new();
+    let (docker, peer) = Peer::new(vec![], 4096);
+    let mut deployment_setup = setup([32; 32], duplex::public_key(&[31; 32]).unwrap());
+    deployment_setup.host_export = Some(layerfs_bridge::daemon_setup::HostExportIdentity {
+        boot_id: observed.boot_id.clone(),
+        device: observed.device,
+        inode: observed.inode ^ 1,
+        shared_peer: observed.shared_peer,
+    });
+    let result = SandboxApi::new(docker).create(
+        SandboxCreate {
+            deployment: layerfs_sandbox::backend::docker::SandboxRequest {
+                image: IMAGE.into(),
+                store_volume: "lfs-test-borrowed".into(),
+                port: 30421,
+                host_export: Some(lease),
+                labels: vec![],
+            },
+            setup: deployment_setup,
+            executable: project.project.store.path.clone(),
+            controller_private: [31; 32],
+            daemon_peer: duplex::public_key(&[32; 32]).unwrap(),
+            startup_wait: Duration::from_secs(2),
+            connect_host: None,
+        },
+        &project.project,
+    );
+    let Err(failure) = result else {
+        panic!("mismatched export must be refused before effects")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Validate);
+    assert!(matches!(failure.cause, SandboxCause::Setup(_)));
+    assert!(failure.sandbox.is_none() && failure.control.is_none());
     assert!(peer.finish().is_empty());
 }
 
@@ -480,6 +570,8 @@ fn fresh_durable_workspace_outside_store_volume_refuses_before_deployment() {
                 image: IMAGE.into(),
                 store_volume: "lfs-test-borrowed".into(),
                 port: 30421,
+                #[cfg(target_os = "linux")]
+                host_export: None,
                 labels: vec![],
             },
             setup: deployment_setup,
@@ -520,6 +612,8 @@ fn created_workspace_must_use_the_actual_docker_volume_root() {
                 image: IMAGE.into(),
                 store_volume: "lfs-test-borrowed".into(),
                 port: 30421,
+                #[cfg(target_os = "linux")]
+                host_export: None,
                 labels: vec![],
             },
             setup: deployment_setup,
@@ -554,6 +648,8 @@ fn lifecycle_observer_failure_before_start_keeps_original_container() {
             image: IMAGE.into(),
             store_volume: "lfs-test-borrowed".into(),
             port: 30421,
+            #[cfg(target_os = "linux")]
+            host_export: None,
             labels: vec![],
         },
         setup: setup([32; 32], duplex::public_key(&[31; 32]).unwrap()),
@@ -662,6 +758,8 @@ fn lifecycle_observer_failure_after_hello_keeps_control_and_original_status() {
             image: IMAGE.into(),
             store_volume: "lfs-test-borrowed".into(),
             port: 30421,
+            #[cfg(target_os = "linux")]
+            host_export: None,
             labels: vec![],
         },
         setup: deployment_setup,

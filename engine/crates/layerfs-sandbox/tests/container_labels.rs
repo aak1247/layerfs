@@ -32,6 +32,8 @@ fn request(labels: &[(&str, &str)]) -> SandboxRequest {
         image: IMAGE.into(),
         store_volume: "lfs-test-borrowed".into(),
         port: 30421,
+        #[cfg(target_os = "linux")]
+        host_export: None,
         labels: (labels.iter())
             .map(|(k, v)| ((*k).into(), (*v).into()))
             .collect(),
@@ -92,6 +94,87 @@ fn inspect(
     (accepted, peer.finish())
 }
 const ALL: &str = r#"{"org.opencontainers.image.title":"layerfs-runtime","layerfs.sandbox":"2","layerfs.project":"shop","layerfs.role":"sandbox"}"#;
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a caller-owned empty shared host export"]
+fn exported_root_is_single_use_and_requires_exact_docker_mount_topology() {
+    use layerfs_sandbox::{
+        backend::docker::Sandbox, export_lease::HostExportLease, host_export::HostExportRoot,
+        ContainerId,
+    };
+    use std::sync::Arc;
+    let path = std::env::var("LAYERFS_EXPORT_ROOT").unwrap();
+    assert!(path
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"/-_".contains(&byte)));
+    let lease = Arc::new(
+        HostExportLease::try_acquire(HostExportRoot::open_fresh(path.as_ref()).unwrap()).unwrap(),
+    );
+    let mut request = request(&[]);
+    request.host_export = Some(lease);
+    let bind = format!(
+        r#"{{"Type":"bind","Source":"{path}","Destination":"/workspaces","Mode":"","RW":true,"Propagation":"rshared"}}"#
+    );
+    let wrong = bind.replace("rshared", "rprivate");
+    let wrong_mode = bind.replace(r#""Mode":"""#, r#""Mode":"z""#);
+    let (docker, peer) = Peer::new(
+        vec![
+            volume("lfs-test-borrowed"),
+            created(),
+            volume("lfs-test-borrowed"),
+            fixed(200, b""),
+            fixed(204, b""),
+            inspection("null", &[STORE, &bind]),
+            inspection("null", &[STORE, &wrong]),
+            inspection("null", &[STORE, &wrong_mode]),
+        ],
+        8192,
+    );
+    let mut sandbox = docker.create_sandbox(request.clone()).unwrap();
+    assert!(docker.create_sandbox(request.clone()).is_err());
+    let executable =
+        std::env::temp_dir().join(format!("lfs-export-executable-{}", std::process::id()));
+    File::create(&executable)
+        .unwrap()
+        .write_all(b"test binary")
+        .unwrap();
+    sandbox
+        .upload(&mut File::open(&executable).unwrap(), b"private")
+        .unwrap();
+    sandbox.start().unwrap();
+    assert!(sandbox.endpoint().is_ok());
+    assert!(sandbox.endpoint().is_err());
+    assert!(sandbox.endpoint().is_err());
+    assert!(Sandbox::reopen(docker, ContainerId::parse(CID).unwrap(), request).is_err());
+    fs::remove_file(executable).unwrap();
+    let calls = peer.finish();
+    assert_eq!(calls.len(), 8);
+    let create = String::from_utf8_lossy(&calls[1]);
+    assert!(create.contains(&format!(r#"{{"Type":"bind","Source":"{path}","Target":"/workspaces","ReadOnly":false,"BindOptions":{{"Propagation":"rshared"}}}}"#)));
+    let upload = &calls[3];
+    let body = upload
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let tar = &upload[body..];
+    let mut cursor = 0;
+    while tar[cursor] != 0 {
+        let header = &tar[cursor..cursor + 512];
+        let end = header[..100].iter().position(|byte| *byte == 0).unwrap();
+        assert_ne!(&header[..end], b"workspaces/");
+        let size = u64::from_str_radix(std::str::from_utf8(&header[124..135]).unwrap(), 8).unwrap();
+        cursor += 512 + (size.div_ceil(512) * 512) as usize;
+    }
+    assert!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with(b"POST /v1.54/containers/create"))
+            .count()
+            == 1
+    );
+}
 
 #[test]
 fn labels_are_sent_at_create_and_found_in_any_order_beside_the_image_s() {

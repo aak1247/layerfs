@@ -104,6 +104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             image: args[2].clone(),
             store_volume: args[3].clone(),
             port: 30421,
+            #[cfg(target_os = "linux")]
+            host_export: None,
             labels: vec![],
         },
         setup,

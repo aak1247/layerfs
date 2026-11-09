@@ -62,18 +62,29 @@ fn source(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 /// What `find` must print inside the mount: every path, nothing else.
-fn listing() -> String {
+fn command_identity() -> layerfs_sandbox::CommandIdentity {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("LAYERFS_EXAMPLE_HOST_EXPORT").is_some() {
+        return layerfs_sandbox::CommandIdentity {
+            uid: nix::unistd::Uid::effective().as_raw(),
+            gid: nix::unistd::Gid::effective().as_raw(),
+        };
+    }
+    layerfs_sandbox::CommandIdentity { uid: 501, gid: 20 }
+}
+fn listing(identity: layerfs_sandbox::CommandIdentity) -> String {
+    let (uid, gid) = (identity.uid, identity.gid);
     let mut lines = vec![
-        "d 755 501 20 ./.git".to_owned(),
-        "d 755 501 20 ./node_modules".to_owned(),
-        "d 755 501 20 ./node_modules/pkg".to_owned(),
-        "f 640 501 20 ./alias".to_owned(),
-        "l 777 501 20 ./dependency".to_owned(),
+        format!("d 755 {uid} {gid} ./.git"),
+        format!("d 755 {uid} {gid} ./node_modules"),
+        format!("d 755 {uid} {gid} ./node_modules/pkg"),
+        format!("f 640 {uid} {gid} ./alias"),
+        format!("l 777 {uid} {gid} ./dependency"),
     ];
     lines.extend(
         FILES
             .iter()
-            .map(|(name, _, mode)| format!("f {mode:o} 501 20 ./{name}")),
+            .map(|(name, _, mode)| format!("f {mode:o} {uid} {gid} ./{name}")),
     );
     lines.sort();
     lines.join("\n") + "\n"
@@ -121,7 +132,7 @@ fn start(
         Directory::Mounted(mounted) => WorkspaceApi::exec(owner, mounted, arguments, vec![], false),
         Directory::Kernel(directory) => layerfs_api::internal::exec(
             &owner.runtime,
-            layerfs_sandbox::CommandIdentity { uid: 501, gid: 20 },
+            command_identity(),
             arguments,
             vec![],
             directory.into(),
@@ -193,7 +204,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::remove_dir_all(directory.join("source"))?;
     let keys = transport::generate_keypair()?;
     let daemon = transport::generate_keypair()?;
-    let api = SandboxApi::new(Docker::new(&args[1], Duration::from_secs(3))?);
+    let mut daemon_setup = setup(daemon.private, keys.public);
+    let identity = command_identity();
+    daemon_setup.command_uid = identity.uid;
+    daemon_setup.command_gid = identity.gid;
+    #[cfg(target_os = "linux")]
+    let host_export = match std::env::var_os("LAYERFS_EXAMPLE_HOST_EXPORT") {
+        Some(path) => {
+            let root = layerfs_sandbox::host_export::HostExportRoot::open_fresh(Path::new(&path))?;
+            let lease = std::sync::Arc::new(
+                layerfs_sandbox::export_lease::HostExportLease::try_acquire(root)?,
+            );
+            let identity = lease.root().identity();
+            daemon_setup.host_export = Some(layerfs_bridge::daemon_setup::HostExportIdentity {
+                boot_id: identity.boot_id.clone(),
+                device: identity.device,
+                inode: identity.inode,
+                shared_peer: identity.shared_peer,
+            });
+            Some(lease)
+        }
+        None => None,
+    };
+    let api = SandboxApi::new(Docker::new(&args[1], Duration::from_secs(30))?);
     let mut owner = api
         .create(
             SandboxCreate {
@@ -201,13 +234,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     image: args[2].clone(),
                     store_volume: args[3].clone(),
                     port: 30421,
+                    #[cfg(target_os = "linux")]
+                    host_export: host_export.clone(),
                     labels: vec![],
                 },
-                setup: setup(daemon.private, keys.public),
+                setup: daemon_setup,
                 executable: PathBuf::from(&args[4]),
                 controller_private: keys.private,
                 daemon_peer: daemon.public,
-                startup_wait: Duration::from_secs(3),
+                startup_wait: Duration::from_secs(30),
                 connect_host: None,
             },
             &project,
@@ -242,13 +277,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(mounted.ready.receipt.loops, 2);
     println!("KERNEL_READY {:?}", mounted.ready);
+    #[cfg(target_os = "linux")]
+    if let Some(export) = &host_export {
+        export.verify()?;
+        let host = export
+            .root()
+            .path()
+            .join(mounted.bound.token.namespace.to_string());
+        assert_eq!(fs::read(host.join("ignored.bin"))?, FILES[2].1);
+        export.verify()?;
+        println!("HOST_EXPORT_READ verified=true");
+    }
     mark("ready");
 
     // Environment and protection facts observed by an ordinary command.
+    let (uid, gid) = (identity.uid, identity.gid);
     let facts = run(
         &owner,
         &format!(
-            "set -e; test \"$(id -u):$(id -g):$(id -G)\" = 501:20:20; \
+            "set -e; test \"$(id -u):$(id -g):$(id -G)\" = {uid}:{gid}:{gid}; \
              grep -q '^CapEff:[[:space:]]*0000000000000000$' /proc/self/status; \
              grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status; \
              for p in /layerfs-local/config/daemon.setup /layerfs-local/overlay/overlay.sqlite \
@@ -258,14 +305,14 @@ fn main() -> Result<(), Box<dyn Error>> {
              ! (exec 3<>/dev/fuse) 2>/dev/null; test ! -w /sys/fs/fuse/connections; \
              mkdir {root}/made; printf abc > {root}/made/f; printf def >> {root}/made/f; \
              test \"$(cat {root}/made/f)\" = abcdef; mv {root}/made/f {root}/made/g; \
-             ln {root}/made/g {root}/made/h; test \"$(stat -c '%h %u' {root}/made/h)\" = '2 501'; \
+             ln {root}/made/g {root}/made/h; test \"$(stat -c '%h %u' {root}/made/h)\" = '2 {uid}'; \
              test \"$(dd if={root}/made/h iflag=direct status=none)\" = abcdef; \
              rm {root}/made/g {root}/made/h; rmdir {root}/made; test ! -e {root}/made; \
              ! mkfifo {root}/pipe 2>/dev/null; ! chmod 4755 {root}/ignored.bin 2>/dev/null; \
              printf 'KERNEL %s\\n' \"$(uname -r)\"; \
              printf 'DEVICE %s\\n' \"$(stat -c '%F %a %u:%g %t:%T' /dev/fuse)\"; \
              printf 'MOUNT %s\\n' \"$(grep ' {root} ' /proc/self/mountinfo)\"; \
-             printf 'ORDINARY_ACCESS uid=501 gid=20 CapEff=0 NoNewPrivs=1 private_backing_denied proc_aliases_denied fuse_device_denied mutation_served special_and_setid_refused\\n'"
+             printf 'ORDINARY_ACCESS uid={uid} gid={gid} CapEff=0 NoNewPrivs=1 private_backing_denied proc_aliases_denied fuse_device_denied mutation_served special_and_setid_refused\\n'"
         ),
         Directory::Kernel("/"),
     )?;
@@ -282,7 +329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "set -e; find . -mindepth 1 -printf '%y %m %U %G %p\\n' | LC_ALL=C sort",
         Directory::Mounted(&mounted),
     )?;
-    assert_eq!(String::from_utf8(listed)?, listing());
+    assert_eq!(String::from_utf8(listed)?, listing(identity));
     let links = run(
         &owner,
         "set -e; readlink dependency; stat -c '%s %h' file alias; \
@@ -414,7 +461,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     mark("container_deleted");
     println!("OWNED_CLEANUP container={container} disposition=Deleted_acknowledged_by_close");
     println!(
-        "KERNEL_FULL_TOPOLOGY host_init=true host_data_path=false named_volume={} root={:?} kernel_fuse=READ_WRITE mutation=RUN commit=NOT_RUN force_unmount=NOT_RUN durable=NOT_RUN",
+        "KERNEL_FULL_TOPOLOGY host_init=true named_volume={} root={:?} kernel_fuse=READ_WRITE mutation=RUN commit=NOT_RUN force_unmount=NOT_RUN durable=NOT_RUN",
         args[3], project.initialized.root
     );
     fs::remove_dir_all(directory)?;

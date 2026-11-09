@@ -20,6 +20,8 @@ fn request() -> SandboxRequest {
         image: IMAGE.into(),
         store_volume: "lfs-test-borrowed".into(),
         port: 30421,
+        #[cfg(target_os = "linux")]
+        host_export: None,
         labels: vec![],
     }
 }

@@ -31,6 +31,10 @@ impl Sandbox {
             .request
             .check()
             .map_err(|_| owner.invalid("saved deployment"))?;
+        #[cfg(target_os = "linux")]
+        if owner.request.host_export.is_some() {
+            return Err(owner.invalid("host export reopen requires fenced recovery"));
+        }
         owner.endpoint()?;
         Ok(owner)
     }
@@ -61,6 +65,7 @@ impl Sandbox {
         if !self.started || self.stop_attempted || self.delete_attempted {
             return Err(self.invalid("running endpoint admission"));
         }
+        self.verify_export()?;
         let mut r = self
             .docker
             .exchange(
@@ -235,10 +240,12 @@ impl Sandbox {
             }
             endpoint.ok_or(RuntimeError::Protocol("missing daemon endpoint"))
         })();
-        result.map_err(|e| {
+        let endpoint = result.map_err(|e| {
             let mut f = self.selected(r.fail(e, None));
             f.observed_container = observed;
             f
-        })
+        })?;
+        self.verify_export()?;
+        Ok(endpoint)
     }
 }

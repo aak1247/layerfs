@@ -152,38 +152,100 @@ pub(super) fn mounts<R: Read>(
     j: &mut Json<R>,
     request: &SandboxRequest,
 ) -> Result<bool, RuntimeError> {
-    let mut count = 0;
+    #[cfg(target_os = "linux")]
+    let export_path = request
+        .host_export
+        .as_ref()
+        .map(|value| value.root().path().to_str().expect("verified UTF-8"));
+    #[cfg(not(target_os = "linux"))]
+    let export_path: Option<&str> = None;
+    let mut volumes = 0;
+    let mut exports = 0;
     let mut valid = true;
     j.array(|j| {
-        count += 1;
         let mut bits = 0;
-        let (mut volume, mut name, mut destination, mut rw, mut local) =
-            (false, false, false, false, false);
+        let (
+            mut kind,
+            mut name,
+            mut destination,
+            mut rw,
+            mut local,
+            mut source,
+            mut propagation,
+            mut bind_mode,
+        ) = (
+            String::new(),
+            false,
+            String::new(),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         j.object(|j, key| {
             if key.equals("Type") {
                 once(&mut bits, 1)?;
-                volume = j.string_equals("volume")?;
+                let value = j.string(true)?;
+                if value.overflow {
+                    return Err(RuntimeError::Protocol("mount type width"));
+                }
+                kind = value.text().to_owned();
             } else if key.equals("Name") {
                 once(&mut bits, 2)?;
                 name = j.string_equals(&request.store_volume)?;
             } else if key.equals("Destination") {
                 once(&mut bits, 4)?;
-                destination = j.string_equals("/layerfs-store")?;
+                let value = j.string(true)?;
+                if value.overflow {
+                    return Err(RuntimeError::Protocol("mount destination width"));
+                }
+                destination = value.text().to_owned();
             } else if key.equals("RW") {
                 once(&mut bits, 8)?;
                 rw = j.boolean()?;
             } else if key.equals("Driver") {
                 once(&mut bits, 16)?;
                 local = j.string_equals("local")?;
+            } else if key.equals("Source") {
+                once(&mut bits, 32)?;
+                if let Some(path) = export_path {
+                    source = j.string_equals(path)?;
+                } else {
+                    j.skip(3)?;
+                }
+            } else if key.equals("Propagation") {
+                once(&mut bits, 64)?;
+                propagation = j.string_equals("rshared")?;
+            } else if key.equals("Mode") {
+                once(&mut bits, 128)?;
+                bind_mode = j.string_equals("")?;
             } else {
                 j.skip(3)?;
             }
             Ok(())
         })?;
-        valid &= bits == 31 && volume && name && destination && rw && local;
+        match kind.as_str() {
+            "volume" => {
+                volumes += 1;
+                valid &= bits & 31 == 31 && name && destination == "/layerfs-store" && rw && local;
+            }
+            "bind" => {
+                exports += 1;
+                valid &= export_path.is_some()
+                    && bits & (1 | 4 | 8 | 32 | 64 | 128) == (1 | 4 | 8 | 32 | 64 | 128)
+                    && bits & (2 | 16) == 0
+                    && destination == "/workspaces"
+                    && rw
+                    && source
+                    && propagation
+                    && bind_mode;
+            }
+            _ => valid = false,
+        }
         Ok(())
     })?;
-    Ok(valid && count == 1)
+    Ok(valid && volumes == 1 && exports == usize::from(export_path.is_some()))
 }
 fn strings<R: Read>(j: &mut Json<R>, expected: &[&str]) -> Result<bool, RuntimeError> {
     let mut index = 0;

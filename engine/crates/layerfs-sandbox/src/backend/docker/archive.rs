@@ -44,6 +44,7 @@ impl Sandbox {
             {
                 return Err(self.invalid("original upload admission"));
             }
+            self.verify_export()?;
             let metadata = executable
                 .metadata()
                 .map_err(|e| self.selected(super::http::failure(false, 0, None, e.into(), None)))?;
@@ -58,8 +59,13 @@ impl Sandbox {
                 return Err(self.invalid("deployment executable/config metadata"));
             }
             work.executable_bytes = metadata.len();
+            #[cfg(target_os = "linux")]
+            let create_mount_home = self.request.host_export.is_none();
+            #[cfg(not(target_os = "linux"))]
+            let create_mount_home = true;
+            let directories = DIRECTORIES.len() - usize::from(!create_mount_home);
             let length = 512u64
-                .checked_mul(DIRECTORIES.len() as u64 + 2)
+                .checked_mul(directories as u64 + 2)
                 .and_then(|v| v.checked_add(padded(metadata.len())?))
                 .and_then(|v| v.checked_add(padded(config.len() as u64)?))
                 .and_then(|v| v.checked_add(1024))
@@ -81,6 +87,7 @@ impl Sandbox {
                         executable,
                         metadata.len(),
                         config,
+                        create_mount_home,
                         out,
                         &mut work,
                         &mut pending_source,
@@ -102,6 +109,7 @@ impl Sandbox {
                 Err(e) => return Err(self.selected(response.fail(e.into(), None))),
             }
             self.uploaded = true;
+            self.verify_export()?;
             Ok(())
         })();
         result.map(|()| work).map_err(|transfer| {
@@ -117,6 +125,7 @@ fn encode(
     executable: &mut File,
     length: u64,
     config: &[u8],
+    create_mount_home: bool,
     out: &mut dyn Write,
     work: &mut UploadWork,
     pending: &mut crate::PendingRequest,
@@ -126,6 +135,9 @@ fn encode(
         count: &mut work.tar_encoded,
     };
     for (path, mode) in DIRECTORIES {
+        if path == "workspaces/" && !create_mount_home {
+            continue;
+        }
         out.write_all(&header(path, mode, 0, true)?)?;
     }
     out.write_all(&header(

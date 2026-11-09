@@ -35,13 +35,14 @@ pub struct ExportIdentity {
 pub struct HostExportRoot {
     path: PathBuf,
     directories: Vec<File>,
+    permissions: Vec<(u32, u32, u32)>,
     identity: ExportIdentity,
 }
 
 impl HostExportRoot {
     /// Checks an empty root-owned path with its own shared propagation group.
-    /// All ancestors must be root-owned and not writable by group or others.
-    /// The caller creates and configures the mount separately.
+    /// All ancestors must be root-owned and not writable by group or others;
+    /// the caller separately grants only the intended consumers access.
     pub fn open_fresh(path: &Path) -> io::Result<Self> {
         let guard = Self::open(path)?;
         guard.verify_fresh()?;
@@ -88,17 +89,25 @@ impl HostExportRoot {
     /// Rechecks the pinned chain, named path and exact propagation identity.
     /// It does not enumerate consumers or make an operation result certain.
     pub fn verify(&self) -> io::Result<()> {
-        for directory in &self.directories {
-            check_directory(&directory.metadata()?)?;
+        for (directory, expected) in self.directories.iter().zip(&self.permissions) {
+            let metadata = directory.metadata()?;
+            check_directory(&metadata)?;
+            if permissions(&metadata) != *expected {
+                return Err(invalid("host export directory permissions changed"));
+            }
         }
         let current = open_chain(&self.path)?;
         if current.len() != self.directories.len() {
             return Err(invalid("host export ancestor chain changed"));
         }
-        for (held, named) in self.directories.iter().zip(&current) {
+        for ((held, named), expected) in
+            self.directories.iter().zip(&current).zip(&self.permissions)
+        {
             let held_meta = held.metadata()?;
             let named_meta = named.metadata()?;
-            if held_meta.dev() != named_meta.dev()
+            if permissions(&held_meta) != *expected
+                || permissions(&named_meta) != *expected
+                || held_meta.dev() != named_meta.dev()
                 || held_meta.ino() != named_meta.ino()
                 || descriptor_mount_id(held)? != descriptor_mount_id(named)?
             {
@@ -125,10 +134,15 @@ impl HostExportRoot {
 
     fn open(path: &Path) -> io::Result<Self> {
         let directories = open_chain(path)?;
+        let permissions = directories
+            .iter()
+            .map(|directory| directory.metadata().map(|value| permissions(&value)))
+            .collect::<io::Result<_>>()?;
         let identity = observe(path, &directories)?;
         Ok(Self {
             path: path.to_owned(),
             directories,
+            permissions,
             identity,
         })
     }
@@ -164,8 +178,8 @@ fn open_chain(path: &Path) -> io::Result<Vec<File>> {
         .last()
         .expect("root and leaf are held")
         .metadata()?;
-    if leaf.mode() & 0o705 != 0o705 {
-        return Err(invalid("host export root is not traversable by consumers"));
+    if leaf.mode() & 0o700 != 0o700 {
+        return Err(invalid("host export root owner permissions"));
     }
     Ok(directories)
 }
@@ -175,6 +189,10 @@ fn check_directory(value: &Metadata) -> io::Result<()> {
         return Err(invalid("host export directory ownership or mode"));
     }
     Ok(())
+}
+
+fn permissions(value: &Metadata) -> (u32, u32, u32) {
+    (value.uid(), value.gid(), value.mode() & 0o7777)
 }
 
 fn observe(path: &Path, chain: &[File]) -> io::Result<ExportIdentity> {
