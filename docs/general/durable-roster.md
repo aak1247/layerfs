@@ -29,8 +29,16 @@ reservation, creates one durable Overlay and admits its exact owner into the
 reserved slot. An attempted failure returns the original error and retained
 slot/owner custody; it cannot be automatically released or retried. The caller
 still serializes Workspace identity through this catalog and must retain both
-owners when discovery or binding has an uncertain outcome. This primitive is
-not yet wired to daemon Mount or AutoTask.
+owners when discovery or binding has an uncertain outcome.
+
+`Service::mount_recorded` composes the capacity reservation, creation intent,
+durable Overlay creation and exact Branch binding for a manually assembled
+daemon. It returns the original failure and keeps the reserved control slot,
+owner or bound Workspace when a later step is uncertain. Full capacity and a
+duplicate identity refuse before creating an Overlay; a consumed namespace is
+not reused. The caller authenticates and serializes the catalog and selects a
+verified physical Store. The normal application daemon's wire Mount and
+AutoTask do not yet use this method.
 
 The directory contains an authority-bound owner file, immutable Workspace and
 lifecycle event files, a fixed-width hash-chained ledger and a durable ledger
@@ -174,3 +182,13 @@ runner and test results are under
 The first run retained its failed evidence separately: the test killed its FUSE
 owner while it still held a file descriptor, leaving a blocked kernel flush;
 the owned test connection was aborted and the fixture was corrected.
+
+The two-Workspace FUSE process-loss test was then switched to create both
+bindings through `Service::mount_recorded`. After independent writes and
+synchronization it killed the original process, fenced the old mounts, reopened
+the same Store and catalog, and recovered and closed both. Separate tests
+covered both capacity limits, duplicate identities, an existing Overlay path
+and a failed discovery directory sync. The FUSE test output and hashes are in
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-mount-fuse-20261109/`.
+This remains a manually assembled and manually fenced test, not automatic
+container/Pod reconstruction or physical host power-loss evidence.

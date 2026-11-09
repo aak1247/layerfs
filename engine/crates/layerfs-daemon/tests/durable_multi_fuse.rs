@@ -10,7 +10,9 @@ use layerfs_bridge::control::{
 };
 use layerfs_daemon::{
     bootstrap::open_store,
-    control::{Failure, KernelConfig, KernelServing, RecordedCloseFailure, Service},
+    control::{
+        Failure, KernelConfig, KernelServing, RecordedCloseFailure, RecordedMountRequest, Service,
+    },
     durable_roster::{Authority, Roster, RosterError, WorkspaceRecord},
     store::BindRequest,
     Owner, OwnerConfig,
@@ -106,42 +108,30 @@ fn child(directory: &Path) {
         .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables);
     let store = open(config);
     let branch = BranchId::from_authority([24; 16]);
-    let snapshot = store.history().branch_snapshot(branch).unwrap().unwrap();
     let roster = roster(&directory.join("writer-template.sqlite"));
     let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
     let mut discovery = Roster::create(&directory.join("catalog"), authority).unwrap();
     let service = Service::with_kernel(store.clone(), &roster, kernel(&directory.join("mounts")));
     for (identity, namespace, text) in ITEMS {
         let workspace_id = WorkspaceId::from_authority([identity; 32]).unwrap();
-        let record = WorkspaceRecord {
-            workspace: workspace_id,
-            branch,
-        };
-        discovery.record(record).unwrap();
-        let path = directory.join("durable").join(record.overlay_name());
-        let owner = Owner::create_durable(DurableWorkspace {
-            path: &path,
-            profile: ProfileConfig::default(),
-            identity: [identity; 32],
-            namespace,
-            expected_base_root: snapshot.effective_root.to_bytes(),
-        })
-        .unwrap();
-        let client = roster.adopt_durable(owner).unwrap();
-        let workspace = store
-            .bind_durable(
-                client,
-                BindRequest {
+        let reply = service
+            .mount_recorded(
+                &mut discovery,
+                &roster,
+                &directory.join("durable"),
+                RecordedMountRequest {
+                    sandbox: [8; 32],
+                    profile: ProfileConfig::default(),
                     workspace: workspace_id,
                     branch,
                 },
-                snapshot.clone(),
             )
             .unwrap()
-            .workspace;
-        let token = service
-            .register_recorded(&mut discovery, workspace)
-            .unwrap();
+            .reply;
+        let Reply::Bound { token, .. } = reply else {
+            panic!("missing binding receipt")
+        };
+        assert_eq!(token.namespace, namespace);
         let mount = attach(&service, token);
         let file = mount.join("file-000000");
         let status = Command::new("/bin/sh")
