@@ -38,6 +38,16 @@ cross-namespace fields. The daemon requires the initial user namespace and
 root-owned, non-writable path components. Unsupported or mismatched setups
 are refused, rather than downgraded to a container-local Workspace.
 
+Before opening storage, the daemon also creates `.layerfs-export-owner`
+exclusively in the pinned root, writes the boot ID and its public key, and
+syncs the file and directory. An existing or partially written marker is never
+replaced. Each later guarded operation rechecks its original file identity,
+permissions and contents. Two daemons racing for one root cannot both claim
+it, even if the controller's advisory lock was lost. The marker remains after
+normal exit; a caller must preserve it until an independently verified
+retirement or recovery protocol says what can be done. Its physical-crash
+durability depends on the export filesystem; a tmpfs test is not such proof.
+
 The kernel serving owner retains this daemon-side guard. It rechecks the root
 before an Attach, and checks both the root and the exact child mount ID and
 device before acknowledging Ready. Normal and forced teardown also check the
@@ -71,11 +81,11 @@ would let Docker change the host directory's ownership and permissions. The
 adapter verifies the lease during startup and refuses an exported Sandbox
 reopen until an independent fenced recovery protocol exists.
 
-This low-level adapter does not yet provide a durable, globally exclusive
-export claim across controller crashes, host-path mapping or host guard checks
-around every Workspace operation. A caller must supply and retain those
-authorities itself. In particular, a released advisory lock does not prove
-that an old daemon, mount or external consumer has stopped.
+This low-level adapter does not yet provide a complete durable lifecycle
+journal and recovery for exported Sandboxes, host-path mapping, or host guard
+checks around every Workspace operation. A caller must supply and retain those
+authorities itself. In particular, a released advisory lock or an existing
+claim does not prove that an old daemon, mount or external consumer has stopped.
 
 External tests used separate, newly provisioned mount roots on the local host.
 They verified an isolated shared root, a path containing a space, refusal of a

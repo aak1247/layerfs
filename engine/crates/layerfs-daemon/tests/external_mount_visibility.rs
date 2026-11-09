@@ -88,7 +88,10 @@ fn owned_mounts_reach_host_and_restricted_consumer() {
                 inode: number("LAYERFS_TEST_EXPORT_INODE"),
                 shared_peer: number("LAYERFS_TEST_EXPORT_PEER"),
             };
-            let guard = ContainerExportRoot::open_fresh(&exported, &identity).unwrap();
+            let mut guard = ContainerExportRoot::open_fresh(&exported, &identity).unwrap();
+            guard
+                .claim_fresh(layerfs_bridge::duplex::public_key(&[9; 32]).unwrap())
+                .unwrap();
             KernelServing::start_with_export(config, guard).unwrap()
         }
         Err(std::env::VarError::NotPresent) => KernelServing::start(config).unwrap(),

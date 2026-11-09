@@ -1,7 +1,7 @@
 //! Cross-namespace export verification; the fixture is supplied by the caller.
 #![cfg(target_os = "linux")]
 use layerfs_bridge::daemon_setup::{DaemonLimits, DaemonSetup, HostExportIdentity};
-use layerfs_daemon::control::ContainerExportRoot;
+use layerfs_daemon::control::{ContainerExportRoot, KernelConfig, KernelServing};
 use std::{
     env,
     fs::{self, DirBuilder, OpenOptions},
@@ -95,11 +95,83 @@ fn daemon_refuses_permission_widening() {
 }
 
 #[test]
+#[ignore = "requires root and a caller-owned empty shared export"]
+fn claim_is_exclusive_and_detects_altered_or_replaced_records() {
+    use std::os::unix::fs::FileExt;
+    let path = env::var("LAYERFS_TEST_EXPORT_PATH").unwrap();
+    let root = Path::new(&path);
+    let mut guard = ContainerExportRoot::open_fresh(root, &expected()).unwrap();
+    let unexpected = root.join(format!("owned-test-entry-{}", std::process::id()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&unexpected)
+        .unwrap();
+    assert!(guard.claim_fresh([8; 32]).is_err());
+    assert!(!root.join(".layerfs-export-owner").exists());
+    fs::remove_file(unexpected).unwrap();
+    guard
+        .claim_fresh(layerfs_bridge::duplex::public_key(&[7; 32]).unwrap())
+        .unwrap();
+    guard.verify().unwrap();
+    assert!(guard.claim_fresh([8; 32]).is_err());
+    assert!(ContainerExportRoot::open_fresh(root, &expected()).is_err());
+    let marker = root.join(".layerfs-export-owner");
+    let original = fs::read(&marker).unwrap();
+    let file = OpenOptions::new().write(true).open(&marker).unwrap();
+    file.write_all_at(&[original[0] ^ 1], 0).unwrap();
+    assert!(guard.verify().is_err());
+    file.write_all_at(&original[..1], 0).unwrap();
+    guard.verify().unwrap();
+    let saved = root.join(format!("owned-test-claim-{}", std::process::id()));
+    fs::rename(&marker, &saved).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .unwrap()
+        .write_all(&original)
+        .unwrap();
+    assert!(guard.verify().is_err());
+    fs::remove_file(&marker).unwrap();
+    fs::rename(saved, &marker).unwrap();
+    guard.verify().unwrap();
+    drop((guard, file));
+    fs::remove_file(marker).unwrap();
+}
+
+#[test]
+#[ignore = "requires root and a caller-owned empty shared export"]
+fn exported_serving_requires_a_claimed_root() {
+    let path = env::var("LAYERFS_TEST_EXPORT_PATH").unwrap();
+    let root = Path::new(&path);
+    let config = KernelConfig {
+        mounts: root.to_owned(),
+        owner_uid: 0,
+        owner_gid: 0,
+        command_uid: 1000,
+        command_gid: 1000,
+        ready_wait: Duration::from_secs(1),
+        drain_wait: Duration::from_secs(1),
+        control: "/nonexistent-control".into(),
+    };
+    let guard = ContainerExportRoot::open_fresh(root, &expected()).unwrap();
+    assert!(KernelServing::start_with_export(config.clone(), guard).is_err());
+    let mut guard = ContainerExportRoot::open_fresh(root, &expected()).unwrap();
+    guard
+        .claim_fresh(layerfs_bridge::duplex::public_key(&[7; 32]).unwrap())
+        .unwrap();
+    let serving = KernelServing::start_with_export(config, guard).unwrap();
+    drop(serving);
+    fs::remove_file(root.join(".layerfs-export-owner")).unwrap();
+}
+
+#[test]
 #[ignore = "requires a caller-owned shared export and a FUSE-capable container"]
 fn configured_daemon_starts_with_the_verified_export() {
     let directory = env::temp_dir().join(format!("layerfs-export-start-{}", std::process::id()));
     DirBuilder::new().mode(0o700).create(&directory).unwrap();
-    let path = |name| directory.join(name).to_str().unwrap().to_owned();
+    let path = |name: &str| directory.join(name).to_str().unwrap().to_owned();
     let setup = DaemonSetup {
         listen: "127.0.0.1:0".into(),
         private_key: [1; 32],
@@ -122,37 +194,64 @@ fn configured_daemon_starts_with_the_verified_export() {
         fresh_workspace: None,
         host_export: Some(expected()),
     };
-    let config = directory.join("config");
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&config)
-        .unwrap()
-        .write_all(&setup.encode().unwrap())
-        .unwrap();
-    let mut child = Command::new(env::var("LAYERFS_TEST_DAEMON_BIN").unwrap())
-        .arg("--config")
-        .arg(config)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    let _ = child.kill();
-    let status = child.wait().unwrap();
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    assert!(
-        line.starts_with("LAYERFS_DAEMON_LISTEN "),
-        "daemon did not start: {status:?}; {stderr}"
-    );
+    let mut children = Vec::new();
+    for index in 0..2 {
+        let mut selected = setup.clone();
+        selected.private_key = [index + 1; 32];
+        selected.store = path(&format!("store-{index}.sqlite"));
+        selected.overlay = path(&format!("overlay-{index}.sqlite"));
+        let config = directory.join(format!("config-{index}"));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config)
+            .unwrap()
+            .write_all(&selected.encode().unwrap())
+            .unwrap();
+        children.push(
+            Command::new(env::var("LAYERFS_TEST_DAEMON_BIN").unwrap())
+                .arg("--config")
+                .arg(config)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let mut ready = 0;
+    let mut refused = 0;
+    for (index, mut child) in children.into_iter().enumerate() {
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let started = line.starts_with("LAYERFS_DAEMON_LISTEN ");
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        if started {
+            ready += 1;
+        } else {
+            refused += 1;
+            assert!(
+                stderr.contains("host Workspace export"),
+                "{status:?}; {stderr}"
+            );
+            assert!(!directory.join(format!("overlay-{index}.sqlite")).exists());
+        }
+    }
+    assert_eq!((ready, refused), (1, 1));
+    assert!(ContainerExportRoot::open_fresh(Path::new(&setup.mounts), &expected()).is_err());
+    let claim = fs::read(Path::new(&setup.mounts).join(".layerfs-export-owner")).unwrap();
+    assert!(claim.starts_with(b"LAYERFS-EXPORT-OWNER\x01"));
+    assert!(!claim
+        .windows(32)
+        .any(|bytes| bytes == [1; 32] || bytes == [2; 32]));
 }

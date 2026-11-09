@@ -37,7 +37,7 @@ impl KernelServing {
                 "host Workspace export path differs from kernel mount root",
             ));
         }
-        host_export.verify()?;
+        host_export.require_claimed()?;
         Ok(Self {
             config,
             host_export: Some(host_export),

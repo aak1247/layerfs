@@ -54,7 +54,7 @@ impl Application {
         // Open the export before any Overlay or Store effect and retain its
         // exact descriptors through the kernel serving owner's lifetime.
         #[cfg(target_os = "linux")]
-        let host_export = setup
+        let mut host_export = setup
             .host_export
             .as_ref()
             .map(|expected| {
@@ -70,6 +70,17 @@ impl Application {
                     format!("host Workspace export preflight: {error}"),
                 ))
             })?;
+        #[cfg(target_os = "linux")]
+        if let Some(export) = &mut host_export {
+            let key =
+                transport::public_key(&setup.private_key).map_err(ApplicationError::Channel)?;
+            export.claim_fresh(key).map_err(|error| {
+                ApplicationError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("host Workspace export claim: {error}"),
+                ))
+            })?;
+        }
         #[cfg(not(target_os = "linux"))]
         if setup.host_export.is_some() {
             return Err(ApplicationError::Io(std::io::Error::new(

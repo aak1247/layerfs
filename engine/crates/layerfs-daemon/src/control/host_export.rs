@@ -6,10 +6,13 @@ use nix::{
 };
 use std::{
     fs::{self, File, Metadata},
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     os::{
         fd::AsRawFd,
-        unix::{ffi::OsStringExt, fs::MetadataExt},
+        unix::{
+            ffi::OsStringExt,
+            fs::{FileExt, MetadataExt},
+        },
     },
     path::{Component, Path, PathBuf},
 };
@@ -23,7 +26,18 @@ pub struct ContainerExportRoot {
     permissions: Vec<(u32, u32, u32)>,
     expected: HostExportIdentity,
     mount_id: u64,
+    claim: Option<Claim>,
 }
+
+#[derive(Debug)]
+struct Claim {
+    file: File,
+    body: Vec<u8>,
+    gid: u32,
+}
+
+const CLAIM_FILE: &str = ".layerfs-export-owner";
+const CLAIM_MAGIC: &[u8] = b"LAYERFS-EXPORT-OWNER\x01";
 
 impl ContainerExportRoot {
     pub(super) fn path(&self) -> &Path {
@@ -38,19 +52,14 @@ impl ContainerExportRoot {
             .map(|directory| directory.metadata().map(|value| permissions(&value)))
             .collect::<io::Result<_>>()?;
         let mount_id = observe(path, &directories, expected)?;
-        if fs::read_dir(path)?.next().transpose()?.is_some()
-            || mount_entries()?
-                .iter()
-                .any(|entry| entry.target != path && entry.target.starts_with(path))
-        {
-            return Err(invalid("host Workspace export is not fresh"));
-        }
+        fresh_root(path, false)?;
         let guard = Self {
             path: path.to_owned(),
             directories,
             permissions,
             expected: expected.clone(),
             mount_id,
+            claim: None,
         };
         guard.verify()?;
         Ok(guard)
@@ -80,6 +89,91 @@ impl ContainerExportRoot {
         }
         if observe(&self.path, &current, &self.expected)? != self.mount_id {
             return Err(invalid("host Workspace export mount changed"));
+        }
+        if let Some(claim) = &self.claim {
+            self.verify_claim(claim)?;
+        }
+        Ok(())
+    }
+
+    /// Claims this fresh directory once, with no replacement or cleanup on
+    /// failure. Supply the daemon's public key, never its private key. A
+    /// successful claim stays on disk until an independently fenced recovery
+    /// or retirement handles it.
+    pub fn claim_fresh(&mut self, public_key: [u8; 32]) -> io::Result<()> {
+        if self.claim.is_some() || public_key == [0; 32] {
+            return Err(invalid("host Workspace export claim admission"));
+        }
+        self.verify()?;
+        fresh_root(&self.path, false)?;
+        let directory = self.directories.last().expect("root and leaf are held");
+        let flags =
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let mut file = File::from(openat(
+            directory,
+            Path::new(CLAIM_FILE),
+            flags,
+            Mode::from_bits_truncate(0o600),
+        )?);
+        let mut body = CLAIM_MAGIC.to_vec();
+        body.extend_from_slice(self.expected.boot_id.as_bytes());
+        body.extend_from_slice(&public_key);
+        file.write_all(&body)?;
+        file.sync_all()?;
+        let sync_flags =
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let parent = File::from(openat(
+            directory,
+            Path::new("."),
+            sync_flags,
+            Mode::empty(),
+        )?);
+        if descriptor_mount_id(&parent)? != self.mount_id {
+            return Err(invalid("host Workspace export claim parent changed"));
+        }
+        parent.sync_all()?;
+        let gid = file.metadata()?.gid();
+        self.claim = Some(Claim { file, body, gid });
+        self.verify()?;
+        fresh_root(&self.path, true)?;
+        self.verify()
+    }
+
+    pub(super) fn require_claimed(&self) -> io::Result<()> {
+        if self.claim.is_none() {
+            return Err(invalid("host Workspace export is not claimed"));
+        }
+        self.verify()
+    }
+
+    fn verify_claim(&self, claim: &Claim) -> io::Result<()> {
+        let directory = self.directories.last().expect("root and leaf are held");
+        let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let named = File::from(openat(
+            directory,
+            Path::new(CLAIM_FILE),
+            flags,
+            Mode::empty(),
+        )?);
+        let held = claim.file.metadata()?;
+        let current = named.metadata()?;
+        if !held.is_file()
+            || held.uid() != 0
+            || held.gid() != claim.gid
+            || held.mode() & 0o7777 != 0o600
+            || held.nlink() != 1
+            || held.dev() != current.dev()
+            || held.ino() != current.ino()
+            || descriptor_mount_id(&claim.file)? != self.mount_id
+            || descriptor_mount_id(&named)? != self.mount_id
+            || held.len() != claim.body.len() as u64
+        {
+            return Err(invalid("host Workspace export claim identity"));
+        }
+        let mut body = vec![0; claim.body.len()];
+        claim.file.read_exact_at(&mut body, 0)?;
+        if body != claim.body {
+            return Err(invalid("host Workspace export claim contents"));
         }
         Ok(())
     }
@@ -147,6 +241,25 @@ fn open_chain(path: &Path) -> io::Result<Vec<File>> {
 fn check_directory(metadata: &Metadata) -> io::Result<()> {
     if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         return Err(invalid("host Workspace export ownership or mode"));
+    }
+    Ok(())
+}
+
+fn fresh_root(path: &Path, claimed: bool) -> io::Result<()> {
+    let mut found = false;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !claimed || found || entry.file_name() != CLAIM_FILE {
+            return Err(invalid("host Workspace export is not fresh"));
+        }
+        found = true;
+    }
+    if found != claimed
+        || mount_entries()?
+            .iter()
+            .any(|entry| entry.target != path && entry.target.starts_with(path))
+    {
+        return Err(invalid("host Workspace export is not fresh"));
     }
     Ok(())
 }
