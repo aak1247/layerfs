@@ -48,6 +48,87 @@ fn project_init_refuses_invalid_store_profile_before_creating_a_project() {
     assert!(!home.0.join("new-project").exists());
 }
 
+fn prepare_durable_project(home: &Home) {
+    std::fs::create_dir(home.0.join("source")).unwrap();
+    std::fs::write(home.0.join("source/file"), b"original source").unwrap();
+    std::fs::create_dir(home.0.join("volume")).unwrap();
+    std::fs::create_dir(home.0.join("volume/global")).unwrap();
+}
+
+fn record_fault_shim(home: &Home) -> std::path::PathBuf {
+    let shim = home.0.join("record-fault.so");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/durable_record_fault.c"))
+        .args(["-ldl", "-o"])
+        .arg(&shim)
+        .status()
+        .unwrap()
+        .success());
+    shim
+}
+
+#[test]
+fn durable_project_initialization_publishes_its_private_record() {
+    let home = Home::new();
+    prepare_durable_project(&home);
+    home.node(
+        "const r=await native.call('project.init',{...args,name:'durable-project',path:process.env.LAYERFS_HOME+'/source',storePath:process.env.LAYERFS_HOME+'/volume/global/store.sqlite',storeProfile:'durable',timeoutMs:15000}); if (process.getuid()===0) assert.equal(r.value?.kind,'Initialized',JSON.stringify(r.refused)); else { assert.equal(r.refused?.code,'Failed',JSON.stringify(r.refused)); assert.match(r.refused.message,/must run as user 0/); }",
+        None,
+        Duration::from_secs(20),
+    );
+    assert!(home.0.join("durable-project/project.record").is_file());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(home.0.join("durable-project/project.record"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn durable_project_record_sync_failure_preserves_unknown_publication() {
+    let home = Home::new();
+    prepare_durable_project(&home);
+    let shim = record_fault_shim(&home);
+    home.node_with_env(
+        "const r=await native.call('project.init',{...args,name:'durable-project',path:process.env.LAYERFS_HOME+'/source',storePath:process.env.LAYERFS_HOME+'/volume/global/store.sqlite',storeProfile:'durable',timeoutMs:15000}); assert.equal(r.refused?.code,'Unknown',JSON.stringify(r.refused));",
+        Some(&shim), &[("LAYERFS_TEST_RECORD_MODE", "sync")], Duration::from_secs(20),
+    );
+    assert!(home.0.join("record-sync-failed").is_file());
+    assert!(home.0.join("durable-project/project.record").is_file());
+    assert!(!home.0.join("volume/global/store.sqlite").exists());
+}
+
+#[test]
+fn durable_project_directory_swap_never_redirects_its_record() {
+    let home = Home::new();
+    prepare_durable_project(&home);
+    let shim = record_fault_shim(&home);
+    home.node_with_env(
+        "const r=await native.call('project.init',{...args,name:'durable-project',path:process.env.LAYERFS_HOME+'/source',storePath:process.env.LAYERFS_HOME+'/volume/global/store.sqlite',storeProfile:'durable',timeoutMs:15000}); assert.equal(r.refused?.code,'Unknown',JSON.stringify(r.refused));",
+        Some(&shim), &[("LAYERFS_TEST_RECORD_MODE", "swap")], Duration::from_secs(20),
+    );
+    assert!(home.0.join("record-parent-swapped").is_file());
+    assert_eq!(
+        std::fs::read_dir(home.0.join("durable-project"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(std::fs::read_dir(home.0.join("original-project"))
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("project.")));
+    assert!(!home.0.join("volume/global/store.sqlite").exists());
+}
+
 #[test]
 fn invalid_recorded_capacity_is_not_treated_as_a_legacy_record() {
     let home = Home::new();

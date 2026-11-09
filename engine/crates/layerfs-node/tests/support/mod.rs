@@ -113,6 +113,16 @@ impl Home {
     }
 
     pub fn node(&self, script: &str, preload: Option<&Path>, timeout: Duration) {
+        self.node_with_env(script, preload, &[], timeout);
+    }
+
+    pub fn node_with_env(
+        &self,
+        script: &str,
+        preload: Option<&Path>,
+        extra: &[(&str, &str)],
+        timeout: Duration,
+    ) {
         let mut command =
             Command::new(std::env::var_os("LAYERFS_TEST_NODE").unwrap_or_else(|| "node".into()));
         command
@@ -130,6 +140,7 @@ impl Home {
             .env("LAYERFS_HOME", &self.0)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        command.envs(extra.iter().copied());
         if let Some(preload) = preload {
             command
                 .env("LD_PRELOAD", preload)

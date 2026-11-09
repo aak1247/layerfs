@@ -3,6 +3,8 @@ mod convert;
 mod direct;
 mod discovery;
 mod dispatch;
+#[cfg(target_os = "linux")]
+mod durable_records;
 mod exec;
 mod job;
 mod output;

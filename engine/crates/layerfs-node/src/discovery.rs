@@ -235,6 +235,19 @@ fn save_with_sync(path: &Path, value: SdkValue, durable: bool) -> Result<()> {
         std::process::id(),
         layerfs_bridge::sdk_values::hex(&registry::random()?[..8])
     ));
+    #[cfg(target_os = "linux")]
+    if durable {
+        return crate::durable_records::save(path, &temp, &bytes).map_err(|failure| {
+            refused(
+                if failure.attempted {
+                    "Unknown"
+                } else {
+                    "Failed"
+                },
+                failure.to_string(),
+            )
+        });
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
