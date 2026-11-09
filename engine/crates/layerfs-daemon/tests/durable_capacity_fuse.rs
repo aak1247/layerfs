@@ -31,6 +31,16 @@ impl Drop for Mounts {
 #[test]
 #[ignore = "requires an isolated FUSE container and a private writable fusectl"]
 fn thirty_two_durable_fuse_workspaces_share_one_capacity() {
+    exercise_capacity(32);
+}
+
+#[test]
+#[ignore = "requires an isolated FUSE container and a private writable fusectl"]
+fn one_hundred_durable_fuse_workspaces_share_one_capacity() {
+    exercise_capacity(100);
+}
+
+fn exercise_capacity(capacity: u8) {
     let fixture = support::Fixture::new_durable(1, "durable-capacity-fuse");
     let directory = &fixture.directory;
     for name in ["durable", "catalog", "mounts"] {
@@ -42,7 +52,7 @@ fn thirty_two_durable_fuse_workspaces_share_one_capacity() {
         fixture.config.clone(),
         support::BINDING,
         support::CURSOR,
-        32,
+        usize::from(capacity),
         8 * 1024 * 1024,
         ReservationBlocks::default(),
     )
@@ -50,7 +60,9 @@ fn thirty_two_durable_fuse_workspaces_share_one_capacity() {
     let owner = Owner::start(
         &directory.join("capacity-template.sqlite"),
         ProfileConfig::default(),
-        OwnerConfig { namespaces: 32 },
+        OwnerConfig {
+            namespaces: usize::from(capacity),
+        },
     )
     .unwrap();
     let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
@@ -85,7 +97,7 @@ fn thirty_two_durable_fuse_workspaces_share_one_capacity() {
         .is_empty());
     let mut mounted = Mounts(Vec::new());
     let mut tokens = Vec::new();
-    for index in 1..=32u8 {
+    for index in 1..=capacity {
         let workspace = WorkspaceId::from_authority([index; 32]).unwrap();
         let Reply::Bound { token, .. } = service
             .execute_control(&Request::Mount {
@@ -108,7 +120,7 @@ fn thirty_two_durable_fuse_workspaces_share_one_capacity() {
         tokens.push(token);
     }
     let overflow = service.execute_control(&Request::Mount {
-        workspace: WorkspaceId::from_authority([33; 32]).unwrap(),
+        workspace: WorkspaceId::from_authority([capacity + 1; 32]).unwrap(),
         branch: fixture.branch,
     });
     let Err(Failure::RecordedMount(failure)) = overflow else {
@@ -118,7 +130,7 @@ fn thirty_two_durable_fuse_workspaces_share_one_capacity() {
         *failure,
         RecordedMountFailure::Before(Failure::Rejected(ControlCode::Capacity, _))
     ));
-    assert_eq!(mounted.0.len(), 32);
+    assert_eq!(mounted.0.len(), usize::from(capacity));
     for token in tokens {
         assert_eq!(
             service
@@ -132,5 +144,5 @@ fn thirty_two_durable_fuse_workspaces_share_one_capacity() {
         );
     }
     mounted.0.clear();
-    println!("32 durable FUSE Workspaces mounted, the 33rd was refused, and all 32 closed");
+    println!("{capacity} durable FUSE Workspaces mounted, the next was refused, and all closed");
 }

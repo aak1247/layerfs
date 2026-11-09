@@ -129,6 +129,13 @@ the direct API's wrapped refusal; that failure is retained separately. This
 functional capacity check does not measure performance or establish SDK or
 Kubernetes capacity.
 
+The same isolated Service test was then run with capacity 100: 100 durable
+FUSE Workspaces were mounted together, the 101st was refused and all 100 were
+closed. Output and hashes are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-hundred-fuse-20261110-0p024vdd/`.
+They share one Branch and were not used for a sustained workload; this is not
+evidence of throughput, recovery at that scale, SDK capacity or Kubernetes.
+
 For a Sandbox record explicitly marked durable, the Node binding records a
 private mount intent before Bind, the original Branch snapshot before Attach,
 and the exact Ready receipt before reporting success. It synchronizes the
