@@ -204,7 +204,9 @@ fn legacy_durable_database_reopens_without_implicit_conversion() {
     db.close_database().unwrap();
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
-        .execute_batch("DROP TABLE durable_binding; PRAGMA user_version=39;")
+        .execute_batch(
+            "DROP TABLE durable_binding; DROP TABLE durable_route; PRAGMA user_version=39;",
+        )
         .unwrap();
     drop(connection);
     let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
@@ -219,6 +221,54 @@ fn legacy_durable_database_reopens_without_implicit_conversion() {
             .unwrap(),
         39
     );
+}
+
+#[test]
+fn legacy_schema_40_keeps_its_binding_without_a_namespace_conversion() {
+    let fixture = Fixture::new();
+    let db = create(&fixture.path());
+    db.initialize_durable_binding(ROOT, b"legacy snapshot")
+        .unwrap();
+    db.close_database().unwrap();
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    connection
+        .execute_batch("DROP TABLE durable_route; PRAGMA user_version=40;")
+        .unwrap();
+    drop(connection);
+    let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    assert_eq!(db.profile().schema_version, 40);
+    assert_eq!(db.durable_binding().unwrap().unwrap(), b"legacy snapshot");
+    assert!(db.durable_namespace().is_err());
+    assert!(db.advance_durable_namespace(2).is_err());
+    db.close_database().unwrap();
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        40
+    );
+}
+
+#[test]
+fn namespace_requires_initialization_and_strictly_increases() {
+    let fixture = Fixture::new();
+    let db = create(&fixture.path());
+    assert_eq!(db.profile().schema_version, 41);
+    assert_eq!(db.durable_namespace().unwrap(), None);
+    assert!(db.advance_durable_namespace(1).is_err());
+    db.initialize_durable_namespace(7).unwrap();
+    assert!(db.initialize_durable_namespace(8).is_err());
+    assert!(db.advance_durable_namespace(7).is_err());
+    assert!(db.advance_durable_namespace(6).is_err());
+    db.advance_durable_namespace(9).unwrap();
+    assert_eq!(db.durable_namespace().unwrap(), Some(9));
+    db.close_database().unwrap();
+    let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    assert_eq!(db.durable_namespace().unwrap(), Some(9));
+    assert!(db.advance_durable_namespace(9).is_err());
+    db.advance_durable_namespace(10).unwrap();
+    db.close_database().unwrap();
 }
 
 #[test]
@@ -825,6 +875,8 @@ fn durable_save_survives_vm_power_loss() {
                 .sync_all()
                 .unwrap();
             let db = create(&path);
+            db.initialize_durable_namespace(1).unwrap();
+            db.advance_durable_namespace(2).unwrap();
             db.initialize_durable_binding(ROOT, b"vm original snapshot")
                 .unwrap();
             let capture = db.capture().unwrap();
@@ -840,6 +892,9 @@ fn durable_save_survives_vm_power_loss() {
         }
         "read" => {
             let db = Overlay::recover_durable(&path, ProfileConfig::default(), IDENTITY).unwrap();
+            assert_eq!(db.durable_namespace().unwrap(), Some(2));
+            assert!(db.advance_durable_namespace(2).is_err());
+            db.advance_durable_namespace(3).unwrap();
             assert_eq!(
                 db.durable_binding().unwrap().unwrap(),
                 b"vm installed snapshot"

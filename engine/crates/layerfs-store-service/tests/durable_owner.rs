@@ -55,6 +55,11 @@ fn spec(path: &Path) -> DurableWorkspace<'_> {
         expected_base_root: ROOT,
     }
 }
+fn recovered_spec(path: &Path) -> DurableWorkspace<'_> {
+    let mut value = spec(path);
+    value.namespace = 2;
+    value
+}
 fn write(client: &OwnerClient, route: Route) {
     client
         .call(route, ServiceClass::Mutation, None, |db| {
@@ -209,7 +214,13 @@ fn durable_owner_validates_identity_root_and_rejects_stale_routes() {
             "durable Workspace base root"
         )))
     ));
-    let recovered = Owner::recover_durable(spec(&path)).unwrap();
+    assert!(matches!(
+        Owner::recover_durable(spec(&path)),
+        Err(OwnerError::Overlay(OverlayError::Invalid(
+            "stale durable namespace"
+        )))
+    ));
+    let recovered = Owner::recover_durable(recovered_spec(&path)).unwrap();
     let client = recovered.client();
     let route = client.bound_route().unwrap();
     assert_ne!(old, route);
@@ -258,7 +269,7 @@ fn durable_owner_recovers_service_writes_after_process_loss() {
     }
     child.kill().unwrap();
     assert!(!child.wait().unwrap().success());
-    let owner = Owner::recover_durable(spec(&fixture.path())).unwrap();
+    let owner = Owner::recover_durable(recovered_spec(&fixture.path())).unwrap();
     let client = owner.client();
     let route = client.bound_route().unwrap();
     assert_ne!(
@@ -266,6 +277,126 @@ fn durable_owner_recovers_service_writes_after_process_loss() {
         format!("{route:?}")
     );
     assert_eq!(read(&client, route), BYTES);
+    owner.stop().unwrap();
+}
+
+#[test]
+fn recovered_namespace_is_not_reused_after_process_loss() {
+    const CHILD: &str = "LAYERFS_DURABLE_NAMESPACE_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let path = PathBuf::from(&directory).join("workspace.sqlite");
+        let first = Owner::create_durable(spec(&path)).unwrap();
+        write(&first.client(), first.client().bound_route().unwrap());
+        first.stop().unwrap();
+        let second = Owner::recover_durable(recovered_spec(&path)).unwrap();
+        assert_eq!(second.client().bound_route().unwrap().namespace(), 2);
+        fs::write(PathBuf::from(directory).join("namespace-ack"), b"2").unwrap();
+        std::thread::sleep(Duration::from_secs(15));
+        panic!("the parent did not kill the namespace owner");
+    }
+    let fixture = Fixture::new();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "recovered_namespace_is_not_reused_after_process_loss",
+        ])
+        .env(CHILD, &fixture.0)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.0.join("namespace-ack").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("owner exited before namespace acknowledgement: {status}");
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("namespace owner did not acknowledge");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert!(matches!(
+        Owner::recover_durable(recovered_spec(&fixture.path())),
+        Err(OwnerError::Overlay(OverlayError::Invalid(
+            "stale durable namespace"
+        )))
+    ));
+    let path = fixture.path();
+    let mut next = recovered_spec(&path);
+    next.namespace = 3;
+    let recovered = Owner::recover_durable(next).unwrap();
+    assert_eq!(
+        read(
+            &recovered.client(),
+            recovered.client().bound_route().unwrap()
+        ),
+        BYTES
+    );
+    recovered.stop().unwrap();
+}
+
+#[test]
+fn failed_namespace_sync_retains_ownership_and_does_not_reuse_the_value() {
+    const CHILD: &str = "LAYERFS_DURABLE_NAMESPACE_FAILURE_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let directory = PathBuf::from(directory);
+        let path = directory.join("workspace.sqlite");
+        let owner = Owner::create_durable(spec(&path)).unwrap();
+        write(&owner.client(), owner.client().bound_route().unwrap());
+        owner.stop().unwrap();
+        fs::write(directory.join("inject"), b"1").unwrap();
+        assert!(matches!(
+            Owner::recover_durable(recovered_spec(&path)),
+            Err(OwnerError::Overlay(OverlayError::Uncertain { .. }))
+        ));
+        assert!(Owner::recover_durable(recovered_spec(&path)).is_err());
+        return;
+    }
+    let fixture = Fixture::new();
+    let shim = fixture.0.join("failure.so");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../layerfs-overlay/tests/durable_dir_sync_failure.c")
+        )
+        .args(["-ldl", "-o"])
+        .arg(&shim)
+        .status()
+        .unwrap()
+        .success());
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "failed_namespace_sync_retains_ownership_and_does_not_reuse_the_value",
+        ])
+        .env(CHILD, &fixture.0)
+        .env("LD_PRELOAD", &shim)
+        .env(
+            "LAYERFS_TEST_DIR_SYNC_TARGET",
+            fs::canonicalize(&fixture.0).unwrap(),
+        )
+        .env("LAYERFS_TEST_DIR_SYNC_TRIGGER", fixture.0.join("inject"))
+        .env(
+            "LAYERFS_TEST_DIR_SYNC_RECEIPT",
+            fixture.0.join("sync-failed"),
+        )
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!fs::read(fixture.0.join("sync-failed")).unwrap().is_empty());
+    let path = fixture.path();
+    let mut next = recovered_spec(&path);
+    next.namespace = 3;
+    let owner = Owner::recover_durable(next).unwrap();
+    assert_eq!(
+        read(&owner.client(), owner.client().bound_route().unwrap()),
+        BYTES
+    );
     owner.stop().unwrap();
 }
 
@@ -303,7 +434,7 @@ fn durable_owner_retains_panicked_connection_until_process_exit() {
         .status()
         .unwrap();
     assert!(status.success());
-    let owner = Owner::recover_durable(spec(&fixture.path())).unwrap();
+    let owner = Owner::recover_durable(recovered_spec(&fixture.path())).unwrap();
     let client = owner.client();
     assert_eq!(read(&client, client.bound_route().unwrap()), BYTES);
     owner.stop().unwrap();

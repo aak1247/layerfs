@@ -11,7 +11,8 @@ use layerfs_workspace::Route;
 use std::{path::Path, sync::Arc};
 
 /// Authenticated identity and expected root of one durable Workspace.
-/// The namespace identifies its new daemon-local route, not a persisted token.
+/// The namespace identifies its daemon-local route. Schema 41 records its
+/// per-Workspace high-water mark before a token can be exposed.
 pub struct DurableWorkspace<'a> {
     pub path: &'a Path,
     pub profile: ProfileConfig,
@@ -30,6 +31,8 @@ impl Owner {
             .map_err(OwnerError::Overlay)?;
         db.open_workspace(spec.expected_base_root)
             .map_err(OwnerError::Overlay)?;
+        db.initialize_durable_namespace(spec.namespace)
+            .map_err(OwnerError::Overlay)?;
         bind(db, spec.namespace, spec.identity, incarnation, true)
     }
 
@@ -46,14 +49,18 @@ impl Owner {
                 "durable Workspace base root",
             )));
         }
+        if db.profile().schema_version == 41 {
+            db.advance_durable_namespace(spec.namespace)
+                .map_err(OwnerError::Overlay)?;
+        }
         bind(db, spec.namespace, spec.identity, incarnation, false)
     }
 
     /// Reopens from the persisted snapshot when no external root is available.
     /// The returned snapshot still needs Store authorization and validation,
     /// and the caller must fence old mounts and reconcile unknown operations.
-    /// `namespace` must be fresh across daemon restarts, so an old control
-    /// token cannot address the recovered Workspace.
+    /// For schema 41, `namespace` must be greater than the recorded value;
+    /// older files require the caller's independent freshness proof.
     pub fn recover_recorded(
         path: &Path,
         profile: ProfileConfig,
@@ -82,6 +89,10 @@ impl Owner {
             return Err(OwnerError::Overlay(OverlayError::Invalid(
                 "durable binding root",
             )));
+        }
+        if db.profile().schema_version == 41 {
+            db.advance_durable_namespace(namespace)
+                .map_err(OwnerError::Overlay)?;
         }
         let owner = bind(db, namespace, identity, incarnation, false)?;
         Ok((owner, snapshot))

@@ -7,7 +7,7 @@ impl Overlay {
     /// base identity and does not accept a record after local changes.
     pub fn initialize_durable_binding(&self, root: [u8; 32], snapshot: &[u8]) -> OverlayResult<()> {
         if self.durable.is_none()
-            || self.profile.schema_version != 40
+            || !matches!(self.profile.schema_version, 40 | 41)
             || snapshot.is_empty()
             || snapshot.len() > 4096
         {
@@ -37,7 +37,7 @@ impl Overlay {
     /// Returns a root-matched record. A later unresolved install is a refusal,
     /// not permission to infer or automatically replay a Store publication.
     pub fn durable_binding(&self) -> OverlayResult<Option<Vec<u8>>> {
-        if self.durable.is_none() || self.profile.schema_version != 40 {
+        if self.durable.is_none() || !matches!(self.profile.schema_version, 40 | 41) {
             return Err(OverlayError::Invalid("durable binding profile"));
         }
         let rows: Vec<(Vec<u8>, Vec<u8>, bool)> = self.query(
@@ -95,7 +95,7 @@ impl Overlay {
     }
 
     pub(crate) fn invalidate_durable_binding(&self, root: [u8; 32]) -> OverlayResult<()> {
-        if self.durable.is_some() && self.profile.schema_version == 40 {
+        if self.durable.is_some() && matches!(self.profile.schema_version, 40 | 41) {
             self.execute(
                 StatementKind::Frontier,
                 "UPDATE durable_binding SET root=?1,recoverable=0 WHERE id=1",
@@ -115,7 +115,7 @@ impl Overlay {
         snapshot: &[u8],
     ) -> OverlayResult<()> {
         if self.durable.is_none()
-            || self.profile.schema_version != 40
+            || !matches!(self.profile.schema_version, 40 | 41)
             || snapshot.is_empty()
             || snapshot.len() > 4096
         {

@@ -168,8 +168,10 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
     drop(other);
     other_owner.stop().unwrap();
 
-    let recovered_owner =
-        Owner::recover_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    assert!(Owner::recover_durable(spec(&path, initial.effective_root.to_bytes())).is_err());
+    let mut recovered_spec = spec(&path, initial.effective_root.to_bytes());
+    recovered_spec.namespace = 2;
+    let recovered_owner = Owner::recover_durable(recovered_spec).unwrap();
     assert_eq!(
         recovered_owner.client().durable_snapshot().unwrap(),
         initial
@@ -211,7 +213,7 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
     store.close_reader(identity).unwrap();
     recovered_owner.stop().unwrap();
     let (reopened_owner, recorded) =
-        Owner::recover_recorded(&path, ProfileConfig::default(), [42; 32], 1).unwrap();
+        Owner::recover_recorded(&path, ProfileConfig::default(), [42; 32], 3).unwrap();
     assert_eq!(recorded, installed);
     let reopened = store
         .bind_durable(reopened_owner.client(), request, recorded)

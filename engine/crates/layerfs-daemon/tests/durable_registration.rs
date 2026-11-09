@@ -565,6 +565,13 @@ fn fuse_write_survives_daemon_process_loss(durable_store: bool, inject_fault: Op
         ReservationBlocks::default(),
     )
     .unwrap();
+    assert!(Owner::recover_recorded(
+        &directory.join("durable/workspace.sqlite"),
+        ProfileConfig::default(),
+        [42; 32],
+        1,
+    )
+    .is_err());
     let (owner, snapshot) = Owner::recover_recorded(
         &directory.join("durable/workspace.sqlite"),
         ProfileConfig::default(),

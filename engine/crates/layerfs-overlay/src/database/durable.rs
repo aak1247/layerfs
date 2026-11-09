@@ -322,7 +322,14 @@ mod linux {
                 &[],
                 0,
             )?;
-            db.execute(StatementKind::Startup, "PRAGMA user_version=40", &[], 0)?;
+            db.execute(
+                StatementKind::Startup,
+                "CREATE TABLE durable_route(id INTEGER PRIMARY KEY CHECK(id=1), \
+                 high_namespace INTEGER NOT NULL CHECK(high_namespace>0)) STRICT",
+                &[],
+                0,
+            )?;
+            db.execute(StatementKind::Startup, "PRAGMA user_version=41", &[], 0)?;
             db.execute(
                 StatementKind::Startup,
                 "PRAGMA application_id=1279676211",
@@ -337,7 +344,7 @@ mod linux {
             )?;
             Ok(())
         })?;
-        db.profile.schema_version = 40;
+        db.profile.schema_version = 41;
         let sync = db.allocation.sync_durable_file().and_then(|_| {
             File::open(
                 path.parent()
@@ -408,7 +415,7 @@ mod linux {
             super::super::profile::readback(&connection, &work, "PRAGMA user_version", |r| {
                 r.get(0)
             })?;
-        if ![39, 40].contains(&profile.schema_version) {
+        if ![39, 40, 41].contains(&profile.schema_version) {
             return Err(OverlayError::Invalid("durable overlay schema version"));
         }
         let integrity: String =
@@ -422,7 +429,7 @@ mod linux {
         // Ready retirement is safe only for an installed generation with a
         // matching recorded receipt. The caller still fences the old mount and
         // validates that receipt against the same authorized Store first.
-        let bound = if profile.schema_version == 40 {
+        let bound = if matches!(profile.schema_version, 40 | 41) {
             super::super::profile::readback(
                 &connection,
                 &work,

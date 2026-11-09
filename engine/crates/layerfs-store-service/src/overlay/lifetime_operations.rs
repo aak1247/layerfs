@@ -125,7 +125,7 @@ impl OwnerClient {
                 });
             }
             let installed = match &durable_snapshot {
-                Some(snapshot) if db.profile().schema_version == 40 => {
+                Some(snapshot) if matches!(db.profile().schema_version, 40 | 41) => {
                     workspace.install_prepared_base_recorded(db, input, snapshot)
                 }
                 _ => workspace.install_prepared_base(db, input),

@@ -21,10 +21,19 @@ engine instead of allowing it to resume.
 lock. The caller supplies the stable identity, the expected base root and a
 daemon-local namespace. Recovery refuses a different stored root, and makes a
 fresh random internal route incarnation so a route from the old owner cannot
-select the recovered connection. Stopping the owner retains the files. These
-APIs do not persist a roster, authenticate the caller, fence old FUSE mounts,
-reconcile Commit outcomes or recover an SDK control token. They do not yet
-replace the normal disposable roster used for mounted Workspaces.
+select the recovered connection. New schema 41 files also persist a
+per-Workspace high-water mark before an owner or recovered token is returned.
+Recovery requires a strictly greater namespace and records it durably before
+exposing the new owner; gaps are allowed and a failed or unknown attempt must
+not be retried with the same value. This protects the external Workspace token
+as well as the internal route while the original database is retained. It does
+not detect database rollback, replacement or reuse of a Workspace identity with
+a different file. The caller must prevent those cases, avoid namespace collisions
+among concurrent mounts and fence the old process, mount and consumers. Stopping
+the owner retains the files. These APIs do not persist a roster, authenticate
+the caller, fence old FUSE mounts, reconcile Commit outcomes or automatically
+recover an SDK control token. They do not yet replace the normal disposable
+roster used for mounted Workspaces.
 
 `Store::bind_durable` attaches such an owner to its exact Branch snapshot. It
 checks the Workspace identity, the original Layer and Commit roots against the
@@ -34,17 +43,18 @@ replace the original view: a later explicit Commit uses the existing merge
 path. The caller must keep the owner private during binding and authenticate
 its Workspace, Store and requested Branch; the snapshot is not authorization.
 
-New durable overlay files use schema 40 and persist their encoded snapshot.
+New durable overlay files use schema 41 and persist their encoded snapshot.
 For a known published Commit, its new snapshot and the overlay's installed
 base advance in the same SQLite transaction. An install without a known
 receipt marks the binding unresolved in that transaction; recovery refuses it
 until reconciled. A subsequent known publication in the live owner can replace
 that marker. A crash with a pending capture still refuses automatic recovery.
-Existing schema 39 durable files are not converted and continue to require the
-caller's independently retained snapshot. Old inode reservation windows are
-not reused; future allocations require the same durable Store authority and
-scope.
-`Owner::recover_recorded` reads the snapshot and root from schema 40 without
+Existing schema 39 and 40 durable files are not converted; the caller must
+independently prove a fresh namespace for either format. Schema 39 also
+requires the caller's independently retained snapshot. Old inode reservation
+windows are not reused; future allocations require the same durable Store
+authority and scope.
+`Owner::recover_recorded` reads the snapshot and root from schema 40 or 41 without
 requiring an external root, but still requires the independently known file
 path and Workspace identity. The resulting snapshot must pass Store binding
 and the caller's authorization and old-owner fencing checks.
@@ -52,10 +62,11 @@ and the caller's authorization and old-owner fencing checks.
 An explicitly assembled daemon `Service` can register one already bound
 durable owner and use its ordinary control and FUSE Attach path. Registration
 checks the exact owner and Store, and a refusal returns the original binding.
-The caller selects a fresh control namespace and fences the prior process,
-mount and consumers; this path is not a durable roster or automatic restart.
-Terminal unmount closes the database but retains its files. Until the full
-barrier is available, a durable mount rejects FUSE FSYNC and FSYNCDIR with
+The caller selects a control namespace and fences the prior process, mount and
+consumers; schema 41 rejects reuse for the same Workspace, but this path is not
+a durable roster or automatic restart.
+Terminal unmount closes the database but retains its files. When the full
+barrier is unavailable, a durable mount rejects FUSE FSYNC and FSYNCDIR with
 EOPNOTSUPP; it does not use ENOSYS, which Linux would cache as successful
 synchronization. A durable owner backed by a concrete Durable Store on a
 supported local filesystem and in a private directory serves FSYNC and
@@ -177,6 +188,16 @@ At that run, `profile.rs`, `durable.rs`, and `connection.rs` respectively had
 SHA-256 `0e0775c1c06c4b1f1262c02d353e012a872f57096c1386c13ff3374f423f52b2`,
 `d91d8f0c0cfbbf5bad2192227e678d54cc37eb7c62ca1a11ef625f7f33ac9538`, and
 `120b9bb6b14cd28ab315595a7bbabf97a1248559157b485145eaadb5b4002cb0`.
+
+The schema-41 probe advanced the namespace before acknowledging a write,
+killed the guest, then reopened the same disk and rejected the previous value.
+It also checked the recorded snapshot and file bytes. Its receipt and serial
+logs are retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-overlay-vm-20261109-namespace-v41/`;
+the probe SHA-256 was
+`7b1e4cee612940aa39ae1e25a35466e389d6135bfcb88830ea3ae483ff9f25a2`.
+This is guest memory loss on the tested ext4 disk, not physical host power loss
+or recovery of a FUSE mount.
 
 An isolated Docker test on 2026-11-09 used a manually assembled daemon
 Service, one durable owner and a disposable test Store. An unprivileged
