@@ -16,6 +16,16 @@ and the engine's main-file descriptor have closed; a failed checked close
 retains it. File replacement or loss of directory privacy quarantines a live
 engine instead of allowing it to resume.
 
+`layerfs-store-service` also exposes `Owner::create_durable` and
+`Owner::recover_durable` for one database behind its ordinary Workspace service
+lock. The caller supplies the stable identity, the expected base root and a
+daemon-local namespace. Recovery refuses a different stored root, and makes a
+fresh random internal route incarnation so a route from the old owner cannot
+select the recovered connection. Stopping the owner retains the files. These
+APIs do not persist a roster, authenticate the caller, fence old FUSE mounts,
+reconcile Commit outcomes or recover an SDK control token. They do not yet
+replace the disposable owner used for a mounted Workspace.
+
 The durable profile is SQLite DELETE/FULL/EXCLUSIVE. Each changed Workspace
 generation, base root, revision, dirty count and volatile-custody flag is
 written in the **same SQLite transaction** as the associated filesystem rows.
@@ -41,7 +51,9 @@ the returned state. A released file lock alone does not establish those facts.
 
 The scoped tests cover same- and cross-process ownership, identity mismatch,
 process termination after acknowledged writes, further writes after reopening,
-and preservation of unresolved states. A test-only sync fault against the
+and preservation of unresolved states. Service-owner tests also cover stale
+internal routes, base-root mismatch, process loss after a service write and a
+panicked service call retaining its original connection. A test-only sync fault against the
 rollback journal verifies that the engine reports an uncertain result and
 quarantines the connection, and that a fresh process sees the prior complete
 transaction. The VM harness can exercise the overlay with `--probe-kind
