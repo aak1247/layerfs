@@ -10,6 +10,178 @@ use layerfs_overlay::{Overlay, OverlayError, ProfileConfig};
 use layerfs_workspace::Route;
 use std::{path::Path, sync::Arc};
 
+/// One before-effect capacity slot and its never-reused local namespace.
+pub struct DurableReservation {
+    pub(super) roster: Arc<super::workspaces::Workspaces>,
+    pub(super) namespace: i64,
+    pub(super) identity: [u8; 32],
+}
+impl std::fmt::Debug for DurableReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableReservation")
+            .field("namespace", &self.namespace)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An attempted creation keeps its slot and any original live owner.
+pub struct DurableCreationCustody {
+    reservation: Option<DurableReservation>,
+    owner: Option<Owner>,
+}
+impl DurableCreationCustody {
+    pub fn namespace(&self) -> i64 {
+        self.reservation
+            .as_ref()
+            .expect("reservation retained")
+            .namespace
+    }
+    pub fn identity(&self) -> [u8; 32] {
+        self.reservation
+            .as_ref()
+            .expect("reservation retained")
+            .identity
+    }
+    pub fn owner(&self) -> Option<&Owner> {
+        self.owner.as_ref()
+    }
+}
+impl Drop for DurableCreationCustody {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            std::mem::forget(reservation);
+        }
+        if let Some(owner) = self.owner.take() {
+            std::mem::forget(owner);
+        }
+    }
+}
+
+/// Original creation/admission failure and the exact retained owner, if any.
+pub struct DurableCreationFailure {
+    pub cause: OwnerError,
+    pub custody: DurableCreationCustody,
+}
+impl std::fmt::Debug for DurableCreationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableCreationFailure")
+            .field("cause", &self.cause)
+            .field("namespace", &self.custody.namespace())
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for DurableCreationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "durable Workspace creation: {}", self.cause)
+    }
+}
+impl std::error::Error for DurableCreationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// A failed before-effect release returns the unchanged reservation.
+pub struct DurableReleaseFailure {
+    pub cause: OwnerError,
+    pub reservation: DurableReservation,
+}
+impl std::fmt::Debug for DurableReleaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableReleaseFailure")
+            .field("cause", &self.cause)
+            .field("namespace", &self.reservation.namespace)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for DurableReleaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "durable Workspace reservation release: {}",
+            self.cause
+        )
+    }
+}
+impl std::error::Error for DurableReleaseFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+impl DurableReservation {
+    pub fn namespace(&self) -> i64 {
+        self.namespace
+    }
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    /// Release only before attempting durable Workspace creation. The local
+    /// namespace remains consumed and is never reused by this owner.
+    pub fn release(self) -> Result<(), Box<DurableReleaseFailure>> {
+        match self
+            .roster
+            .release_durable_reservation(self.namespace, self.identity)
+        {
+            Ok(()) => Ok(()),
+            Err(cause) => Err(Box::new(DurableReleaseFailure {
+                cause,
+                reservation: self,
+            })),
+        }
+    }
+
+    /// Attempt creation once and admit the resulting exact owner into this slot.
+    /// On any failure the caller keeps its original error and custody; there is
+    /// no retry, cleanup or release of the attempted reservation.
+    pub fn create(
+        self,
+        path: &Path,
+        profile: ProfileConfig,
+        expected_base_root: [u8; 32],
+    ) -> Result<OwnerClient, Box<DurableCreationFailure>> {
+        let spec = DurableWorkspace {
+            path,
+            profile,
+            identity: self.identity,
+            namespace: self.namespace,
+            expected_base_root,
+        };
+        let owner = match Owner::create_durable(spec) {
+            Ok(owner) => owner,
+            Err(cause) => {
+                return Err(Box::new(DurableCreationFailure {
+                    cause,
+                    custody: DurableCreationCustody {
+                        reservation: Some(self),
+                        owner: None,
+                    },
+                }))
+            }
+        };
+        match self
+            .roster
+            .admit_reserved_durable(self.namespace, self.identity, owner)
+        {
+            Ok(client) => Ok(client),
+            Err(failure) => {
+                let DurableAdmissionFailure { cause, owner } = *failure;
+                Err(Box::new(DurableCreationFailure {
+                    cause,
+                    custody: DurableCreationCustody {
+                        reservation: Some(self),
+                        owner: Some(owner),
+                    },
+                }))
+            }
+        }
+    }
+}
+
 /// Authenticated identity and expected root of one durable Workspace.
 /// The namespace identifies its daemon-local route. Schema 41 records its
 /// per-Workspace high-water mark before a token can be exposed.
@@ -42,6 +214,14 @@ impl std::fmt::Display for DurableAdmissionFailure {
 impl std::error::Error for DurableAdmissionFailure {}
 
 impl Owner {
+    /// Reserve capacity and a fresh namespace before writing a discovery intent.
+    pub fn reserve_durable(&self, identity: [u8; 32]) -> Result<DurableReservation, OwnerError> {
+        self.client
+            .roster()
+            .ok_or(OwnerError::InvalidAdmission)?
+            .reserve_durable(identity)
+    }
+
     /// Transfers an already authorized durable owner into this bounded roster.
     /// The caller retains responsibility for discovery, authorization and old
     /// mount/process fencing. A refusal returns the original owner unchanged.

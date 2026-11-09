@@ -1,7 +1,7 @@
 //! Closed template and a bounded roster of independently served Workspace files.
 use super::{
     backing::Backing,
-    durable_owner::DurableAdmissionFailure,
+    durable_owner::{DurableAdmissionFailure, DurableReservation},
     owner::{Owner, OwnerClient, OwnerConfig, OwnerError},
     state::Shared,
 };
@@ -103,6 +103,115 @@ pub(super) fn start(path: &Path, profile: ProfileConfig, config: OwnerConfig) ->
 impl Workspaces {
     pub fn configuration(&self) -> OwnerConfig {
         self.config
+    }
+
+    pub(super) fn reserve_durable(
+        self: &Arc<Self>,
+        identity: [u8; 32],
+    ) -> Result<DurableReservation, OwnerError> {
+        if identity == [0; 32] {
+            return Err(OwnerError::InvalidAdmission);
+        }
+        let mut state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
+        if state.stopping {
+            return Err(OwnerError::Stopped);
+        }
+        if state.slots.len() >= self.config.namespaces {
+            return Err(OwnerError::AdmissionFull);
+        }
+        if state
+            .slots
+            .values()
+            .any(|slot| matches!(slot, Slot::Starting(stored) if *stored == identity))
+        {
+            return Err(OwnerError::InvalidAdmission);
+        }
+        let namespace = state.next;
+        state.next = namespace
+            .checked_add(1)
+            .ok_or(OwnerError::IdentityExhausted)?;
+        state.slots.insert(namespace, Slot::Starting(identity));
+        Ok(DurableReservation {
+            roster: self.clone(),
+            namespace,
+            identity,
+        })
+    }
+
+    pub(super) fn release_durable_reservation(
+        &self,
+        namespace: i64,
+        identity: [u8; 32],
+    ) -> Result<(), OwnerError> {
+        let mut state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
+        if state.stopping {
+            return Err(OwnerError::Stopped);
+        }
+        if !matches!(state.slots.get(&namespace), Some(Slot::Starting(stored)) if *stored == identity)
+        {
+            return Err(OwnerError::InvalidAdmission);
+        }
+        state.slots.remove(&namespace);
+        Ok(())
+    }
+
+    pub(super) fn admit_reserved_durable(
+        &self,
+        namespace: i64,
+        identity: [u8; 32],
+        owner: Owner,
+    ) -> Result<OwnerClient, Box<DurableAdmissionFailure>> {
+        let client = owner.client();
+        let admission = (|| {
+            if client.durable_identity()? != Some(identity) {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            let route = client.bound_route()?;
+            if route.namespace() != namespace || client.state(route)?.closed {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            let state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
+            if state.stopping {
+                return Err(OwnerError::Stopped);
+            }
+            if !matches!(state.slots.get(&namespace), Some(Slot::Starting(stored)) if *stored == identity)
+            {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            if state.slots.iter().any(|(other, slot)| {
+                *other != namespace
+                    && match slot {
+                        Slot::Starting(stored)
+                        | Slot::Live {
+                            incarnation: stored,
+                            ..
+                        }
+                        | Slot::Retiring {
+                            incarnation: stored,
+                        }
+                        | Slot::Failed {
+                            incarnation: stored,
+                            ..
+                        } => *stored == route.incarnation(),
+                    }
+            }) {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            Ok((state, route))
+        })();
+        let (mut state, route) = match admission {
+            Ok(value) => value,
+            Err(cause) => return Err(Box::new(DurableAdmissionFailure { cause, owner })),
+        };
+        state.slots.insert(
+            namespace,
+            Slot::Live {
+                owner: Arc::new(Mutex::new(Some(owner))),
+                incarnation: route.incarnation(),
+                durable: true,
+            },
+        );
+        Ok(client)
     }
     pub(super) fn vacant_namespace_floor(&self) -> Result<i64, OwnerError> {
         let state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
@@ -476,6 +585,15 @@ impl Workspaces {
             let mut state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
             if state.stopping {
                 return Ok(());
+            }
+            if state
+                .slots
+                .values()
+                .any(|slot| matches!(slot, Slot::Starting(_)))
+            {
+                // An in-flight open or durable creation retains the roster;
+                // stopping must not race it and leave a late owner untracked.
+                return Err(OwnerError::InvalidAdmission);
             }
             state.stopping = true;
             state

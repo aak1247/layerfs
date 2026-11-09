@@ -22,6 +22,16 @@ or file and never removes records. Overlay files live separately; each record
 supplies a deterministic filename component, and the caller must open it with
 the Overlay's own identity and directory checks.
 
+`Owner::reserve_durable` separately reserves a bounded owner slot and a fresh
+local namespace before the caller writes a creation intent. Releasing an
+unattempted reservation does not reuse that namespace. `create` consumes the
+reservation, creates one durable Overlay and admits its exact owner into the
+reserved slot. An attempted failure returns the original error and retained
+slot/owner custody; it cannot be automatically released or retried. The caller
+still serializes Workspace identity through this catalog and must retain both
+owners when discovery or binding has an uncertain outcome. This primitive is
+not yet wired to daemon Mount or AutoTask.
+
 The directory contains an authority-bound owner file, immutable Workspace and
 lifecycle event files, a fixed-width hash-chained ledger and a durable ledger
 head. Appending writes and synchronizes the event, appends and synchronizes the

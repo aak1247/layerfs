@@ -222,6 +222,190 @@ fn durable_and_disposable_owners_share_capacity_without_route_collision() {
 }
 
 #[test]
+fn durable_reservations_bound_capacity_and_keep_released_namespaces_consumed() {
+    let fixture = Fixture::new();
+    let roster = Owner::start(
+        &fixture.0.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let first = roster.reserve_durable([51; 32]).unwrap();
+    let second = roster.reserve_durable([52; 32]).unwrap();
+    assert_eq!((first.namespace(), second.namespace()), (1, 2));
+    assert!(matches!(
+        roster.reserve_durable([53; 32]),
+        Err(OwnerError::AdmissionFull)
+    ));
+    first.release().unwrap();
+    let third = roster.reserve_durable([53; 32]).unwrap();
+    assert_eq!(third.namespace(), 3);
+    let third = third
+        .create(
+            &fixture.0.join("third.sqlite"),
+            ProfileConfig::default(),
+            ROOT,
+        )
+        .unwrap();
+    let second = second
+        .create(
+            &fixture.0.join("second.sqlite"),
+            ProfileConfig::default(),
+            ROOT,
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            second.bound_route().unwrap().namespace(),
+            third.bound_route().unwrap().namespace()
+        ),
+        (2, 3)
+    );
+    assert!(matches!(
+        roster.reserve_durable([54; 32]),
+        Err(OwnerError::AdmissionFull)
+    ));
+    for client in [&second, &third] {
+        let route = client.bound_route().unwrap();
+        client.close(route).unwrap();
+        roster.client().retire_namespace(route.namespace()).unwrap();
+    }
+    let fourth = roster.reserve_durable([54; 32]).unwrap();
+    assert_eq!(fourth.namespace(), 4);
+    fourth.release().unwrap();
+    roster.stop().unwrap();
+    assert!(fixture.0.join("second.sqlite").is_file());
+    assert!(fixture.0.join("third.sqlite").is_file());
+}
+
+#[test]
+fn concurrent_durable_reservations_do_not_overbook_capacity() {
+    let fixture = Fixture::new();
+    let roster = Arc::new(
+        Owner::start(
+            &fixture.0.join("template.sqlite"),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 8 },
+        )
+        .unwrap(),
+    );
+    let gate = Arc::new(std::sync::Barrier::new(17));
+    let (sender, receiver) = mpsc::channel();
+    let mut threads = Vec::new();
+    for identity in 1..=16u8 {
+        let roster = roster.clone();
+        let gate = gate.clone();
+        let sender = sender.clone();
+        threads.push(std::thread::spawn(move || {
+            gate.wait();
+            sender.send(roster.reserve_durable([identity; 32])).unwrap();
+        }));
+    }
+    drop(sender);
+    gate.wait();
+    let results = receiver.into_iter().collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(results.len(), 16);
+    let mut admitted = Vec::new();
+    let mut refused = 0;
+    for result in results {
+        match result {
+            Ok(reservation) => admitted.push(reservation),
+            Err(OwnerError::AdmissionFull) => refused += 1,
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+        }
+    }
+    assert_eq!((admitted.len(), refused), (8, 8));
+    let mut namespaces = admitted
+        .iter()
+        .map(|value| value.namespace())
+        .collect::<Vec<_>>();
+    namespaces.sort_unstable();
+    assert_eq!(namespaces, (1..=8).collect::<Vec<_>>());
+    for reservation in admitted {
+        reservation.release().unwrap();
+    }
+    Arc::try_unwrap(roster).ok().unwrap().stop().unwrap();
+}
+
+#[test]
+fn owner_stop_cannot_pass_an_unsettled_durable_reservation() {
+    let fixture = Fixture::new();
+    let roster = Owner::start(
+        &fixture.0.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 1 },
+    )
+    .unwrap();
+    let reservation = roster.reserve_durable([57; 32]).unwrap();
+    assert!(matches!(roster.stop(), Err(OwnerError::InvalidAdmission)));
+    reservation.release().unwrap();
+    assert!(!fixture.0.join("57.sqlite").exists());
+}
+
+#[test]
+fn failed_reserved_creation_retains_capacity_and_original_file() {
+    const CHILD: &str = "LAYERFS_DURABLE_RESERVATION_FAILURE_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let directory = PathBuf::from(directory);
+        let roster = Owner::start(
+            &directory.join("template.sqlite"),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 1 },
+        )
+        .unwrap();
+        let reservation = roster.reserve_durable([55; 32]).unwrap();
+        let failure = match reservation.create(
+            &directory.join("existing.sqlite"),
+            ProfileConfig::default(),
+            ROOT,
+        ) {
+            Ok(_) => panic!("existing file must not be replaced"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.custody.namespace(), 1);
+        assert_eq!(failure.custody.identity(), [55; 32]);
+        assert!(failure.custody.owner().is_none());
+        assert!(matches!(
+            roster.reserve_durable([56; 32]),
+            Err(OwnerError::AdmissionFull)
+        ));
+        assert_eq!(
+            fs::read(directory.join("existing.sqlite")).unwrap(),
+            b"original user data"
+        );
+        drop(failure);
+        assert!(matches!(
+            roster.reserve_durable([56; 32]),
+            Err(OwnerError::AdmissionFull)
+        ));
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("existing.sqlite"), b"original user data").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "failed_reserved_creation_retains_capacity_and_original_file",
+        ])
+        .env(CHILD, &fixture.0)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(fixture.0.join("existing.sqlite")).unwrap(),
+        b"original user data"
+    );
+}
+
+#[test]
 fn stopped_owner_wait_returns_the_unattempted_action() {
     let fixture = Fixture::new();
     let owner = Owner::create_durable(spec(&fixture.path())).unwrap();
