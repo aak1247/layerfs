@@ -21,4 +21,5 @@ pub(crate) use kernel_directory::INLINE_PAGES;
 mod kernel_directory_read;
 mod kernel_file;
 mod kernel_mutation;
+mod kernel_sync;
 mod kernel_visit;

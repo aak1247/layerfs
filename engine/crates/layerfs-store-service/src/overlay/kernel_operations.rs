@@ -7,6 +7,20 @@ use layerfs_workspace::{
 };
 use std::sync::Arc;
 impl OwnerClient {
+    /// The exact descriptor's overlay barrier, under its Workspace owner.
+    /// The caller must separately establish the Store's durability.
+    pub fn kernel_synchronize(
+        &self,
+        route: Route,
+        mount: KernelMount,
+        serial: u64,
+        handle: u64,
+        directory: bool,
+    ) -> Result<(), OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.synchronize_kernel(mount, serial, handle, directory)
+        })
+    }
     pub fn kernel_mount(
         &self,
         route: Route,

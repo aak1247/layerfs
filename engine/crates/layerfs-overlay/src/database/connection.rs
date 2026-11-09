@@ -335,6 +335,38 @@ impl Overlay {
             }
         }
     }
+    /// One checked barrier outside any running atomic job. The caller owns
+    /// the Workspace turn and separately establishes its base's durability.
+    pub(crate) fn synchronize_durable_database(&self) -> OverlayResult<()> {
+        self.available()?;
+        if self.transaction.get() != Transaction::None {
+            return Err(OverlayError::Invalid("synchronization inside atomic job"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let lease = self
+                .durable
+                .as_ref()
+                .ok_or(OverlayError::Invalid("durable overlay required"))?;
+            let result = self
+                .allocation
+                .sync_durable_file()
+                .and_then(|_| lease.sync_directory())
+                .and_then(|_| self.allocation.state().map(|_| ()));
+            if let Err(cause) = result {
+                self.quarantined.set(true);
+                return Err(OverlayError::Uncertain {
+                    cause: Box::new(cause),
+                    completion: None,
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(OverlayError::UnsupportedPlatform)
+        }
+    }
     /// Runs one job atomically. Reads before the job's first writing statement
     /// execute in autocommit: this connection is the only one, holds the
     /// exclusive lock and runs one job at a time, so they see the same state.

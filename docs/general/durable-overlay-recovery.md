@@ -59,6 +59,15 @@ barrier is implemented, durable mounts explicitly reject FUSE FSYNC and
 FSYNCDIR with EOPNOTSUPP; they do not use ENOSYS, which Linux would cache as a
 successful synchronization. This is not an `fsync` durability claim.
 
+The Overlay provides a separate `synchronize_kernel` primitive: it validates
+the live mount and the exact file or directory handle, then synchronizes the
+durable overlay file and its original checked directory. A file or directory
+sync failure quarantines the owner and retains its connection and lease; a
+disposable database or a nested atomic job cannot claim this barrier. Tests
+inject failures into each sync and exercise stale and mismatched handles. This
+primitive does not establish that the Store or its base is durable and is not
+wired to a successful FUSE reply.
+
 The durable profile is SQLite DELETE/EXTRA/EXCLUSIVE. SQLite documents that
 [FULL alone is not necessarily durable in DELETE mode](https://sqlite.org/pragma.html#pragma_synchronous).
 In this pinned SQLite build, exclusive locking can reuse the journal rather
