@@ -100,6 +100,18 @@ Native binding tests use a simulated Engine and daemon to check successful
 creation, an unknown Start, and failure while recording the Create reply; they
 do not establish a real Docker or FUSE recovery result for this SDK path.
 
+An isolated Docker proof subsequently exercised the real Node binding, daemon
+and FUSE mounts with a Durable Store: two distinct Workspaces wrote and synced
+different bytes. After the original test Sandbox was killed, its two original
+processes and FUSE connections were checked absent. A new Node process refused
+to reclaim the stopped Sandbox and retained both records. A separate test-only
+Service then opened the same Store and catalog, selected fresh namespaces,
+remounted both exact Workspaces and read their original bytes. Its output,
+source and binary hashes, old-owner fence and retention ownership are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-docker-20261110-sstqc67g/`.
+This manually fenced same-host recovery does not implement automatic SDK
+recovery, Kubernetes reconstruction or physical host power-loss handling.
+
 For a Sandbox record explicitly marked durable, the Node binding records a
 private mount intent before Bind, the original Branch snapshot before Attach,
 and the exact Ready receipt before reporting success. It synchronizes the
