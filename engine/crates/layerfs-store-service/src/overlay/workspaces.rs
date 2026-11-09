@@ -1,6 +1,7 @@
 //! Closed template and a bounded roster of independently served Workspace files.
 use super::{
     backing::Backing,
+    durable_owner::DurableAdmissionFailure,
     owner::{Owner, OwnerClient, OwnerConfig, OwnerError},
     state::Shared,
 };
@@ -18,6 +19,7 @@ enum Slot {
     Live {
         owner: Arc<Mutex<Option<Owner>>>,
         incarnation: [u8; 32],
+        durable: bool,
     },
     Retiring {
         incarnation: [u8; 32],
@@ -117,6 +119,66 @@ impl Workspaces {
             Some(Slot::Failed { cause, .. }) => Err(OwnerError::Retained(cause.clone())),
             _ => Err(OwnerError::Overlay(layerfs_overlay::OverlayError::Stale)),
         }
+    }
+    pub(super) fn adopt_durable(
+        &self,
+        owner: Owner,
+    ) -> Result<OwnerClient, Box<DurableAdmissionFailure>> {
+        let client = owner.client();
+        let admission = (|| {
+            if client.durable_identity()?.is_none() {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            let route = client.bound_route()?;
+            if client.state(route)?.closed {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            let next = route
+                .namespace()
+                .checked_add(1)
+                .ok_or(OwnerError::IdentityExhausted)?;
+            let state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
+            if state.stopping {
+                return Err(OwnerError::Stopped);
+            }
+            if state.slots.len() >= self.config.namespaces {
+                return Err(OwnerError::AdmissionFull);
+            }
+            if route.namespace() < state.next || state.slots.contains_key(&route.namespace()) {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            if state.slots.values().any(|slot| match slot {
+                Slot::Starting(stored)
+                | Slot::Live {
+                    incarnation: stored,
+                    ..
+                }
+                | Slot::Retiring {
+                    incarnation: stored,
+                }
+                | Slot::Failed {
+                    incarnation: stored,
+                    ..
+                } => *stored == route.incarnation(),
+            }) {
+                return Err(OwnerError::InvalidAdmission);
+            }
+            Ok((state, route, next))
+        })();
+        let (mut state, route, next) = match admission {
+            Ok(admission) => admission,
+            Err(cause) => return Err(Box::new(DurableAdmissionFailure { cause, owner })),
+        };
+        state.next = next;
+        state.slots.insert(
+            route.namespace(),
+            Slot::Live {
+                owner: Arc::new(Mutex::new(Some(owner))),
+                incarnation: route.incarnation(),
+                durable: true,
+            },
+        );
+        Ok(client)
     }
     fn fail(&self, namespace: i64, cause: OwnerError) -> OwnerError {
         let cause = Arc::new(cause);
@@ -219,6 +281,7 @@ impl Workspaces {
                 Slot::Live {
                     owner: Arc::new(Mutex::new(Some(owner))),
                     incarnation,
+                    durable: false,
                 },
             );
         Ok(client)
@@ -239,6 +302,7 @@ impl Workspaces {
             Some(Slot::Live {
                 owner,
                 incarnation: stored,
+                ..
             }) if *stored == incarnation => owner
                 .lock()
                 .map_err(|_| OwnerError::Stopped)?
@@ -305,34 +369,49 @@ impl Workspaces {
         self.retire_with(namespace, true)
     }
     fn retire_with(&self, namespace: i64, terminal: bool) -> Result<(), OwnerError> {
-        let owner = {
+        if terminal {
+            let client = self.client(namespace)?;
+            if client.durable_identity()?.is_some() && !client.state(client.bound_route()?)?.closed
+            {
+                return Err(OwnerError::InvalidAdmission);
+            }
+        }
+        let (owner, durable, incarnation) = {
             let mut state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
-            let Some(Slot::Live { owner, incarnation }) = state.slots.get(&namespace) else {
+            let Some(Slot::Live {
+                owner,
+                incarnation,
+                durable,
+            }) = state.slots.get(&namespace)
+            else {
                 return Err(OwnerError::Stopped);
             };
             let incarnation = *incarnation;
-            let owner = owner
-                .lock()
-                .map_err(|_| OwnerError::Stopped)?
-                .take()
-                .ok_or(OwnerError::Stopped)?;
-            let backing = owner
-                .client
-                .connection()?
-                .state
-                .lock()
-                .map_err(|_| OwnerError::Stopped)?
-                .backing
-                .as_ref()
-                .ok_or(OwnerError::Stopped)?
-                .clone();
-            if terminal {
-                backing.terminal();
+            let durable = *durable;
+            let mut slot = owner.lock().map_err(|_| OwnerError::Stopped)?;
+            if !durable {
+                let backing = slot
+                    .as_ref()
+                    .ok_or(OwnerError::Stopped)?
+                    .client
+                    .connection()?
+                    .state
+                    .lock()
+                    .map_err(|_| OwnerError::Stopped)?
+                    .backing
+                    .as_ref()
+                    .ok_or(OwnerError::Stopped)?
+                    .clone();
+                if terminal {
+                    backing.terminal();
+                }
             }
+            let owner = slot.take().ok_or(OwnerError::Stopped)?;
+            drop(slot);
             state
                 .slots
                 .insert(namespace, Slot::Retiring { incarnation });
-            owner
+            (owner, durable, incarnation)
         };
         let client = owner.client();
         let result = owner.stop();
@@ -344,6 +423,15 @@ impl Workspaces {
             .retired
             .accumulate(&observed);
         match result {
+            Ok(()) if durable => {
+                let mut state = self.state.lock().map_err(|_| OwnerError::Stopped)?;
+                if !matches!(state.slots.get(&namespace), Some(Slot::Retiring { incarnation: stored }) if *stored == incarnation)
+                {
+                    return Err(OwnerError::Stopped);
+                }
+                state.slots.remove(&namespace);
+                Ok(())
+            }
             Ok(()) => Ok(()),
             Err(cause) => Err(self.fail(namespace, cause)),
         }

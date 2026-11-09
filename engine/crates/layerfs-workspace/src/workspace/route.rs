@@ -26,4 +26,8 @@ impl Route {
     pub const fn engine(self) -> u64 {
         self.engine
     }
+    /// Exact incarnation selected when this route was created.
+    pub const fn incarnation(self) -> [u8; 32] {
+        self.incarnation
+    }
 }

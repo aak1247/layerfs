@@ -59,12 +59,17 @@ requiring an external root, but still requires the independently known file
 path and Workspace identity. The resulting snapshot must pass Store binding
 and the caller's authorization and old-owner fencing checks.
 
-An explicitly assembled daemon `Service` can register one already bound
-durable owner and use its ordinary control and FUSE Attach path. Registration
-checks the exact owner and Store, and a refusal returns the original binding.
-The caller selects a control namespace and fences the prior process, mount and
-consumers; schema 41 rejects reuse for the same Workspace, but this path is not
-a durable roster or automatic restart.
+An explicitly assembled daemon `Service` can register already bound durable
+owners and use its ordinary control and FUSE Attach path. The caller may first
+transfer each owner into an in-memory bounded `Owner` roster with
+`adopt_durable`; this shares the configured capacity with disposable owners.
+Within one roster lifetime, adopted namespaces must increase and cannot collide
+with earlier owners. A refused adoption returns the original owner; a refused
+registration returns the original binding. Registration verifies the exact
+roster owner, durable Workspace identity and Store. The caller selects the
+namespaces and fences the prior process, mounts and consumers; schema 41 also
+rejects reuse for the same Workspace. The roster itself is not persisted and
+does not discover files or automatically restart a Sandbox.
 Terminal unmount closes the database but retains its files. When the full
 barrier is unavailable, a durable mount rejects FUSE FSYNC and FSYNCDIR with
 EOPNOTSUPP; it does not use ENOSYS, which Linux would cache as successful
@@ -233,3 +238,23 @@ process-loss test, not container/Pod recreation, automatic mount recovery,
 physical power loss or a performance qualification. The output, exit status,
 executable/source hashes, test-only fault shim, image and kernel facts are under
 `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-sync-verified-20261109/`.
+
+The schema-41 FUSE rerun also explicitly attempted recovery with the old
+namespace before remounting under a newer one; all five container test cases
+passed. Docker reported the test container's exit code as 0, but its automatic
+removal remained in progress after the client wait timed out. The runner
+output, executable/source hashes and observed Docker state are retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-fuse-sync-namespace41-20261109/`.
+
+A separate isolated FUSE test manually adopted two durable owners into one
+daemon and mounted both against one Durable Store. An unprivileged process
+wrote different bytes to each and synchronized them. After killing and reaping
+the daemon, the test detached both old mounts, reopened each original file
+under a newer namespace, rejected both old tokens and verified the distinct
+bytes as an unprivileged user. The test then synchronized and explicitly
+unmounted both recovered views. It used a test-only container with `/dev/fuse`,
+CAP_SYS_ADMIN, unconfined AppArmor and seccomp, and no network or Docker socket.
+This tests two manually assembled Workspaces after process loss, not automatic
+discovery, Pod recovery, physical power loss or high-capacity performance. The
+output, exit status and image/kernel/source hashes are retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-multi-fuse-20261109/`.

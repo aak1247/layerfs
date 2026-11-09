@@ -2,7 +2,9 @@
 #![cfg(target_os = "linux")]
 
 use layerfs_overlay::{Changes, Inode, InodeKind, OverlayError, PayloadWrite, ProfileConfig};
-use layerfs_store_service::{DurableWorkspace, Owner, OwnerClient, OwnerError, ServiceClass};
+use layerfs_store_service::{
+    DurableWorkspace, Owner, OwnerClient, OwnerConfig, OwnerError, ServiceClass,
+};
 use layerfs_workspace::Route;
 use std::{
     fs,
@@ -102,6 +104,121 @@ fn read(client: &OwnerClient, route: Route) -> Vec<u8> {
             Ok(bytes)
         })
         .unwrap()
+}
+
+#[test]
+fn bounded_roster_adopts_durable_owners_without_reusing_namespaces() {
+    let fixture = Fixture::new();
+    let roster = Owner::start(
+        &fixture.0.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let make = |name: &str, identity: u8, namespace: i64| {
+        let path = fixture.0.join(name);
+        let mut value = spec(&path);
+        value.identity = [identity; 32];
+        value.namespace = namespace;
+        Owner::create_durable(value).unwrap()
+    };
+    let first = roster.adopt_durable(make("first.sqlite", 41, 1)).unwrap();
+    let first_route = first.bound_route().unwrap();
+    write(&first, first_route);
+
+    let rejected = match roster.adopt_durable(make("collision.sqlite", 42, 1)) {
+        Ok(_) => panic!("reused namespace was admitted"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(rejected.cause, OwnerError::InvalidAdmission));
+    assert!(
+        !rejected
+            .owner
+            .client()
+            .state(rejected.owner.client().bound_route().unwrap())
+            .unwrap()
+            .closed
+    );
+    rejected.owner.stop().unwrap();
+
+    let second = roster.adopt_durable(make("second.sqlite", 43, 2)).unwrap();
+    let second_route = second.bound_route().unwrap();
+    write(&second, second_route);
+    let rejected = match roster.adopt_durable(make("third.sqlite", 44, 3)) {
+        Ok(_) => panic!("full roster admitted another owner"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(rejected.cause, OwnerError::AdmissionFull));
+    assert_eq!(read(&second, second_route), BYTES);
+    assert!(matches!(
+        roster.client().retire_namespace(1),
+        Err(OwnerError::InvalidAdmission)
+    ));
+    first.close(first_route).unwrap();
+    roster.client().retire_namespace(1).unwrap();
+    assert!(first.state(first_route).is_err());
+    assert!(fixture.0.join("first.sqlite").is_file());
+
+    let third = roster.adopt_durable(rejected.owner).unwrap();
+    let third_route = third.bound_route().unwrap();
+    write(&third, third_route);
+    roster.stop().unwrap();
+    assert!(second.state(second_route).is_err());
+    for (name, identity, namespace) in [("second.sqlite", 43, 4), ("third.sqlite", 44, 5)] {
+        let path = fixture.0.join(name);
+        let mut value = spec(&path);
+        value.identity = [identity; 32];
+        value.namespace = namespace;
+        let recovered = Owner::recover_durable(value).unwrap();
+        assert_eq!(
+            read(
+                &recovered.client(),
+                recovered.client().bound_route().unwrap()
+            ),
+            BYTES
+        );
+        recovered.stop().unwrap();
+    }
+}
+
+#[test]
+fn durable_and_disposable_owners_share_capacity_without_route_collision() {
+    let fixture = Fixture::new();
+    let roster = Owner::start(
+        &fixture.0.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let path = fixture.path();
+    let mut value = spec(&path);
+    value.namespace = 5;
+    let durable = roster
+        .adopt_durable(Owner::create_durable(value).unwrap())
+        .unwrap();
+    let durable_route = durable.bound_route().unwrap();
+    write(&durable, durable_route);
+    let disposable_route = roster.client().open(None, [44; 32], ROOT).unwrap();
+    assert_eq!(disposable_route.namespace(), 6);
+    assert_eq!(read(&durable, durable_route), BYTES);
+    assert!(roster.client().open(None, [45; 32], ROOT).is_err());
+    roster.client().close(disposable_route).unwrap();
+    roster
+        .client()
+        .retire_namespace(disposable_route.namespace())
+        .unwrap();
+    roster.stop().unwrap();
+    let mut recovered_spec = spec(&path);
+    recovered_spec.namespace = 7;
+    let recovered = Owner::recover_durable(recovered_spec).unwrap();
+    assert_eq!(
+        read(
+            &recovered.client(),
+            recovered.client().bound_route().unwrap()
+        ),
+        BYTES
+    );
+    recovered.stop().unwrap();
 }
 
 #[test]

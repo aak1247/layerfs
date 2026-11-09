@@ -181,7 +181,9 @@ lifecycle/frontier/dirty/base-reader counters are one journaled runtime value,
 restored only after known whole-job rollback; unknown outcomes retain custody.
 Commit runs/readers/base pins are journaled owner maps; captured generation
 holds use a count index. Daemon-bound routing is checked once per call; Overlay
-accepts no Route and stores no namespace. Cleanup debt remains SQL-backed after
+accepts no Route. A schema-41 durable Workspace records its last control
+namespace only to reject token reuse after recovery; filesystem rows are not
+partitioned by namespace. Cleanup debt remains SQL-backed after
 the [memory-placement review](../core/docs/issues/320/CLEANUP-MEMORY-DESIGN-20261014.md).
 Resources computes row/length totals on demand and
 retains exact owner counts from memory. See the current

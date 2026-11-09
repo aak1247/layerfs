@@ -73,6 +73,12 @@ impl BoundWorkspace {
             .durable_identity()
             .map_or(true, |identity| identity.is_some())
     }
+    /// True only when the owner's durable identity matches this Workspace.
+    pub fn has_verified_durable_overlay(&self) -> bool {
+        self.owner
+            .durable_identity()
+            .is_ok_and(|identity| identity == Some(self.identity.to_bytes()))
+    }
     /// True only for a concrete Linux Durable Store opened by this adapter.
     pub fn has_durable_store(&self) -> bool {
         self.store.durable_writer.is_some()

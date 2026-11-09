@@ -9,7 +9,7 @@ use layerfs_daemon::{
     bootstrap::open_store,
     control::{KernelConfig, KernelServing, Service},
     store::BindRequest,
-    Owner, ServiceClass,
+    Owner, OwnerConfig, ServiceClass,
 };
 use layerfs_history::WorkspaceId;
 use layerfs_overlay::ProfileConfig;
@@ -115,6 +115,130 @@ fn registration_checks_exact_ownership_and_retains_files_on_unmount() {
     drop(service);
     first.stop().unwrap();
     assert!(first_path.is_file() && second_path.is_file());
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn one_service_controls_two_adopted_durable_workspaces() {
+    let fixture = support::Fixture::new(1, "durable-roster-registration");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        2,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let snapshot = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let roster = Owner::start(
+        &fixture.directory.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let service = Service::new(store.clone(), &roster);
+    let mut tokens = Vec::new();
+    for (name, identity, namespace) in [("first.sqlite", 51, 1), ("second.sqlite", 52, 2)] {
+        let path = directory.join(name);
+        let owner = Owner::create_durable(spec(
+            &path,
+            identity,
+            namespace,
+            snapshot.effective_root.to_bytes(),
+        ))
+        .unwrap();
+        let client = roster.adopt_durable(owner).unwrap();
+        let workspace = store
+            .bind_durable(
+                client,
+                BindRequest {
+                    workspace: WorkspaceId::from_authority([identity; 32]).unwrap(),
+                    branch: fixture.branch,
+                },
+                snapshot.clone(),
+            )
+            .unwrap()
+            .workspace;
+        tokens.push(service.register_durable(workspace).unwrap());
+    }
+    assert_eq!(service.workspaces(), Some(2));
+    for token in &tokens {
+        assert!(matches!(
+            service
+                .execute_control(&Request::Status(*token))
+                .unwrap()
+                .reply,
+            Reply::Status(_)
+        ));
+    }
+    for token in tokens {
+        assert_eq!(
+            service
+                .execute_control(&Request::Unmount(UnmountControl {
+                    token,
+                    discard: false,
+                }))
+                .unwrap()
+                .reply,
+            Reply::Unmounted(token)
+        );
+    }
+    assert_eq!(service.workspaces(), Some(0));
+    assert!(directory.join("first.sqlite").is_file());
+    assert!(directory.join("second.sqlite").is_file());
+    drop(service);
+    roster.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn durable_registration_refuses_a_disposable_binding_from_its_own_roster() {
+    let fixture = support::Fixture::new(1, "disposable-roster-registration");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        2,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let roster = Owner::start(
+        &fixture.directory.join("template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let workspace = store
+        .bind(
+            roster.client(),
+            BindRequest {
+                workspace: WorkspaceId::from_authority([53; 32]).unwrap(),
+                branch: fixture.branch,
+            },
+        )
+        .unwrap()
+        .workspace;
+    let namespace = workspace.route().namespace();
+    assert!(!workspace.has_verified_durable_overlay());
+    let service = Service::new(store.clone(), &roster);
+    let rejected = service.register_durable(workspace).unwrap_err();
+    assert_eq!(service.workspaces(), Some(0));
+    rejected.workspace.close().unwrap();
+    drop(rejected);
+    roster.client().retire_namespace(namespace).unwrap();
+    drop(service);
+    roster.stop().unwrap();
     drop(store);
     fixture.cleanup();
 }

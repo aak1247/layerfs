@@ -21,7 +21,40 @@ pub struct DurableWorkspace<'a> {
     pub expected_base_root: [u8; 32],
 }
 
+/// A before-effect roster refusal returns the original owner to its caller.
+pub struct DurableAdmissionFailure {
+    pub cause: OwnerError,
+    pub owner: Owner,
+}
+impl std::fmt::Debug for DurableAdmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableAdmissionFailure")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for DurableAdmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "durable Workspace admission: {}", self.cause)
+    }
+}
+impl std::error::Error for DurableAdmissionFailure {}
+
 impl Owner {
+    /// Transfers an already authorized durable owner into this bounded roster.
+    /// The caller retains responsibility for discovery, authorization and old
+    /// mount/process fencing. A refusal returns the original owner unchanged.
+    pub fn adopt_durable(&self, owner: Owner) -> Result<OwnerClient, Box<DurableAdmissionFailure>> {
+        match self.client.roster() {
+            Some(roster) => roster.adopt_durable(owner),
+            None => Err(Box::new(DurableAdmissionFailure {
+                cause: OwnerError::InvalidAdmission,
+                owner,
+            })),
+        }
+    }
+
     /// Creates a durable, initially bound Workspace. An existing file is never
     /// replaced. A failed attempt retains its files and is not auto-retried.
     /// The caller must authorize the identity and base root before calling.

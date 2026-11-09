@@ -89,7 +89,11 @@ impl Service {
                 workspace: Box::new(workspace),
             })
         };
-        if !workspace.owned_by(&self.owner) || !workspace.belongs_to(&self.store) {
+        let owner = self.owner.workspace_client(workspace.route());
+        if !owner.as_ref().is_ok_and(|owner| workspace.owned_by(owner))
+            || !workspace.belongs_to(&self.store)
+            || !workspace.has_verified_durable_overlay()
+        {
             return Err(refuse(
                 Failure::Rejected(ControlCode::Invalid, "Workspace authority mismatch"),
                 workspace,

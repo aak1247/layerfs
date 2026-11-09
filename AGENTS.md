@@ -51,9 +51,10 @@ different connection setting.
 
 The normal daemon application still mounts MEMORY/OFF/EXCLUSIVE Workspaces.
 The Overlay crate provides a Linux durable database and conservative reopen
-boundary; an explicitly assembled single-owner daemon Service can attach and
-manually remount it after the caller fences the old process and mount. This is
-not a durable roster or automatic Sandbox recovery. A Durable global Store
+boundary; an explicitly assembled daemon Service can adopt multiple durable
+owners and manually remount them after the caller fences the old process and
+mounts. The in-memory roster is not durable discovery or automatic Sandbox
+recovery. A Durable global Store
 alone does not make uncommitted Workspace writes durable. Do not route user
 work to a path that claims full recovery until the overlay, lifecycle and FUSE
 synchronization contracts are implemented and verified together.
@@ -82,8 +83,9 @@ synchronization contracts are implemented and verified together.
   root without a whole-tree scan/copy/materialization or dependency restoration.
   The only file it creates is the Workspace's own overlay database, copied from
   the template. Demand-loaded metadata/content still pay real I/O.
-- Each mounted Workspace has its own local overlay SQLite file, copied at mount
-  from a template built before readiness and deleted at terminal unmount. Its
+- Each mounted Workspace has its own local overlay SQLite file. Disposable
+  files are copied at mount from a template and deleted at terminal unmount;
+  explicitly created durable files are retained. Its
   metadata, payload and operation records live only in that file; its open-file,
   directory-position and kernel-reference state lives in daemon memory.
   Workspaces share no overlay connection, writer, page cache or memory budget;
@@ -122,9 +124,9 @@ synchronization contracts are implemented and verified together.
   The one resident exception is a Workspace's open state, which grows with open
   files and with the files the kernel currently references.
 - Automatic bounded local reclamation follows last-owner release, including
-  during live activity and idle periods. Terminal unmount drains requests,
-  closes the Workspace's overlay connection and deletes its file. Neither
-  deletes global history.
+  during live activity and idle periods. Terminal unmount drains requests and
+  closes the Workspace's overlay connection; it deletes a disposable file and
+  retains a durable file. Neither deletes global history.
 - Target (owner direction 2026-10-07, Store calls revised 2026-10-18): every
   daemon opens the global Store directly from a volume the daemons share and
   reads, saves and publishes in-process. Project Init creates and seals one
