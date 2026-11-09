@@ -94,9 +94,24 @@ would let Docker change the host directory's ownership and permissions. The
 adapter verifies the lease during startup and refuses an exported Sandbox
 reopen until an independent fenced recovery protocol exists.
 
+Given the original authenticated Ready receipt, the host lease can observe a
+Workspace's positive namespace and device major/minor. It pins the host-visible
+directory and checks its descriptor, host mount ID, parent, filesystem, source
+and device against the held export root, refusing stacked or nested mounts and
+changed identities. The host mount ID is local to the host namespace and must
+not be compared to the daemon's mount ID. The descriptor can keep a mount busy,
+so the consumer must drop the guard before requesting unmount. These checks
+are boundary observations; they do not authorize a consumer, fence privileged
+concurrent changes or make an uncertain effect safe to repeat.
+An isolated Docker/FUSE test matched the authenticated device to the distinct
+host mount ID, rejected a wrong device, temporarily stacked a test bind mount
+over the Workspace and observed refusal, then removed that exact test bind and
+verified the original mount before normal use and close. Its receipt is
+`~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/host-workspace-identity-20261110-jdx5FVHU/receipt.txt`.
+
 This low-level adapter does not yet provide a complete durable lifecycle
-journal and recovery for exported Sandboxes, host-path mapping, or host guard
-checks around every Workspace operation. A caller must supply and retain those
+journal and recovery for exported Sandboxes or automatic host guard checks
+around every Workspace operation. A caller must supply and retain those
 authorities itself. In particular, a released advisory lock or an existing
 claim does not prove that an old daemon, mount or external consumer has stopped.
 

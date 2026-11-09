@@ -3,9 +3,10 @@
 //! This does not create a mount, expose a Workspace, authorize a consumer or
 //! prove that an old owner has exited. The caller retains this guard and must
 //! separately fence lifecycle effects and each consumer.
+use crate::export_lease::HostExportLease;
 use nix::{
     fcntl::{open, openat, OFlag},
-    sys::stat::Mode,
+    sys::stat::{major, minor, Mode},
 };
 use std::{
     fs::{self, File, Metadata},
@@ -37,6 +38,118 @@ pub struct HostExportRoot {
     directories: Vec<File>,
     permissions: Vec<(u32, u32, u32)>,
     identity: ExportIdentity,
+}
+
+/// A host-visible workspace mount pinned while its consumer uses it.
+///
+/// The mount descriptor may keep the mount busy. Drop this guard before
+/// requesting an unmount. This is an observation, not consumer authorization,
+/// durable lifecycle custody, or proof that an earlier owner has exited.
+#[derive(Debug)]
+pub struct HostWorkspaceMount<'a> {
+    lease: &'a HostExportLease,
+    path: PathBuf,
+    descriptor: File,
+    mount_id: u64,
+    device_major: u32,
+    device_minor: u32,
+}
+
+impl HostExportLease {
+    /// Independently checks one host-visible FUSE mount against the device
+    /// identity from the original authenticated daemon Ready receipt. The
+    /// namespace must be that receipt's positive, never-reused namespace.
+    pub fn observe_workspace(
+        &self,
+        namespace: i64,
+        device_major: u32,
+        device_minor: u32,
+    ) -> io::Result<HostWorkspaceMount<'_>> {
+        if namespace <= 0 {
+            return Err(invalid("host workspace namespace"));
+        }
+        self.verify()?;
+        let root = self.root();
+        let name = namespace.to_string();
+        let descriptor = open_workspace(root, std::ffi::OsStr::new(&name))?;
+        let mount = HostWorkspaceMount {
+            lease: self,
+            path: root.path.join(name),
+            mount_id: descriptor_mount_id(&descriptor)?,
+            descriptor,
+            device_major,
+            device_minor,
+        };
+        mount.verify()?;
+        Ok(mount)
+    }
+}
+
+impl HostWorkspaceMount<'_> {
+    /// Host path corresponding to the original daemon namespace.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Pinned directory descriptor for trusted, descriptor-relative consumers.
+    pub fn descriptor(&self) -> &File {
+        &self.descriptor
+    }
+
+    /// Host mount-table ID; it is distinct from the daemon namespace's ID.
+    pub fn mount_id(&self) -> u64 {
+        self.mount_id
+    }
+
+    /// Revalidates the host root, named mount, pinned descriptor and device.
+    /// Callers must also fence their own effects and verify their consumers.
+    pub fn verify(&self) -> io::Result<()> {
+        self.lease.verify()?;
+        let root = self.lease.root();
+        let name = self
+            .path
+            .file_name()
+            .ok_or_else(|| invalid("host workspace path"))?;
+        let named = open_workspace(root, name)?;
+        let held_meta = self.descriptor.metadata()?;
+        let named_meta = named.metadata()?;
+        if !held_meta.is_dir()
+            || held_meta.dev() != named_meta.dev()
+            || held_meta.ino() != named_meta.ino()
+            || major(held_meta.dev()) != u64::from(self.device_major)
+            || minor(held_meta.dev()) != u64::from(self.device_minor)
+            || descriptor_mount_id(&self.descriptor)? != self.mount_id
+            || descriptor_mount_id(&named)? != self.mount_id
+        {
+            return Err(invalid("host workspace descriptor identity changed"));
+        }
+        let entries = mount_entries()?;
+        let mut matches = entries.iter().filter(|entry| entry.target == self.path);
+        let selected = matches
+            .next()
+            .ok_or_else(|| invalid("host workspace mount missing"))?;
+        if matches.next().is_some()
+            || selected.id != self.mount_id
+            || selected.parent != root.identity.mount_id
+            || selected.device_major != u64::from(self.device_major)
+            || selected.device_minor != u64::from(self.device_minor)
+            || selected.root != Path::new("/")
+            || selected.filesystem != b"fuse"
+            || selected.source != b"layerfs"
+            || entries
+                .iter()
+                .any(|entry| entry.target != self.path && entry.target.starts_with(&self.path))
+        {
+            return Err(invalid("host workspace mount identity changed"));
+        }
+        self.lease.verify()
+    }
+}
+
+fn open_workspace(root: &HostExportRoot, name: &std::ffi::OsStr) -> io::Result<File> {
+    let directory = root.directories.last().expect("root and leaf are held");
+    let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    Ok(File::from(openat(directory, name, flags, Mode::empty())?))
 }
 
 impl HostExportRoot {
@@ -270,6 +383,11 @@ struct MountEntry {
     parent: u64,
     target: PathBuf,
     shared: Option<u64>,
+    device_major: u64,
+    device_minor: u64,
+    root: PathBuf,
+    filesystem: Vec<u8>,
+    source: Vec<u8>,
 }
 
 fn mount_entries() -> io::Result<Vec<MountEntry>> {
@@ -301,11 +419,22 @@ fn mount_entries() -> io::Result<Vec<MountEntry>> {
                 }
             }
         }
+        let mut device = fields[2].split(|byte| *byte == b':');
+        let device_major = device.next().ok_or_else(|| invalid("host mount device"))?;
+        let device_minor = device.next().ok_or_else(|| invalid("host mount device"))?;
+        if device.next().is_some() {
+            return Err(invalid("host mount device"));
+        }
         entries.push(MountEntry {
             id: number(fields[0])?,
             parent: number(fields[1])?,
             target: PathBuf::from(std::ffi::OsString::from_vec(unescape(fields[4])?)),
             shared,
+            device_major: number(device_major)?,
+            device_minor: number(device_minor)?,
+            root: PathBuf::from(std::ffi::OsString::from_vec(unescape(fields[3])?)),
+            filesystem: fields[separator + 1].to_vec(),
+            source: unescape(fields[separator + 2])?,
         });
     }
     Ok(entries)

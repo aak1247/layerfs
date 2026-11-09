@@ -61,6 +61,37 @@ fn source(root: &Path) -> Result<(), Box<dyn Error>> {
     std::os::unix::fs::symlink("node_modules/pkg", root.join("dependency"))?;
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn check_host_mount_change(
+    host: &layerfs_sandbox::host_export::HostWorkspaceMount<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(proof) = std::env::var_os("LAYERFS_EXAMPLE_EXPORT_PROBE") else {
+        return Ok(());
+    };
+    let proof = PathBuf::from(proof);
+    fs::write(
+        proof.join("ready"),
+        format!("{}\n{}\n", host.path().display(), host.mount_id()),
+    )?;
+    let wait = |name: &str| -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !proof.join(name).exists() {
+            if Instant::now() >= deadline {
+                return Err(format!("host mount proof did not reach {name}").into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    };
+    wait("changed")?;
+    assert!(host.verify().is_err(), "changed host mount was accepted");
+    fs::write(proof.join("refused"), b"changed mount refused\n")?;
+    wait("restored")?;
+    host.verify()?;
+    println!("HOST_EXPORT_CHANGE refused=true original_mount_restored=true");
+    Ok(())
+}
 /// What `find` must print inside the mount: every path, nothing else.
 fn command_identity() -> layerfs_sandbox::CommandIdentity {
     #[cfg(target_os = "linux")]
@@ -279,14 +310,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("KERNEL_READY {:?}", mounted.ready);
     #[cfg(target_os = "linux")]
     if let Some(export) = &host_export {
-        export.verify()?;
-        let host = export
-            .root()
-            .path()
-            .join(mounted.bound.token.namespace.to_string());
-        assert_eq!(fs::read(host.join("ignored.bin"))?, FILES[2].1);
-        export.verify()?;
-        println!("HOST_EXPORT_READ verified=true");
+        let namespace = mounted.bound.token.namespace;
+        let receipt = mounted.ready.receipt;
+        assert!(export
+            .observe_workspace(0, receipt.device_major, receipt.device_minor)
+            .is_err());
+        assert!(export
+            .observe_workspace(namespace, receipt.device_major, receipt.device_minor ^ 1)
+            .is_err());
+        let host =
+            export.observe_workspace(namespace, receipt.device_major, receipt.device_minor)?;
+        assert_ne!(host.mount_id(), 0);
+        host.verify()?;
+        check_host_mount_change(&host)?;
+        assert_eq!(fs::read(host.path().join("ignored.bin"))?, FILES[2].1);
+        host.verify()?;
+        println!("HOST_EXPORT_READ verified=true host_mount_id={} device_matches=true wrong_device_refused=true", host.mount_id());
     }
     mark("ready");
 
