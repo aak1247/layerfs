@@ -29,6 +29,7 @@ pub enum OwnerError {
     },
     Overlay(OverlayError),
     Randomness(layerfs_bridge::duplex::ChannelError),
+    BindingCodec(layerfs_bridge::control::ControlError),
     Stopped,
     Retained(Arc<OwnerError>),
     Attempted(Box<WorkspaceCallFailure>),
@@ -45,6 +46,7 @@ pub enum OwnerError {
     Install {
         cause: Box<layerfs_workspace::WorkspaceError>,
         input: Box<layerfs_workspace::PreparedBase>,
+        durable_snapshot: Option<Vec<u8>>,
     },
     /// Exact failure of an attempted namespace job; never replayed.
     Workspace(Box<layerfs_workspace::WorkspaceError>),
@@ -105,6 +107,7 @@ impl std::error::Error for OwnerError {
             Self::Deletion { cause, .. } => Some(cause),
             Self::Overlay(error) => Some(error),
             Self::Randomness(error) => Some(error),
+            Self::BindingCodec(error) => Some(error),
             Self::Unattempted { cause, .. } => Some(cause.as_ref()),
             Self::Install { cause, .. } => Some(cause.as_ref()),
             Self::Workspace(cause) => Some(cause.as_ref()),

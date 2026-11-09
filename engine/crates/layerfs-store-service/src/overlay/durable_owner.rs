@@ -30,7 +30,7 @@ impl Owner {
             .map_err(OwnerError::Overlay)?;
         db.open_workspace(spec.expected_base_root)
             .map_err(OwnerError::Overlay)?;
-        bind(db, spec.namespace, spec.identity, incarnation)
+        bind(db, spec.namespace, spec.identity, incarnation, true)
     }
 
     /// Reopens an existing durable Workspace with a fresh route incarnation.
@@ -46,7 +46,43 @@ impl Owner {
                 "durable Workspace base root",
             )));
         }
-        bind(db, spec.namespace, spec.identity, incarnation)
+        bind(db, spec.namespace, spec.identity, incarnation, false)
+    }
+
+    /// Reopens from the persisted snapshot when no external root is available.
+    /// The returned snapshot still needs Store authorization and validation,
+    /// and the caller must fence old mounts and reconcile unknown operations.
+    pub fn recover_recorded(
+        path: &Path,
+        profile: ProfileConfig,
+        identity: [u8; 32],
+        namespace: i64,
+    ) -> Result<(Self, layerfs_history::BranchSnapshot), OwnerError> {
+        let spec = DurableWorkspace {
+            path,
+            profile,
+            identity,
+            namespace,
+            expected_base_root: [0; 32],
+        };
+        let incarnation = admission(&spec)?;
+        let db = Overlay::recover_durable(path, profile, identity).map_err(OwnerError::Overlay)?;
+        let bytes =
+            db.durable_binding()
+                .map_err(OwnerError::Overlay)?
+                .ok_or(OwnerError::Overlay(OverlayError::Invalid(
+                    "durable binding is absent",
+                )))?;
+        let snapshot =
+            layerfs_bridge::snapshot::decode(&bytes).map_err(OwnerError::BindingCodec)?;
+        if snapshot.effective_root.to_bytes() != db.state().map_err(OwnerError::Overlay)?.base_root
+        {
+            return Err(OwnerError::Overlay(OverlayError::Invalid(
+                "durable binding root",
+            )));
+        }
+        let owner = bind(db, namespace, identity, incarnation, false)?;
+        Ok((owner, snapshot))
     }
 }
 
@@ -70,6 +106,58 @@ impl OwnerClient {
     pub(crate) fn durable_identity(&self) -> Result<Option<[u8; 32]>, OwnerError> {
         Ok(self.connection()?.durable_identity)
     }
+    /// Reads the saved snapshot without selecting a current Branch head.
+    pub fn durable_snapshot(&self) -> Result<layerfs_history::BranchSnapshot, OwnerError> {
+        let route = self.bound_route()?;
+        let (bytes, root) = self.call(route, crate::ServiceClass::General, None, |db| {
+            Ok((db.durable_binding()?, db.state()?.base_root))
+        })?;
+        let bytes = bytes.ok_or(OwnerError::Overlay(OverlayError::Invalid(
+            "durable binding is absent",
+        )))?;
+        let snapshot =
+            layerfs_bridge::snapshot::decode(&bytes).map_err(OwnerError::BindingCodec)?;
+        if snapshot.effective_root.to_bytes() != root {
+            return Err(OwnerError::Overlay(OverlayError::Invalid(
+                "durable binding root",
+            )));
+        }
+        Ok(snapshot)
+    }
+    pub(crate) fn ensure_durable_snapshot(
+        &self,
+        snapshot: &layerfs_history::BranchSnapshot,
+    ) -> Result<(), OwnerError> {
+        let route = self.bound_route()?;
+        let version = self.call(route, crate::ServiceClass::General, None, |db| {
+            Ok(db.profile().schema_version)
+        })?;
+        // Existing v39 databases have no binding row and are never silently
+        // converted. Their caller still supplies trusted external metadata.
+        if version == 39 {
+            return Ok(());
+        }
+        let expected =
+            layerfs_bridge::snapshot::encode(snapshot).map_err(OwnerError::BindingCodec)?;
+        let recorded = self.call(route, crate::ServiceClass::General, None, |db| {
+            db.durable_binding()
+        })?;
+        match recorded {
+            Some(recorded) if recorded == expected => Ok(()),
+            Some(_) => Err(OwnerError::Overlay(OverlayError::Invalid(
+                "durable binding snapshot",
+            ))),
+            None if self.connection()?.durable_fresh => {
+                let root = snapshot.effective_root.to_bytes();
+                self.call(route, crate::ServiceClass::General, None, move |db| {
+                    db.initialize_durable_binding(root, &expected)
+                })
+            }
+            None => Err(OwnerError::Overlay(OverlayError::Invalid(
+                "durable binding is absent",
+            ))),
+        }
+    }
     /// A single logical binding owns this engine's base and Commit state.
     pub(crate) fn claim_durable_binding(&self) -> Result<(), OwnerError> {
         use std::sync::atomic::Ordering;
@@ -90,10 +178,11 @@ fn bind(
     namespace: i64,
     identity: [u8; 32],
     incarnation: [u8; 32],
+    fresh: bool,
 ) -> Result<Owner, OwnerError> {
     let route = Route::new(namespace, db.engine(), incarnation).map_err(OwnerError::Overlay)?;
     let profile = db.profile().clone();
-    let shared = Arc::new(Shared::durable(namespace, identity));
+    let shared = Arc::new(Shared::durable(namespace, identity, fresh));
     // This fresh Shared has no published readers or disposable Backing fd.
     shared.route.set(route).map_err(|_| OwnerError::Stopped)?;
     shared.state.lock().map_err(|_| OwnerError::Stopped)?.db = Some(Box::new(db));

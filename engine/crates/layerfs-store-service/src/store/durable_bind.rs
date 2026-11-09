@@ -67,6 +67,9 @@ impl Store {
                     "durable binding root",
                 )));
             }
+            owner
+                .ensure_durable_snapshot(&snapshot)
+                .map_err(BindError::Owner)?;
             owner.claim_durable_binding().map_err(BindError::Owner)?;
             Ok(BindSuccess {
                 workspace: BoundWorkspace {

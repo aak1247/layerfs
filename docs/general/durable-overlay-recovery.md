@@ -26,17 +26,28 @@ APIs do not persist a roster, authenticate the caller, fence old FUSE mounts,
 reconcile Commit outcomes or recover an SDK control token. They do not yet
 replace the disposable owner used for a mounted Workspace.
 
-`Store::bind_durable` can attach such an owner to the exact Branch snapshot
-supplied by a trusted recovery record. It checks the Workspace identity, the
-original Layer and Commit roots against the Store, and the overlay's recorded
-base against that snapshot. It rejects a second logical binding of the same
-owner. A Branch that has advanced does not replace the original view: a later
-explicit Commit uses the existing merge path. The caller must keep the owner
-private during binding and independently authenticate and persist the full
-snapshot; these APIs do not write or restore that record. A Commit whose overlay
-base and recorded snapshot have not both been reconciled must not be recovered
-as if its outcome were known. Old inode reservation windows are not reused;
-future allocations require the same durable Store authority and scope.
+`Store::bind_durable` attaches such an owner to its exact Branch snapshot. It
+checks the Workspace identity, the original Layer and Commit roots against the
+Store, and the overlay's recorded base against that snapshot. It rejects a
+second logical binding of the same owner. A Branch that has advanced does not
+replace the original view: a later explicit Commit uses the existing merge
+path. The caller must keep the owner private during binding and authenticate
+its Workspace, Store and requested Branch; the snapshot is not authorization.
+
+New durable overlay files use schema 40 and persist their encoded snapshot.
+For a known published Commit, its new snapshot and the overlay's installed
+base advance in the same SQLite transaction. An install without a known
+receipt marks the binding unresolved in that transaction; recovery refuses it
+until reconciled. A subsequent known publication in the live owner can replace
+that marker. A crash with a pending capture still refuses automatic recovery.
+Existing schema 39 durable files are not converted and continue to require the
+caller's independently retained snapshot. Old inode reservation windows are
+not reused; future allocations require the same durable Store authority and
+scope.
+`Owner::recover_recorded` reads the snapshot and root from schema 40 without
+requiring an external root, but still requires the independently known file
+path and Workspace identity. The resulting snapshot must pass Store binding
+and the caller's authorization and old-owner fencing checks.
 
 The durable profile is SQLite DELETE/FULL/EXCLUSIVE. Each changed Workspace
 generation, base root, revision, dirty count and volatile-custody flag is
@@ -66,12 +77,13 @@ process termination after acknowledged writes, further writes after reopening,
 and preservation of unresolved states. Service-owner tests also cover stale
 internal routes, base-root mismatch, process loss after a service write and a
 panicked service call retaining its original connection. A Store binding test
-uses a separately retained snapshot and a live Store to check a moved Branch,
-identity/root refusals and an explicit merge; it is not a mount or crash proof.
-A test-only sync fault against the
-rollback journal verifies that the engine reports an uncertain result and
+checks a moved Branch, identity/root refusals, an explicit merge and recovery
+of its installed snapshot against a live Store; it is not a mount crash proof.
+Test-only sync faults against the
+rollback journal verify that the engine reports an uncertain result and
 quarantines the connection, and that a fresh process sees the prior complete
-transaction. The VM harness can exercise the overlay with `--probe-kind
+transaction or an unresolved capture with its matching prior snapshot. The VM
+harness can exercise the overlay with `--probe-kind
 overlay`; this proves only the database path on its guest filesystem, not FUSE
 `fsync`, mount recovery, Docker/Kubernetes integration or physical host power
 loss.
@@ -88,3 +100,17 @@ the overlay durable implementation SHA-256 was
 `f6a5c6563d0837982c1a2930528d05ebdaae97c30635e3f3edcd57cb909b8318`,
 and its connection-owner SHA-256 was
 `43474bdfda377ffef4125c47e27097dfd729ff0047b57aeaff7b8a1818d06cd3`.
+
+The later schema-40 probe on the same guest and disk profile installed a new
+base and snapshot together, acknowledged an additional file write, killed the
+guest and recovered all three from the disk. Its receipt and serial logs are
+retained under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-overlay-vm-20261109-binding-v40/`;
+the probe SHA-256 was
+`c2c7448ef266f438fc0328c1928232b19cb1cc2ffc8fcfc8aedf5954451c4b49`.
+At that run, `durable.rs`, `durable_binding.rs`, `generation.rs` and the probe
+source respectively had SHA-256
+`0074fce8597b377385105d484c8432d39a21464bd1201cde77be91dd91349d74`,
+`c29c7c9bf6ccae38ea5b8cbdfd9d4bfca017c102b9ae12bc74542d6505c14b40`,
+`4886c9da03046e9a6dd590955f8c5509e0a60035e482b7055d55674b4f574bbd`, and
+`cf9121d29e851672fc35416e97be97c0d76cf319d2cca95057063d926d2f859b`.

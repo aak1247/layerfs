@@ -67,8 +67,11 @@ fn put(db: &Overlay) {
 }
 
 fn assert_recovered(db: &Overlay) {
+    assert_recovered_at(db, ROOT);
+}
+fn assert_recovered_at(db: &Overlay, root: [u8; 32]) {
     let state = db.state().unwrap();
-    assert_eq!(state.base_root, ROOT);
+    assert_eq!(state.base_root, root);
     assert_eq!(state.dirty_inodes, 1);
     assert_eq!(state.base_readers, 0);
     let source = db.acquire_base_source(2).unwrap();
@@ -151,6 +154,8 @@ fn durable_overlay_recovers_after_writer_process_is_killed() {
     if let Some(directory) = std::env::var_os(CHILD) {
         let directory = PathBuf::from(directory);
         let db = create(&directory.join("overlay.sqlite"));
+        db.initialize_durable_binding(ROOT, b"original snapshot")
+            .unwrap();
         put(&db);
         fs::write(directory.join("ack"), b"completed").unwrap();
         std::thread::sleep(Duration::from_secs(15));
@@ -182,8 +187,59 @@ fn durable_overlay_recovers_after_writer_process_is_killed() {
     assert!(!child.wait().unwrap().success());
     let reopened =
         Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    assert_eq!(
+        reopened.durable_binding().unwrap().unwrap(),
+        b"original snapshot"
+    );
     assert_recovered(&reopened);
     reopened.close_database().unwrap();
+}
+
+#[test]
+fn legacy_durable_database_reopens_without_implicit_conversion() {
+    let fixture = Fixture::new();
+    let db = create(&fixture.path());
+    put(&db);
+    db.close_database().unwrap();
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    connection
+        .execute_batch("DROP TABLE durable_binding; PRAGMA user_version=39;")
+        .unwrap();
+    drop(connection);
+    let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    assert_eq!(db.profile().schema_version, 39);
+    assert!(db.durable_binding().is_err());
+    assert_recovered(&db);
+    db.close_database().unwrap();
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        39
+    );
+}
+
+#[test]
+fn durable_binding_never_follows_an_unrecorded_install() {
+    let fixture = Fixture::new();
+    let db = create(&fixture.path());
+    db.initialize_durable_binding(ROOT, b"original snapshot")
+        .unwrap();
+    assert!(db.initialize_durable_binding(ROOT, b"replacement").is_err());
+    let capture = db.capture().unwrap();
+    db.install(capture, [18; 32]).unwrap();
+    assert!(matches!(
+        db.durable_binding(),
+        Err(OverlayError::Invalid(
+            "durable binding requires reconciliation"
+        ))
+    ));
+    let resolved = db.capture().unwrap();
+    db.install_recorded(resolved, [19; 32], b"resolved snapshot")
+        .unwrap();
+    assert_eq!(db.durable_binding().unwrap().unwrap(), b"resolved snapshot");
+    db.close_database().unwrap();
 }
 
 #[test]
@@ -473,6 +529,77 @@ fn durable_overlay_quarantines_failed_journal_sync_and_recovers_prior_state() {
 }
 
 #[test]
+fn failed_install_sync_retains_matching_root_and_binding() {
+    const CHILD: &str = "LAYERFS_DURABLE_INSTALL_SYNC_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let directory = PathBuf::from(directory);
+        let db = create(&directory.join("overlay.sqlite"));
+        db.initialize_durable_binding(ROOT, b"original snapshot")
+            .unwrap();
+        let capture = db.capture().unwrap();
+        fs::write(directory.join("inject"), b"1").unwrap();
+        assert!(matches!(
+            db.install_recorded(capture, [18; 32], b"new snapshot"),
+            Err(OverlayError::Uncertain { .. })
+        ));
+        assert!(matches!(
+            db.close_database(),
+            Err(OverlayError::Quarantined)
+        ));
+        std::process::exit(0);
+    }
+    let fixture = Fixture::new();
+    let shim = fixture.0.join("install-sync-failure.so");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/durable_sync_failure.c");
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .args(["-ldl", "-o"])
+        .arg(&shim)
+        .status()
+        .unwrap()
+        .success());
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "failed_install_sync_retains_matching_root_and_binding",
+        ])
+        .env(CHILD, &fixture.0)
+        .env("LD_PRELOAD", &shim)
+        .env("LAYERFS_TEST_SYNC_TRIGGER", fixture.0.join("inject"))
+        .env("LAYERFS_TEST_SYNC_RECEIPT", fixture.0.join("sync-failed"))
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "install sync failure child: {status}");
+    assert_eq!(fs::read(fixture.0.join("sync-failed")).unwrap(), b"EIO\n");
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    let (root, captured): (Vec<u8>, Option<i64>) = connection
+        .query_row(
+            "SELECT base_root,captured FROM durable_state WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let (binding_root, snapshot, recoverable): (Vec<u8>, Vec<u8>, bool) = connection
+        .query_row(
+            "SELECT root,snapshot,recoverable FROM durable_binding WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(root, ROOT);
+    assert_eq!(binding_root, ROOT);
+    assert_eq!(snapshot, b"original snapshot");
+    assert!(
+        recoverable && captured.is_some(),
+        "the original in-flight capture remains unresolved"
+    );
+    drop(connection);
+    assert!(Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).is_err());
+}
+
+#[test]
 #[ignore = "run only inside the owned VM power-loss harness"]
 fn durable_save_survives_vm_power_loss() {
     let directory = PathBuf::from(std::env::var("LAYERFS_DURABLE_VM_ROOT").unwrap());
@@ -487,6 +614,19 @@ fn durable_save_survives_vm_power_loss() {
                 .sync_all()
                 .unwrap();
             let db = create(&path);
+            db.initialize_durable_binding(ROOT, b"vm original snapshot")
+                .unwrap();
+            let capture = db.capture().unwrap();
+            db.install_recorded(capture, [18; 32], b"vm installed snapshot")
+                .unwrap();
+            let mut cursor = MaintenanceCursor::default();
+            for _ in 0..32 {
+                match db.maintain(cursor).unwrap() {
+                    Some(step) => cursor = step.cursor,
+                    None => break,
+                }
+            }
+            assert!(db.maintenance_idle().unwrap());
             put(&db);
             let size = fs::metadata(&path).unwrap().len();
             assert!(size > 0);
@@ -496,7 +636,11 @@ fn durable_save_survives_vm_power_loss() {
         }
         "read" => {
             let db = Overlay::recover_durable(&path, ProfileConfig::default(), IDENTITY).unwrap();
-            assert_recovered(&db);
+            assert_eq!(
+                db.durable_binding().unwrap().unwrap(),
+                b"vm installed snapshot"
+            );
+            assert_recovered_at(&db, [18; 32]);
             eprintln!("LAYERFS_VM_RECOVERED");
             std::thread::sleep(Duration::from_secs(60));
             panic!("host did not terminate the reader guest");

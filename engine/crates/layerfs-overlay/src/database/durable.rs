@@ -268,6 +268,16 @@ mod linux {
             crate::diagnostics::startup::batch(&db.connection, &db.work, STATE_SCHEMA)?;
             db.execute(
                 StatementKind::Startup,
+                "CREATE TABLE durable_binding(id INTEGER PRIMARY KEY CHECK(id=1), \
+                 root BLOB NOT NULL CHECK(length(root)=32), \
+                 snapshot BLOB NOT NULL CHECK(length(snapshot)>0 AND length(snapshot)<=4096), \
+                 recoverable INTEGER NOT NULL CHECK(recoverable IN(0,1))) STRICT",
+                &[],
+                0,
+            )?;
+            db.execute(StatementKind::Startup, "PRAGMA user_version=40", &[], 0)?;
+            db.execute(
+                StatementKind::Startup,
                 "PRAGMA application_id=1279676211",
                 &[],
                 0,
@@ -280,6 +290,7 @@ mod linux {
             )?;
             Ok(())
         })?;
+        db.profile.schema_version = 40;
         let sync = db.allocation.sync_durable_file().and_then(|_| {
             File::open(
                 path.parent()
@@ -350,7 +361,7 @@ mod linux {
             super::super::profile::readback(&connection, &work, "PRAGMA user_version", |r| {
                 r.get(0)
             })?;
-        if profile.schema_version != 39 {
+        if ![39, 40].contains(&profile.schema_version) {
             return Err(OverlayError::Invalid("durable overlay schema version"));
         }
         let integrity: String =

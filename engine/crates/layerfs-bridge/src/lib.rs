@@ -24,3 +24,4 @@ pub mod daemon_setup;
 mod daemon_types;
 mod daemon_wire;
 pub mod initial_record;
+pub mod snapshot;

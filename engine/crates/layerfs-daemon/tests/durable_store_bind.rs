@@ -120,6 +120,7 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
         .bind_durable(owner.client(), request.clone(), initial.clone())
         .unwrap()
         .workspace;
+    assert_eq!(owner.client().durable_snapshot().unwrap(), initial);
     let mut ours = support::bytes(0);
     ours[0] = b'X';
     write(&original, "file-000000", &ours);
@@ -169,6 +170,10 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
 
     let recovered_owner =
         Owner::recover_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    assert_eq!(
+        recovered_owner.client().durable_snapshot().unwrap(),
+        initial
+    );
     let mut wrong = request.clone();
     wrong.workspace = WorkspaceId::from_authority([44; 32]).unwrap();
     assert!(store
@@ -186,7 +191,7 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
         "a valid newer root does not replace the recorded base"
     );
     let recovered = store
-        .bind_durable(recovered_owner.client(), request, initial.clone())
+        .bind_durable(recovered_owner.client(), request.clone(), initial.clone())
         .unwrap()
         .workspace;
     assert_eq!(recovered.snapshot().unwrap(), initial);
@@ -197,9 +202,26 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
         .unwrap();
     assert_eq!(read(&recovered, "file-000000"), ours);
     assert_eq!(read(&recovered, "file-000001"), theirs);
-    recovered.close().unwrap();
+    let installed = recovered.snapshot().unwrap();
+    assert_eq!(
+        recovered_owner.client().durable_snapshot().unwrap(),
+        installed
+    );
     drop(recovered);
+    store.close_reader(identity).unwrap();
     recovered_owner.stop().unwrap();
+    let (reopened_owner, recorded) =
+        Owner::recover_recorded(&path, ProfileConfig::default(), [42; 32], 1).unwrap();
+    assert_eq!(recorded, installed);
+    let reopened = store
+        .bind_durable(reopened_owner.client(), request, recorded)
+        .unwrap()
+        .workspace;
+    assert_eq!(read(&reopened, "file-000000"), ours);
+    assert_eq!(read(&reopened, "file-000001"), theirs);
+    reopened.close().unwrap();
+    drop(reopened);
+    reopened_owner.stop().unwrap();
     drop(store);
     fixture.cleanup();
 }

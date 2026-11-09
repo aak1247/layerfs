@@ -106,20 +106,35 @@ impl OwnerClient {
         workspace: std::sync::Arc<layerfs_workspace::Workspace>,
         input: layerfs_workspace::PreparedBase,
     ) -> Result<(), OwnerError> {
+        self.install_prepared_recorded(route, workspace, input, None)
+    }
+    pub(crate) fn install_prepared_recorded(
+        &self,
+        route: Route,
+        workspace: std::sync::Arc<layerfs_workspace::Workspace>,
+        input: layerfs_workspace::PreparedBase,
+        durable_snapshot: Option<Vec<u8>>,
+    ) -> Result<(), OwnerError> {
         let ready = Some(Readiness::Install(input.capture()));
         self.call_observed(Some(route), ServiceClass::General, ready, move |db, _| {
             if route != workspace.route() {
                 return Err(OwnerError::Install {
                     cause: Box::new(OverlayError::Stale.into()),
                     input: Box::new(input),
+                    durable_snapshot,
                 });
             }
-            workspace
-                .install_prepared_base(db, input)
-                .map_err(|(cause, input)| OwnerError::Install {
-                    cause: Box::new(cause),
-                    input: Box::new(input),
-                })
+            let installed = match &durable_snapshot {
+                Some(snapshot) if db.profile().schema_version == 40 => {
+                    workspace.install_prepared_base_recorded(db, input, snapshot)
+                }
+                _ => workspace.install_prepared_base(db, input),
+            };
+            installed.map_err(|(cause, input)| OwnerError::Install {
+                cause: Box::new(cause),
+                input: Box::new(input),
+                durable_snapshot,
+            })
         })
         .map(|(value, _)| value)
     }

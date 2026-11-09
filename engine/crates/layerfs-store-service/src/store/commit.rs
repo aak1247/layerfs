@@ -418,10 +418,29 @@ impl BoundWorkspace {
                 None
             };
             retained.phase = CommitPhase::Install;
+            let durable_snapshot =
+                if !conflicted
+                    && self
+                        .owner
+                        .durable_identity()
+                        .map_err(CommitError::Owner)?
+                        .is_some()
+                {
+                    Some(layerfs_bridge::snapshot::encode(&next).map_err(|cause| {
+                        CommitError::Owner(crate::OwnerError::BindingCodec(cause))
+                    })?)
+                } else {
+                    None
+                };
             let prepared = retained.prepared.take().expect("prepared install");
             phase(timing, "install", || {
                 self.job(|job_client: &crate::OwnerClient, route| {
-                    job_client.install_prepared(route, self.workspace.clone(), prepared)
+                    job_client.install_prepared_recorded(
+                        route,
+                        self.workspace.clone(),
+                        prepared,
+                        durable_snapshot,
+                    )
                 })
                 .map_err(CommitError::Owner)
             })?;

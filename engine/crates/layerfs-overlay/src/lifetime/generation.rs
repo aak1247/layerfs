@@ -10,9 +10,34 @@ impl Overlay {
     /// Later active rows and pending replies remain untouched. Physical retire
     /// work is queued; last-owner eligibility/automatic deletion is S6 work.
     pub fn install(&self, capture: Capture, root: [u8; 32]) -> OverlayResult<()> {
+        self.install_with_binding(capture, root, None)
+    }
+    /// Installs a root and its trusted, encoded history receipt in one durable
+    /// transaction. The caller must validate the encoded snapshot and known
+    /// publication; the overlay cannot infer either one.
+    pub fn install_recorded(
+        &self,
+        capture: Capture,
+        root: [u8; 32],
+        snapshot: &[u8],
+    ) -> OverlayResult<()> {
+        self.install_with_binding(capture, root, Some(snapshot))
+    }
+    fn install_with_binding(
+        &self,
+        capture: Capture,
+        root: [u8; 32],
+        snapshot: Option<&[u8]>,
+    ) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             if !self.install_ready(capture)? {
                 return Err(OverlayError::BaseSourcesPending);
+            }
+            match snapshot {
+                Some(snapshot) => {
+                    self.install_durable_binding(capture.base_root, root, snapshot)?
+                }
+                None => self.invalidate_durable_binding(root)?,
             }
             self.change_state(|state| {
                 state.base_root = root;

@@ -55,6 +55,23 @@ impl Workspace {
         overlay: &Overlay,
         prepared: PreparedBase,
     ) -> Result<(), (WorkspaceError, PreparedBase)> {
+        self.install_with_binding(overlay, prepared, None)
+    }
+    /// Pairs a known durable history receipt with the local base transition.
+    pub fn install_prepared_base_recorded(
+        &self,
+        overlay: &Overlay,
+        prepared: PreparedBase,
+        snapshot: &[u8],
+    ) -> Result<(), (WorkspaceError, PreparedBase)> {
+        self.install_with_binding(overlay, prepared, Some(snapshot))
+    }
+    fn install_with_binding(
+        &self,
+        overlay: &Overlay,
+        prepared: PreparedBase,
+        snapshot: Option<&[u8]>,
+    ) -> Result<(), (WorkspaceError, PreparedBase)> {
         if prepared.capture.engine() != self.route().engine() {
             return Err((OverlayError::Stale.into(), prepared));
         }
@@ -71,8 +88,12 @@ impl Workspace {
                 prepared,
             ));
         }
-        if let Err(error) = overlay.install(prepared.capture, prepared.next.identity().0.to_bytes())
-        {
+        let root = prepared.next.identity().0.to_bytes();
+        let installed = match snapshot {
+            Some(snapshot) => overlay.install_recorded(prepared.capture, root, snapshot),
+            None => overlay.install(prepared.capture, root),
+        };
+        if let Err(error) = installed {
             return Err((error.into(), prepared));
         }
         // No fallible work follows known SQL success; old immutable plans own

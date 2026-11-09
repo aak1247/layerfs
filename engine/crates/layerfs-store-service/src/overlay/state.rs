@@ -22,6 +22,7 @@ pub struct State {
 pub struct Shared {
     pub namespace: i64,
     pub durable_identity: Option<[u8; 32]>,
+    pub durable_fresh: bool,
     pub durable_binding_claimed: AtomicBool,
     pub route: OnceLock<layerfs_workspace::Route>,
     pub state: Mutex<State>,
@@ -29,15 +30,20 @@ pub struct Shared {
 }
 impl Shared {
     pub fn new(namespace: i64) -> Self {
-        Self::with_identity(namespace, None)
+        Self::with_identity(namespace, None, false)
     }
-    pub fn durable(namespace: i64, identity: [u8; 32]) -> Self {
-        Self::with_identity(namespace, Some(identity))
+    pub fn durable(namespace: i64, identity: [u8; 32], fresh: bool) -> Self {
+        Self::with_identity(namespace, Some(identity), fresh)
     }
-    fn with_identity(namespace: i64, durable_identity: Option<[u8; 32]>) -> Self {
+    fn with_identity(
+        namespace: i64,
+        durable_identity: Option<[u8; 32]>,
+        durable_fresh: bool,
+    ) -> Self {
         Self {
             namespace,
             durable_identity,
+            durable_fresh,
             durable_binding_claimed: AtomicBool::new(false),
             route: OnceLock::new(),
             state: Mutex::new(State {

@@ -2,6 +2,7 @@
 pub(crate) mod connection;
 pub(crate) mod connection_owner;
 pub(crate) mod durable;
+pub(crate) mod durable_binding;
 pub(crate) mod profile;
 pub(crate) mod startup;
 pub(crate) mod statements;
