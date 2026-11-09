@@ -346,6 +346,10 @@ pub(crate) fn save_sandbox(
             ("project", SdkValue::text(&state.project)),
             ("name", SdkValue::text(&state.name)),
             (
+                "maxWorkspaces",
+                SdkValue::Int(i64::from(state.max_workspaces)),
+            ),
+            (
                 "container",
                 SdkValue::text(state.runtime.identity().to_string()),
             ),
@@ -468,6 +472,7 @@ pub(crate) fn reopen(args: &SdkValue) -> Result<Arc<SandboxState>> {
         project: project.to_owned(),
         // a record from before #373 has no name
         name: value.get_text("name").unwrap_or_default().to_owned(),
+        max_workspaces: crate::sandbox::workspace_capacity(&value)?,
         directory,
         runtime,
         identity: CommandIdentity { uid: 501, gid: 20 },

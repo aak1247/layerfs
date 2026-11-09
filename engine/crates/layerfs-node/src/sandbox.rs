@@ -46,15 +46,27 @@ pub(crate) fn operation(failure: Box<OperationFailure>) -> SdkRefusal {
 /// container then stops, and the next `sandbox.create` or `runtime.sandbox.reclaim` reclaims it.
 const IDLE_EXIT_S: u32 = 120;
 
-/// Workspaces one Sandbox holds at once; a mount into a full one is refused
-/// `Capacity`.
-pub(crate) const WORKSPACES: u32 = 16;
+/// Default for new Sandboxes and records written before capacity was stored.
+pub(crate) const DEFAULT_WORKSPACES: u32 = 16;
+
+/// Capacity is selected once at creation; a malformed saved value is never
+/// treated as a legacy record.
+pub(crate) fn workspace_capacity(value: &SdkValue) -> Result<u32, SdkRefusal> {
+    match value.get("maxWorkspaces") {
+        None => Ok(DEFAULT_WORKSPACES),
+        Some(SdkValue::Int(n)) if *n > 0 && *n <= i64::from(u32::MAX) => Ok(*n as u32),
+        _ => Err(refused(
+            "InvalidInput",
+            "maxWorkspaces must be an integer from 1 to 4294967295",
+        )),
+    }
+}
 
 /// Control connections a Sandbox's daemon admits: [`crate::pool::CONNECTIONS`]
 /// for this process and the rest for others (#352 F-017).
 pub(crate) const DAEMON_CONNECTIONS: u16 = 8;
 
-fn setup(private: [u8; 32], peer: [u8; 32]) -> DaemonSetup {
+fn setup(private: [u8; 32], peer: [u8; 32], max_workspaces: u32) -> DaemonSetup {
     DaemonSetup {
         listen: format!("0.0.0.0:{PORT}"),
         private_key: private,
@@ -74,7 +86,7 @@ fn setup(private: [u8; 32], peer: [u8; 32]) -> DaemonSetup {
             // `ls -l` of 10,000 entries, so a later Workspace re-read it all.
             // 64 MiB by owner decision (#359 warm daemon, record 031).
             cache_bytes: 64 * 1024 * 1024,
-            namespaces: WORKSPACES,
+            namespaces: max_workspaces,
             pager_kib: 1024,
             serial_low_water: 256,
             idle_exit_s: IDLE_EXIT_S,
@@ -104,6 +116,7 @@ pub(crate) fn labels(project: &str, id: &str) -> Vec<(String, String)> {
 /// project's directory `directory`, so no other start runs meanwhile.
 pub(crate) fn start(args: &SdkValue, directory: &Path) -> Result<Arc<SandboxState>, SdkRefusal> {
     let name = text(args, "project")?;
+    let max_workspaces = workspace_capacity(args)?;
     let deploy = args
         .get("deploy")
         .ok_or_else(|| refused("InvalidInput", "missing `deploy`"))?;
@@ -167,6 +180,7 @@ pub(crate) fn start(args: &SdkValue, directory: &Path) -> Result<Arc<SandboxStat
         &id,
         (&project, installed),
         (docker, image, store_volume, executable),
+        max_workspaces,
     );
     if made.is_err() {
         let _ = std::fs::remove_dir(&saved_directory);
@@ -183,11 +197,12 @@ fn start_claimed(
     id: &str,
     (project, installed): (&crate::registry::Project, StoreManifest),
     (docker, image, store_volume, executable): (&str, String, String, PathBuf),
+    max_workspaces: u32,
 ) -> Result<Arc<SandboxState>, SdkRefusal> {
     let name = text(args, "project")?;
     let controller = layerfs_bridge::duplex::generate_keypair().map_err(failed)?;
     let daemon = layerfs_bridge::duplex::generate_keypair().map_err(failed)?;
-    let mut daemon_setup = setup(daemon.private, controller.public);
+    let mut daemon_setup = setup(daemon.private, controller.public, max_workspaces);
     let mut existing = project.manifest.clone();
     existing.daemon_sqlite = installed.daemon_sqlite;
     daemon_setup.existing_store = Some(existing);
@@ -242,6 +257,7 @@ fn start_claimed(
         id: id.to_owned(),
         project: name.to_owned(),
         name: container_name,
+        max_workspaces,
         directory: saved_directory.to_owned(),
         runtime,
         identity,
@@ -341,12 +357,13 @@ fn abandon(directory: &Path, id: &str, mut failure: Box<SandboxFailure>) -> SdkR
     }
 }
 
-/// `sandbox.create({ image })`: under the project's guard, reclaims the
+/// `sandbox.create({ image, maxWorkspaces })`: under the project's guard, reclaims the
 /// project's idle-closed Sandboxes, then starts the lowest free number on
 /// the call's image (`deploy.image`) and waits for its daemon:
 /// `{ sandbox, name, image }`. The only call that starts a Sandbox. Failures
 /// are `Failed` or `Unknown`, never retried.
 pub(crate) fn create(args: &SdkValue) -> Outcome {
+    workspace_capacity(args)?;
     let project = crate::discovery::project_dir(args)?;
     let _placing = crate::discovery::guard(&project)?;
     crate::workspace::reclaim_gone(args)?;

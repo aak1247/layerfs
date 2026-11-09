@@ -46,7 +46,7 @@ async and return a ready client, and `new LayerFS()` is refused
 environment, read once when the client is made, by its `LAYERFS_` name only:
 `LAYERFS_HOME`, `_STORE_PATH`, `_DOCKER`, `_IMAGE`,
 `_VOLUME`, `_DAEMON`, `_CONTAINER_PREFIX`, `_DAEMON_HOST`, `_TRACE`,
-`_STORE_POLICY` (and `_TRACE_STEP`, read at each call). An object passed where
+`_STORE_POLICY`, `_MAX_WORKSPACES` (and `_TRACE_STEP`, read at each call). An object passed where
 the options went (`LayerFS.open(name, {…})`, or an object as `LayerFS.init`'s
 third argument) is refused `InvalidInput`, never ignored. `open` opens the project's Store and makes one project lookup
 on it, so a missing project is `NoSuchProject` at once; if either fails,
@@ -140,6 +140,7 @@ Keep each agent's operations on a Workspace sequential.
 | `LAYERFS_IMAGE` | Exact immutable runtime `sha256:...` digest a new Sandbox runs. A running Sandbox keeps the image it started with. |
 | `LAYERFS_VOLUME` | Existing named local VM volume shared by the project's daemons. |
 | `LAYERFS_DAEMON` | Host path to the built Linux daemon executable. |
+| `LAYERFS_MAX_WORKSPACES` | Optional positive integer for new Sandboxes, default 16. `sandbox.create({ maxWorkspaces })` overrides it. The value is fixed in the Sandbox's record until it closes. |
 | `LAYERFS_NATIVE` | Optional path of the real addon; defaults to `engine/crates/layerfs-node/layerfs.node`. |
 | `LAYERFS_WORKER_ENDPOINT` | macOS and Windows: the endpoint file of the LayerFS home's worker, which then makes every binding call. Any integration may set it. |
 | `LAYERFS_STORE_PATH` | The installed Store file this client's Store calls open: `global/store.sqlite` in the project's volume. On Linux this process opens it, so it must be on a local filesystem the daemons share, such as `/layerfs-store/global/store.sqlite` where the volume is mounted at `/layerfs-store`; otherwise Store calls fail `Unsupported`. On macOS and Windows the worker opens it, so it is the path inside the worker's Linux, `/var/lib/docker/volumes/<volume>/_data/global/store.sqlite`. On any other platform Store calls fail `Unsupported`. Unset, they fail `InvalidInput` everywhere. |
@@ -168,8 +169,8 @@ its own wrapper.
 
 A Sandbox is a container running one daemon on the project's Store. The
 project has numbered Sandboxes, `1`, `2`, …, each on one image and holding up
-to 16 Workspaces. **There is no placement** (owner 2026-10-23):
-`sandbox.create({ image }?)` is the only call that starts one. Under the
+to its own `maxWorkspaces` (default 16). **There is no placement** (owner 2026-10-23):
+`sandbox.create({ image, maxWorkspaces }?)` is the only call that starts one. Under the
 project's lock it first reclaims Sandboxes that closed themselves, then
 starts the lowest free number on `image` (default `LAYERFS_IMAGE`) and
 returns `{ sandbox, image }`. One project's Sandboxes may run different
@@ -179,8 +180,8 @@ mounts in that Sandbox only, on its image; the native call gets
 `{ sandbox, branch }` with the client's project, home, deploy and Store
 path. It is refused `NoSuchSandbox` when the Sandbox is not running (or
 closed itself), with a message that says to create one with
-`sandbox.create()` and mount there, and `Capacity` when it holds 16
-Workspaces, with a message that says to create a new Sandbox with
+`sandbox.create()` and mount there, and `Capacity` when it reaches its configured
+Workspace limit, with a message that says to create a new Sandbox with
 `sandbox.create()`, or list its Workspaces with
 `sandbox.list_workspaces(sandbox)` and unmount the ones that are done with
 `workspace.unmount`. `sandbox.close(sandbox)` stops one now (stop, then
@@ -188,7 +189,7 @@ delete, each once), refused `MountsActive` while a Workspace is mounted in it
 and `NoSuchSandbox` when it is not running. A Sandbox still closes itself two
 minutes after its last Workspace is unmounted, with no call in flight.
 `project.list_sandboxes(pageSize, pagePos)` lists the running ones, each
-`{ sandbox, name, image, workspaces }`, reading records and starting and
+`{ sandbox, name, image, workspaces, maxWorkspaces }`, reading records and starting and
 changing nothing; `sandbox.list_workspaces(sandbox, pageSize, pagePos)` asks
 that Sandbox's daemon for its Workspaces, each `{ sandbox, path, branch,
 base, activity, changed }` (`activity` Idle or Busy) plus the daemon's record. A Workspace is
@@ -202,6 +203,14 @@ Store volume. Its records are `LAYERFS_HOME/<project>/sandboxes/<n>/`, with
 the container id in the plain-text file `container` there (for
 `docker logs`). A Sandbox starts with the image the deployment names then and
 keeps it for its life.
+
+`maxWorkspaces` must be an integer from 1 through 4294967295. It is an
+admission limit, not a promise that a machine has the resources to run that
+many Workspaces. An explicit SDK or CLI value wins over the environment.
+All clients read the selected value from the Sandbox record, including after
+reopening it in another process. Records from before this setting use 16;
+changing the environment never changes a running Sandbox. A larger number
+does not change the separate limit on control connections or Store writers.
 
 A Sandbox closes when idle: its daemon ends itself after 2 minutes with no
 Workspace and no call, and its container stops. Open connections do not keep
@@ -519,7 +528,7 @@ table differs, and when a family's files stop matching the SDK's.
 | `workspace.exec` | `layerfs workspace exec <ws> <command> [-m <text>] [--stream]` |
 | `workspace.commit` | `layerfs workspace commit <ws> [-m <text>] [--force]` |
 | `workspace.unmount` | `layerfs workspace unmount <ws> [--discard] [--force]` |
-| `sandbox.create` | `layerfs sandbox create [--image <text>]` |
+| `sandbox.create` | `layerfs sandbox create [--image <text>] [--max-workspaces <n>]` |
 | `sandbox.list_workspaces` | `layerfs sandbox list_workspaces <sandbox> [--page-size <n>] [--page-pos <n>]` |
 | `sandbox.close` | `layerfs sandbox close <sandbox>` |
 <!-- calls:end -->

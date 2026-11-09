@@ -133,6 +133,7 @@ export class LayerFS {
       },
       storePolicy: env("STORE_POLICY"),
       storePath: env("STORE_PATH"),
+      maxWorkspaces: env("MAX_WORKSPACES"),
     };
     // not open until a factory has opened its Store; the binding is chosen now, once
     this[STATE] = { closed: null, transport: binding() };

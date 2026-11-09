@@ -142,7 +142,7 @@ if (selected === "surface") {
   const first = await shop.project.list_sandboxes(2, 0);
   assert.deepEqual([first.items.map((s) => s.sandbox), first.hasMore, first.nextPagePos], [["1", "2"], true, 2]);
   const last = await shop.project.list_sandboxes(2, 2);
-  assert.deepEqual([last.items, last.hasMore, last.nextPagePos], [[{ sandbox: "3", name: "layerfs-website-3", image: "configured-image", workspaces: 3 }], false, null]);
+  assert.deepEqual([last.items, last.hasMore, last.nextPagePos], [[{ sandbox: "3", name: "layerfs-website-3", image: "configured-image", workspaces: 3, maxWorkspaces: 16 }], false, null]);
   // list_workspaces shapes the daemon's records
   native.workspaceList = [
     { workspace: "w1", branch: "feature", base: "c1", activity: "idle", mounted: true, directory: "/workspaces/w1", dirty: { inodes: 0, entries: 0 }, headMovedSinceMount: false, pendingMerge: false },

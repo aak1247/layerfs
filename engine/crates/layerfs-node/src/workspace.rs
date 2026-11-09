@@ -11,7 +11,7 @@ use crate::job::{failed, Outcome};
 use crate::registry::{
     lock, naming, random, sandbox, sandbox_live, sandbox_refreshed, text, Mount,
 };
-use crate::sandbox::{operation, WORKSPACES};
+use crate::sandbox::operation;
 use layerfs_api::internal::workspace;
 use layerfs_api::sandbox::{values, Unmounted};
 use layerfs_bridge::control::{CommitControl, SdkRefusal, SdkValue};
@@ -39,8 +39,8 @@ fn no_sandbox(mut refusal: SdkRefusal) -> SdkRefusal {
 }
 
 /// `workspace.mount(sandbox, branch)`: a new Workspace of `branch` in
-/// Sandbox `sandbox`, which must be running and hold fewer than
-/// [`WORKSPACES`]; its `sandbox`, `path` and `image`. Refused
+/// Sandbox `sandbox`, which must be running and have free capacity;
+/// its `sandbox`, `path` and `image`. Refused
 /// `NoSuchSandbox` (no such Sandbox, or it closed itself) and `Capacity`
 /// (full), each naming the calls to make instead. Only the Sandbox's own
 /// guard is taken; its record and count are checked under it.
@@ -76,11 +76,12 @@ pub(crate) fn mount(args: &SdkValue) -> Outcome {
     if !record.exists() {
         return Err(missing());
     }
-    if recorded(&directory)? >= WORKSPACES as usize {
+    if recorded(&directory)? >= state.max_workspaces as usize {
+        let capacity = state.max_workspaces;
         return Err(crate::job::refused(
             "Capacity",
             format!(
-                "Sandbox {sandbox} already holds {WORKSPACES} Workspaces. Create a new Sandbox with `sandbox.create()` and mount there, or list this one's Workspaces with `sandbox.list_workspaces(\"{sandbox}\")` and unmount the ones you are done with (`workspace.unmount(ws)`)"
+                "Sandbox {sandbox} already holds {capacity} Workspaces. Create a new Sandbox with `sandbox.create()` and mount there, or list this one's Workspaces with `sandbox.list_workspaces(\"{sandbox}\")` and unmount the ones you are done with (`workspace.unmount(ws)`)"
             ),
         ));
     }
@@ -160,7 +161,7 @@ pub(crate) fn reclaim_gone(args: &SdkValue) -> Result<(), SdkRefusal> {
 }
 
 /// `project.list_sandboxes()`: the project's running Sandboxes, lowest
-/// number first: `{ sandbox, name, image, workspaces }`, where `workspaces`
+/// number first: `{ sandbox, name, image, workspaces, maxWorkspaces }`, where `workspaces`
 /// counts its Workspace records. It reads records and inspects each
 /// container once; it starts nothing and changes nothing. A Sandbox found
 /// gone or stopped (an idle-closed one) is left out and its records kept:
@@ -182,6 +183,10 @@ pub(crate) fn sandboxes(args: &SdkValue) -> Outcome {
                 SdkValue::text(value.get_text("image").unwrap_or_default()),
             ),
             ("workspaces", SdkValue::Int(recorded(&directory)? as i64)),
+            (
+                "maxWorkspaces",
+                SdkValue::Int(i64::from(crate::sandbox::workspace_capacity(&value)?)),
+            ),
         ]));
     }
     Ok(SdkValue::map([

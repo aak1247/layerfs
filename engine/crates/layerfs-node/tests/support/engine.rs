@@ -22,11 +22,9 @@ pub fn engines_before(
         let mut before = Some(before);
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut requests = Vec::new();
-        for (status, body) in responses {
-            let response = format!(
-                "HTTP/1.1 {status} test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
+        let mut responses = responses.into_iter();
+        let mut next = responses.next();
+        while next.is_some() {
             let stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -52,11 +50,23 @@ pub fn engines_before(
                 }
                 request.push_str(&line);
             }
+            if request.starts_with("GET /version ") {
+                let body = r#"{"ApiVersion":"1.54"}"#;
+                let response = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                (&stream).write_all(response.as_bytes()).unwrap();
+                continue;
+            }
+            let (status, body) = next.take().unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
             if let Some(before) = before.take() {
                 before();
             }
             (&stream).write_all(response.as_bytes()).unwrap();
             requests.push(request);
+            next = responses.next();
         }
         requests
     })

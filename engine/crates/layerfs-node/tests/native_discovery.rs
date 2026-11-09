@@ -1,8 +1,60 @@
 //! External tests of the built Node binding. No private Rust source is included.
 #![cfg(target_os = "linux")]
 mod support;
+use layerfs_bridge::control::SdkValue;
 use std::{path::Path, process::Command, time::Duration};
 use support::{engine::*, *};
+
+#[test]
+fn sandbox_capacity_is_read_from_the_record_and_legacy_defaults_to_sixteen() {
+    for (stored, expected) in [(None, 16), (Some(SdkValue::Int(64)), 64)] {
+        let home = Home::new();
+        home.record_with_capacity(CID, [1; 32], [2; 32], stored);
+        let running = exited()
+            .replace("\"Running\":false", "\"Running\":true")
+            .replace(
+                "\"Ports\":{}",
+                r#""Ports":{"30421/tcp":[{"HostIp":"127.0.0.1","HostPort":"32123"}]}"#,
+            );
+        let engine = engine(&home.0, 200, &running);
+        home.node(
+            &format!("assert.equal((await native.call('project.list_sandboxes',args)).value.items[0].maxWorkspaces, {expected});"),
+            None,
+            Duration::from_secs(5),
+        );
+        engine.join().unwrap();
+    }
+}
+
+#[test]
+fn sandbox_create_refuses_invalid_capacity_before_any_side_effect() {
+    let home = Home::new();
+    home.node(
+        "for (const value of [0,-1,4294967296,'2',null]) { const result = await native.call('sandbox.create',{...args,maxWorkspaces:value}); assert.equal(result.refused.code,'InvalidInput'); }",
+        None,
+        Duration::from_secs(5),
+    );
+    assert!(!home.0.join("proj/create.intent").exists());
+}
+
+#[test]
+fn invalid_recorded_capacity_is_not_treated_as_a_legacy_record() {
+    let home = Home::new();
+    home.record_with_capacity(CID, [1; 32], [2; 32], Some(SdkValue::Int(0)));
+    let running = exited()
+        .replace("\"Running\":false", "\"Running\":true")
+        .replace(
+            "\"Ports\":{}",
+            r#""Ports":{"30421/tcp":[{"HostIp":"127.0.0.1","HostPort":"32123"}]}"#,
+        );
+    let engine = engine(&home.0, 200, &running);
+    home.node(
+        "assert.equal((await native.call('project.list_sandboxes',args)).refused.code,'InvalidInput');",
+        None,
+        Duration::from_secs(5),
+    );
+    engine.join().unwrap();
+}
 
 #[test]
 fn a_gone_container_is_reclaimed_by_removing_its_records() {

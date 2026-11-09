@@ -44,6 +44,8 @@ pub(crate) struct SandboxState {
     pub(crate) project: String,
     /// Its container's name, `<prefix><project>-<id>`.
     pub(crate) name: String,
+    /// Fixed when this Sandbox starts and shared by every client reopening it.
+    pub(crate) max_workspaces: u32,
     pub(crate) directory: std::path::PathBuf,
     pub(crate) runtime: Sandbox,
     pub(crate) identity: CommandIdentity,

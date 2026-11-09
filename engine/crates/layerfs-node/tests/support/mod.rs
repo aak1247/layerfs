@@ -48,8 +48,18 @@ impl Home {
     }
 
     pub fn record(&self, container: &str, secret: [u8; 32], peer: [u8; 32]) {
+        self.record_with_capacity(container, secret, peer, None);
+    }
+
+    pub fn record_with_capacity(
+        &self,
+        container: &str,
+        secret: [u8; 32],
+        peer: [u8; 32],
+        capacity: Option<SdkValue>,
+    ) {
         let bytes = |n: [u8; 32]| SdkValue::Bytes(n.to_vec());
-        let value = SdkValue::map([
+        let mut value = SdkValue::map([
             ("id", SdkValue::text("1")),
             ("project", SdkValue::text("proj")),
             ("container", SdkValue::text(container)),
@@ -66,6 +76,9 @@ impl Home {
             ("peer", bytes(peer)),
             ("instance", bytes([7; 32])),
         ]);
+        if let (Some(capacity), SdkValue::Map(fields)) = (capacity, &mut value) {
+            fields.push(("maxWorkspaces".to_owned(), capacity));
+        }
         let path = self.0.join("proj/sandboxes/1/sandbox.record");
         let mut file = std::fs::OpenOptions::new()
             .write(true)

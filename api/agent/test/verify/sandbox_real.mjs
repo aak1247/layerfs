@@ -52,6 +52,15 @@ try {
   assert.equal(closed.code, "NoSuchSandbox", closed.message);
   assert.match(closed.message, /sandbox\.create\(\)/);
   assert.deepEqual((await shop.project.list_sandboxes()).items, []);
+  // A custom capacity reaches the daemon as well as the SDK admission check.
+  // The 17th mount succeeds and the 18th is refused in the same Sandbox.
+  const custom = await shop.sandbox.create({ maxWorkspaces: 17 });
+  assert.equal(custom.sandbox, "1");
+  assert.equal((await shop.project.list_sandboxes()).items[0].maxWorkspaces, 17);
+  for (let i = 0; i < 17; i++) mounted.push(await shop.workspace.mount(custom.sandbox, "lane"));
+  assert.equal((await refusal(shop.workspace.mount(custom.sandbox, "lane"))).code, "Capacity");
+  for (const ws of mounted.splice(0)) await shop.workspace.unmount(ws, true);
+  assert.deepEqual(await shop.sandbox.close(custom.sandbox), { kind: "Closed", sandbox: "1" });
   // the closed client refuses
   await shop.close();
   assert.ok(isRefusal(await refusal(shop.project.list_sandboxes()), "InvalidInput"));

@@ -87,7 +87,7 @@ exports.observed = [];
 exports.deploys = [];
 exports.args = [];
 exports.workspaceList = [];
-exports.sandboxList = [{ sandbox: "1", name: "layerfs-website-1", image: "fake-image", workspaces: 0 }];
+exports.sandboxList = [{ sandbox: "1", name: "layerfs-website-1", image: "fake-image", workspaces: 0, maxWorkspaces: 16 }];
 const traced = (op, args) => {
   log(op, args);
   exports.calls.push(op);

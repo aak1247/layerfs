@@ -2,7 +2,7 @@
 // running Sandbox `sandbox` names (its number, as sandbox.create returns it),
 // and nowhere else: there is no placement (owner 2026-10-23), and a mount
 // never starts a Sandbox. Refused NoSuchSandbox when it is not running (or
-// closed itself) and Capacity when it holds 16 Workspaces; each refusal's
+// closed itself) and Capacity when it reaches its configured limit; each refusal's
 // message names the calls to make instead. The Sandbox fixes the image. The
 // Branch is found by name in the project's Store; the daemon binds its id.
 // The native call gets { sandbox, branch } with the client's project, home,
