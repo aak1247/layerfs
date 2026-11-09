@@ -158,19 +158,30 @@ daemon connection; an observer or publication failure retains its original
 result and directory in the running process. Project inventory can still inspect
 the container separately and is not evidence that the intent completed.
 Checks wait for the Sandbox discovery guard, so another active mount can finish
-before its intent is classified. Reopening never replays the old request. Completed records
-are checked against the Sandbox, Workspace, Branch and receipt identities.
+before its intent is classified. Reopening never replays the old request.
+Completed records are checked against the Sandbox, Workspace, Branch and receipt
+identities.
 Each completed mount must match its Workspace record or an exact completed
 close receipt; an orphan, missing or mismatched record requires recovery.
 Durable records lacking the required mount intent are not automatically
 converted. These checks scan the saved records; they are not evidence of
 sustained performance at large workspace counts. This does not recover an old
-daemon or prove its physical consumers have exited. The native Node tests use an authenticated
-simulated daemon and a real local Store: they cover distinct successful mounts,
+daemon or prove its physical consumers have exited. The native Node tests use
+an authenticated simulated daemon and a real local Store: they cover distinct successful mounts,
 lost Ready, failed intent sync, directory replacement, two concurrent mounts,
 missing or mismatched records, completed closes and process reopen without
-access to the Docker socket. The
-separate Docker/FUSE proof above exercises actual SDK-created mounts.
+access to the Docker socket.
+
+After the record-matching checks were added, a fresh SDK/Docker/FUSE fixture
+created 32 durable Workspaces in one Sandbox, refused the 33rd at capacity and
+closed all 32. A fresh network-none Node process without a Docker socket then
+validated the 32 mount intents and 32 close receipts with no Workspace records,
+before reaching the expected unavailable-socket error. The test harness and
+verifier exited successfully, and the host FUSE connections returned to their
+pre-test baseline. Evidence, exact retained resources and cleanup ownership are
+in `/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-durable-consistency-20261110-ecdc1ed882-zq8z61vh/receipt.txt`.
+This is a normal-close functional test, not a performance, automatic-recovery,
+Kubernetes or AutoTask integration proof.
 
 The Linux Node binding also synchronizes a close intent before sending a durable
 Workspace's ordinary Unmount. It records the correlated terminal reply before
