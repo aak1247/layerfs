@@ -112,6 +112,14 @@ source and binary hashes, old-owner fence and retention ownership are under
 This manually fenced same-host recovery does not implement automatic SDK
 recovery, Kubernetes reconstruction or physical host power-loss handling.
 
+A separate attempted 32-Workspace durable capacity proof did not reach its
+first mount: Docker Create returned an unknown outcome while the Engine was
+slow, and the exact test-labelled container was later observed in Created
+state. The SDK retained the creation intent; a fresh Node process without a
+Docker socket refused to replay it. The original test container, volume and
+diagnostic evidence are retained under the same proof directory. This failed
+attempt is not a 32-Workspace capacity result.
+
 For a Sandbox record explicitly marked durable, the Node binding records a
 private mount intent before Bind, the original Branch snapshot before Attach,
 and the exact Ready receipt before reporting success. It synchronizes the
