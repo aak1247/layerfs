@@ -83,12 +83,13 @@ impl Service {
         if record.branch != snapshot.branch.id {
             return Err(reject(RecordedRegistrationError::BranchMismatch, workspace));
         }
-        self.register_durable(workspace).map_err(|error| {
-            let DurableRegistrationFailure { cause, workspace } = *error;
-            Box::new(RecordedRegistrationFailure {
-                cause: RecordedRegistrationError::Control(cause),
-                workspace,
+        self.register_durable_with_recording(workspace, true)
+            .map_err(|error| {
+                let DurableRegistrationFailure { cause, workspace } = *error;
+                Box::new(RecordedRegistrationFailure {
+                    cause: RecordedRegistrationError::Control(cause),
+                    workspace,
+                })
             })
-        })
     }
 }

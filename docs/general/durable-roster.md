@@ -62,10 +62,13 @@ consumers stopped before invoking this operation.
 Even after a successful scan the caller must separately authorize each
 Workspace and Branch, prove the Store and original file identities, fence old
 processes and mounts, and reconcile unknown operations before exposing data.
-Before attempting a terminal close the caller may persist
-`Roster::begin_close(token)`. The caller must serialize control admission and
-verify that this is the current bound Workspace and namespace. Only one close
-may be pending in a catalog at a time. While one is pending, normal discovery,
+Before attempting a terminal close, the manually assembled daemon can use
+`Service::unmount_recorded`: it checks the catalog and current bound token,
+reserves the Workspace control entry, persists `Roster::begin_close(token)`,
+performs one unmount and records its actual terminal reply. Direct control-wire
+Unmount and ForceUnmount refuse catalog-backed bindings; forced close is not
+yet implemented for these bindings. A Dirty refusal occurs before an intent is
+recorded. Only one close may be pending in a catalog at a time. While one is pending, normal discovery,
 recovery and new intents refuse without performing those operations.
 `Roster::pending_close` exposes the exact retained Workspace, Branch and token;
 it does not establish whether the original unmount succeeded. After verifying
@@ -73,8 +76,14 @@ the provenance of that exact unmount's `Reply::Unmounted`, the caller may pass
 the reply to `Roster::finish_close`. Status, a disconnected process or a reply
 for another namespace is not a receipt. An interrupted or unknown close must
 be reconciled with independent evidence, never automatically retried or
-declared complete. This is a low-level catalog protocol; the normal daemon's
-unmount path does not yet perform it or provide the required admission fencing.
+declared complete. A kernel Busy refusal is known to have made no terminal
+change, but currently still leaves an unresolved intent; safe cancellation and
+an explicit subsequent close are not implemented yet. The normal application
+daemon does not yet register catalog-backed bindings or call this close path.
+The caller must authenticate the Sandbox and physical Store, serialize access
+to the catalog, and retain the original Service and failure on an uncertain
+attempt. A terminal reply that cannot be recorded is returned with the exact
+original `Success`, including its kernel receipt.
 
 A completed close removes the Workspace from the active discovery set while
 keeping the original creation, intent and terminal event files. The same
@@ -129,3 +138,12 @@ exit are under
 The first test setup failed because its bind-mounted proof directory did not
 allow the test's unprivileged user to traverse it; that failed run is retained
 separately in `durable-roster-lifecycle-fuse-20261109`.
+
+The catalog-aware Service close was tested with directory-sync failures both
+before unmount and after the terminal reply; it retained the original binding
+or successful reply respectively. A separate isolated FUSE run retained a Busy
+close intent across process loss, refused replay and recovery, and also closed
+two recovered mounts through the new Service method. Its test output, hashes
+and container exit are under
+`/home/yahui/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/durable-recorded-close-fuse-20261109/`.
+This is not automatic daemon startup or an end-to-end AutoTask integration.

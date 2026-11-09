@@ -513,6 +513,30 @@ impl Roster {
         Ok(result)
     }
 
+    /// Exact-marker lookup after this locked catalog's complete opening scan.
+    /// Unlike `lookup`, this does not rescan unrelated Workspace markers.
+    pub(crate) fn active_record(
+        &mut self,
+        workspace: WorkspaceId,
+    ) -> Result<Option<WorkspaceRecord>, RosterError> {
+        self.ensure()?;
+        self.ready()?;
+        let name = format!("{}.record", identity_name(workspace));
+        let record = match self.checked_marker(&name)? {
+            Some((_, Event::Created(record))) if record.workspace == workspace => record,
+            Some(_) => {
+                return Err(self.retain(RosterError::Invalid("roster creation marker"), false))
+            }
+            None => return Ok(None),
+        };
+        let name = format!("{}.closed", identity_name(workspace));
+        match self.checked_marker(&name)? {
+            None => Ok(Some(record)),
+            Some((_, Event::Closed(closing))) if closing.record == record => Ok(None),
+            Some(_) => Err(self.retain(RosterError::Invalid("roster terminal marker"), false)),
+        }
+    }
+
     /// Recheck the original directory, owner, ledger and head under its lock.
     pub(crate) fn check_live(&mut self) -> Result<(), RosterError> {
         self.ensure()

@@ -198,6 +198,7 @@ impl Service {
                     workspace: Arc::new(bound.workspace),
                     snapshot,
                     activity: Activity::Idle,
+                    recorded: false,
                     epoch: 1,
                     published: None,
                 })),

@@ -5,7 +5,7 @@
 #[path = "support/installed_store.rs"]
 mod support;
 
-use layerfs_bridge::control::{Reply, Request, UnmountControl};
+use layerfs_bridge::control::{Reply, UnmountControl};
 use layerfs_daemon::{
     bootstrap::open_store,
     control::{RecordedRegistrationError, Service},
@@ -129,10 +129,13 @@ fn discovery_identity_and_branch_gate_registration() {
     owner.client().retire_namespace(2).unwrap();
     assert_eq!(
         service
-            .execute_control(&Request::Unmount(UnmountControl {
-                token,
-                discard: false
-            }))
+            .unmount_recorded(
+                &mut discovery,
+                UnmountControl {
+                    token,
+                    discard: false
+                }
+            )
             .unwrap()
             .reply,
         Reply::Unmounted(token)

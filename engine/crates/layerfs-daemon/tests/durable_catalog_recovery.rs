@@ -82,7 +82,18 @@ fn acknowledged_close_is_excluded_and_pending_close_blocks_recovery() {
         tokens.push(service.register_recorded(&mut discovery, binding).unwrap());
     }
 
-    let closing = discovery.begin_close(tokens[0]).unwrap();
+    // A synthetic pending catalog entry exercises preflight before any open.
+    let synthetic = WorkspaceToken {
+        workspace: WorkspaceId::from_authority([93; 32]).unwrap(),
+        namespace: 93,
+    };
+    discovery
+        .record(WorkspaceRecord {
+            workspace: synthetic.workspace,
+            branch: fixture.branch,
+        })
+        .unwrap();
+    let closing = discovery.begin_close(synthetic).unwrap();
     let other = Owner::start(
         &fixture.directory.join("other.sqlite"),
         ProfileConfig::default(),
@@ -106,16 +117,47 @@ fn acknowledged_close_is_excluded_and_pending_close_blocks_recovery() {
     assert!(blocked.completed.is_empty());
     drop(other_service);
     other.stop().unwrap();
+    discovery
+        .finish_close(&Reply::Unmounted(synthetic))
+        .unwrap();
 
-    let reply = service
+    assert!(service
         .execute_control(&Request::Unmount(UnmountControl {
             token: tokens[0],
-            discard: false,
+            discard: true
         }))
+        .is_err());
+    assert!(service
+        .execute_control(&Request::ForceUnmount {
+            token: tokens[0],
+            relinquish_unknown: false
+        })
+        .is_err());
+    assert!(service
+        .unmount_recorded(
+            &mut discovery,
+            UnmountControl {
+                token: WorkspaceToken {
+                    namespace: tokens[0].namespace + 1,
+                    ..tokens[0]
+                },
+                discard: true,
+            }
+        )
+        .is_err());
+    assert_eq!(discovery.pending_close().unwrap(), None);
+
+    let reply = service
+        .unmount_recorded(
+            &mut discovery,
+            UnmountControl {
+                token: tokens[0],
+                discard: false,
+            },
+        )
         .unwrap()
         .reply;
     assert_eq!(reply, Reply::Unmounted(tokens[0]));
-    discovery.finish_close(&reply).unwrap();
     drop(service);
     store.close_reader(tokens[1].workspace).unwrap();
     owner.stop().unwrap();
@@ -151,10 +193,13 @@ fn acknowledged_close_is_excluded_and_pending_close_blocks_recovery() {
         )
         .is_file());
     let reply = recovered_service
-        .execute_control(&Request::Unmount(UnmountControl {
-            token: recovered[0],
-            discard: false,
-        }))
+        .unmount_recorded(
+            &mut discovery,
+            UnmountControl {
+                token: recovered[0],
+                discard: false,
+            },
+        )
         .unwrap()
         .reply;
     assert_eq!(reply, Reply::Unmounted(recovered[0]));
@@ -370,10 +415,13 @@ fn capacity_preflight_and_partial_failure_keep_original_recovery_custody() {
     ));
     assert_eq!(
         service
-            .execute_control(&Request::Unmount(UnmountControl {
-                token,
-                discard: false
-            }))
+            .unmount_recorded(
+                &mut discovery,
+                UnmountControl {
+                    token,
+                    discard: false
+                }
+            )
             .unwrap()
             .reply,
         Reply::Unmounted(token)
@@ -481,10 +529,13 @@ fn one_catalog_recovers_sixty_four_independent_workspace_bindings() {
     for token in tokens {
         assert_eq!(
             service
-                .execute_control(&Request::Unmount(UnmountControl {
-                    token,
-                    discard: false
-                }))
+                .unmount_recorded(
+                    &mut discovery,
+                    UnmountControl {
+                        token,
+                        discard: false
+                    }
+                )
                 .unwrap()
                 .reply,
             Reply::Unmounted(token)

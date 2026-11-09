@@ -221,7 +221,7 @@ impl Service {
                     ))
                 }
             };
-            match self.register_durable(binding) {
+            match self.register_durable_with_recording(binding, true) {
                 Ok(token) => completed.push(token),
                 Err(failure) => {
                     let DurableRegistrationFailure { cause, workspace } = *failure;

@@ -5,11 +5,15 @@
 #[path = "support/installed_store.rs"]
 mod support;
 
-use layerfs_bridge::control::{Reply, Request, UnmountControl, WorkspaceToken};
+use layerfs_bridge::control::{
+    Activity, ControlCode, Reply, Request, UnmountControl, WorkspaceToken,
+};
 use layerfs_daemon::{
     bootstrap::open_store,
-    control::{KernelConfig, KernelServing, Service},
-    durable_roster::{Authority, Roster, WorkspaceRecord},
+    control::{
+        CatalogRecoveryCause, Failure, KernelConfig, KernelServing, RecordedCloseFailure, Service,
+    },
+    durable_roster::{Authority, Roster, RosterError, WorkspaceRecord},
     store::BindRequest,
     Owner, OwnerConfig,
 };
@@ -28,6 +32,7 @@ use std::{
 };
 
 const CHILD: &str = "LAYERFS_DURABLE_MULTI_CHILD";
+const BUSY_CHILD: &str = "LAYERFS_DURABLE_CLOSE_BUSY_CHILD";
 const ITEMS: [(u8, i64, &str); 2] = [(51, 1, "first"), (52, 2, "second")];
 
 struct ChildGuard(Child);
@@ -157,6 +162,152 @@ fn child(directory: &Path) {
     panic!("parent did not terminate the old owner");
 }
 
+fn busy_child(directory: &Path) {
+    let config = PersistenceConfig::sqlite(directory.join("store-private/store.sqlite"))
+        .with_sqlite_profile(SqlitePersistenceProfile::Durable)
+        .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables);
+    let store = open(config);
+    let branch = BranchId::from_authority([24; 16]);
+    let snapshot = store.history().branch_snapshot(branch).unwrap().unwrap();
+    let roster = roster(&directory.join("busy-template.sqlite"));
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    let mut discovery = Roster::create(&directory.join("catalog"), authority).unwrap();
+    let service = Service::with_kernel(store.clone(), &roster, kernel(&directory.join("mounts")));
+    let workspace = WorkspaceId::from_authority([53; 32]).unwrap();
+    let record = WorkspaceRecord { workspace, branch };
+    discovery.record(record).unwrap();
+    let durable = Owner::create_durable(DurableWorkspace {
+        path: &directory.join("durable").join(record.overlay_name()),
+        profile: ProfileConfig::default(),
+        identity: [53; 32],
+        namespace: 1,
+        expected_base_root: snapshot.effective_root.to_bytes(),
+    })
+    .unwrap();
+    let client = roster.adopt_durable(durable).unwrap();
+    let binding = store
+        .bind_durable(client, BindRequest { workspace, branch }, snapshot)
+        .unwrap()
+        .workspace;
+    let token = service.register_recorded(&mut discovery, binding).unwrap();
+    let mount = attach(&service, token);
+    let held = fs::File::open(mount.join("file-000000")).unwrap();
+    let failure = service
+        .unmount_recorded(
+            &mut discovery,
+            UnmountControl {
+                token,
+                discard: true,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(failure, RecordedCloseFailure::Control { token: saved, cause: Failure::Kernel(ref cause) }
+        if saved == token && cause.code == ControlCode::Busy && cause.phase == "unmount:kernel")
+    );
+    let Reply::Status(status) = service
+        .execute_control(&Request::Status(token))
+        .unwrap()
+        .reply
+    else {
+        panic!("missing status")
+    };
+    assert_eq!(status.activity, Activity::Closing);
+    assert!(service.operation(token).is_err());
+    assert_eq!(discovery.pending_close().unwrap().unwrap().token, token);
+    assert!(matches!(
+        service.unmount_recorded(
+            &mut discovery,
+            UnmountControl {
+                token,
+                discard: true
+            }
+        ),
+        Err(RecordedCloseFailure::Discovery(RosterError::PendingClose(
+            _
+        )))
+    ));
+    drop(held);
+    fs::write(
+        directory.join("busy-ack"),
+        b"original close and owner retained",
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(90));
+    panic!("parent did not terminate the old owner");
+}
+
+#[test]
+#[ignore = "requires a dedicated Linux container with CAP_SYS_ADMIN and /dev/fuse"]
+fn recorded_busy_close_keeps_its_original_intent_after_process_loss() {
+    if let Some(directory) = std::env::var_os(BUSY_CHILD) {
+        busy_child(Path::new(&directory));
+        return;
+    }
+    let fixture = support::Fixture::new_durable(1, "durable-recorded-busy");
+    let directory = &fixture.directory;
+    for name in ["durable", "catalog", "mounts"] {
+        fs::create_dir(directory.join(name)).unwrap();
+        fs::set_permissions(
+            directory.join(name),
+            fs::Permissions::from_mode(if name == "mounts" { 0o755 } else { 0o700 }),
+        )
+        .unwrap();
+    }
+    let mount = directory.join("mounts/1");
+    let mut cleanup = Mounts(vec![mount.clone()]);
+    let mut old = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "recorded_busy_close_keeps_its_original_intent_after_process_loss",
+                "--ignored",
+            ])
+            .env(BUSY_CHILD, directory)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !directory.join("busy-ack").exists() {
+        assert!(old.0.try_wait().unwrap().is_none(), "writer exited early");
+        assert!(Instant::now() < deadline, "writer did not acknowledge");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    old.0.kill().unwrap();
+    assert!(!old.0.wait().unwrap().success());
+    nix::mount::umount2(&mount, nix::mount::MntFlags::MNT_DETACH).unwrap();
+    fs::remove_dir(&mount).unwrap();
+    cleanup.0.clear();
+    let store = open(fixture.config.clone());
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    let mut discovery = Roster::open(&directory.join("catalog"), authority).unwrap();
+    let pending = discovery.pending_close().unwrap().unwrap();
+    assert_eq!(pending.token.workspace.to_bytes(), [53; 32]);
+    assert_eq!(pending.token.namespace, 1);
+    let roster = roster(&directory.join("busy-reader.sqlite"));
+    let service = Service::new(store.clone(), &roster);
+    let failure = service
+        .recover_catalog(
+            &mut discovery,
+            &roster,
+            &directory.join("durable"),
+            [8; 32],
+            ProfileConfig::default(),
+            2,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(failure.cause, CatalogRecoveryCause::Discovery(RosterError::PendingClose(saved)) if saved == pending)
+    );
+    assert!(failure.completed.is_empty());
+    drop(service);
+    roster.stop().unwrap();
+    drop(discovery);
+    drop(store);
+    fixture.cleanup();
+}
+
 #[test]
 #[ignore = "requires a dedicated Linux container with CAP_SYS_ADMIN and /dev/fuse"]
 fn two_durable_mounts_recover_independently_after_process_loss() {
@@ -270,15 +421,27 @@ fn two_durable_mounts_recover_independently_after_process_loss() {
     }
     assert_eq!(service.workspaces(), Some(2));
     for token in tokens {
-        discovery.begin_close(token).unwrap();
+        let refused = service
+            .unmount_recorded(
+                &mut discovery,
+                UnmountControl {
+                    token,
+                    discard: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(refused.reply, Reply::Dirty(_)));
+        assert_eq!(discovery.pending_close().unwrap(), None);
         let done = service
-            .execute_control(&Request::Unmount(UnmountControl {
-                token,
-                discard: true,
-            }))
+            .unmount_recorded(
+                &mut discovery,
+                UnmountControl {
+                    token,
+                    discard: true,
+                },
+            )
             .unwrap();
         assert_eq!(done.reply, Reply::Unmounted(token));
-        discovery.finish_close(&done.reply).unwrap();
     }
     cleanup.0.clear();
     drop(service);

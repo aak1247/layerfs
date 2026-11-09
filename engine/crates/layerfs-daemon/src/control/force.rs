@@ -50,6 +50,17 @@ fn guard(
     token: WorkspaceToken,
     relinquish_unknown: bool,
 ) -> Result<CommitKnowledge, Failure> {
+    if value.recorded {
+        #[cfg(target_os = "linux")]
+        if let Kernel::Retained(kept) = &value.kernel {
+            return Err(Failure::Retained(Box::new(kept.custody(token))));
+        }
+        return Err(refused(
+            ControlCode::Invalid,
+            ADMISSION,
+            "recorded Workspace requires its catalog close protocol",
+        ));
+    }
     // Stored custody answers first: no second abort or detach ever follows
     // it. The one exception is a normal unmount stalled at Join, admitted
     // idle with no Commit custody, whose abort control is still unused.

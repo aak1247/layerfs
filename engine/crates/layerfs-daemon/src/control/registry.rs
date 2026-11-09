@@ -18,6 +18,8 @@ pub(super) struct Binding {
     pub workspace: Arc<BoundWorkspace>,
     pub snapshot: BranchSnapshot,
     pub activity: Activity,
+    /// Catalog-backed bindings must not bypass their recorded close protocol.
+    pub recorded: bool,
     pub epoch: u64,
     pub published: Option<CommitOutcome>,
 }
@@ -83,6 +85,14 @@ impl Service {
         &self,
         workspace: BoundWorkspace,
     ) -> Result<WorkspaceToken, Box<DurableRegistrationFailure>> {
+        self.register_durable_with_recording(workspace, false)
+    }
+
+    pub(super) fn register_durable_with_recording(
+        &self,
+        workspace: BoundWorkspace,
+        recorded: bool,
+    ) -> Result<WorkspaceToken, Box<DurableRegistrationFailure>> {
         let refuse = |cause, workspace| {
             Box::new(DurableRegistrationFailure {
                 cause,
@@ -130,6 +140,7 @@ impl Service {
                 workspace: Arc::new(workspace),
                 snapshot,
                 activity: Activity::Idle,
+                recorded,
                 epoch: 1,
                 published: None,
             })),
@@ -145,7 +156,9 @@ impl Service {
         let workspace = {
             let entries = self.entries.lock().map_err(|_| Failure::Poisoned)?;
             let value = bound(&entries, token)?;
-            if value.activity == Activity::Closing {
+            if value.activity == Activity::Closing
+                || (value.recorded && value.activity == Activity::Uncertain)
+            {
                 return Err(Failure::Rejected(ControlCode::Busy, "Workspace is closing"));
             }
             value.workspace.clone()

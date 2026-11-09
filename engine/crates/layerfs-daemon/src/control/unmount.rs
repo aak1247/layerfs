@@ -32,7 +32,7 @@ impl Service {
             Departure::Unattached => {}
             #[cfg(target_os = "linux")]
             Departure::Session(attached) => {
-                return self.unmount_kernel(token, workspace, *attached)
+                return self.unmount_kernel(token, workspace, *attached, false)
             }
         };
         self.close(token, &workspace, None)
@@ -49,6 +49,12 @@ impl Service {
         #[cfg(target_os = "linux")]
         if let Kernel::Retained(kept) = &value.kernel {
             return Err(Failure::Retained(Box::new(kept.custody(token))));
+        }
+        if value.recorded {
+            return Err(Failure::Rejected(
+                layerfs_bridge::control::ControlCode::Invalid,
+                "recorded Workspace requires its catalog close protocol",
+            ));
         }
         idle(value)?;
         let departure = match value.kernel {
@@ -167,6 +173,8 @@ impl Service {
             if let Ok(binding) = bound_mut(&mut entries, token) {
                 binding.activity = if failure.uncertain() {
                     Activity::Uncertain
+                } else if binding.recorded {
+                    Activity::Closing
                 } else {
                     Activity::Idle
                 };

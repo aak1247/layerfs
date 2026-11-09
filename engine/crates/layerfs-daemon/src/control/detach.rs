@@ -73,6 +73,7 @@ impl Service {
         token: WorkspaceToken,
         workspace: Arc<BoundWorkspace>,
         attached: Attached,
+        recorded: bool,
     ) -> Result<Success, Failure> {
         let Attached { mut session, ready } = attached;
         let mount = session.mount();
@@ -84,7 +85,11 @@ impl Service {
                 self.settle(
                     token,
                     Kernel::Ready(Box::new(Attached { session, ready })),
-                    Activity::Idle,
+                    if recorded {
+                        Activity::Closing
+                    } else {
+                        Activity::Idle
+                    },
                 );
                 return Err(Failure::kernel(
                     ControlCode::Busy,
