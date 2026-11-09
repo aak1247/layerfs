@@ -67,6 +67,8 @@ pub fn connect_address(
 pub enum SandboxPhase {
     /// Local validation, no container effect.
     Validate,
+    /// The caller's original durable lifecycle observation.
+    Record,
     /// Caller executable open/metadata.
     Executable,
     /// Volume observation and original Create.
@@ -101,6 +103,13 @@ pub enum SandboxCause {
     Io(io::Error),
     /// Local config or correlated startup validation.
     Setup(ControlError),
+    /// Original lifecycle observer error, at the named milestone.
+    Observer {
+        /// Milestone the observer was recording.
+        milestone: SandboxMilestone,
+        /// Original observer error.
+        cause: io::Error,
+    },
     /// Actual original runtime Create including partial decoded ID.
     Create(Box<SandboxCreateFailure>),
     /// Actual incremental archive extraction failure and work.
@@ -174,6 +183,54 @@ pub struct ManagedSandbox {
     pub handshake: ChannelWork,
     pub(crate) command_identity: layerfs_sandbox::CommandIdentity,
 }
+/// Ordered boundaries for one original Sandbox creation attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxMilestone {
+    /// Before the Engine receives the container Create request.
+    BeforeCreate,
+    /// The exact container ID has been acknowledged.
+    Created,
+    /// Private configuration and executable upload was acknowledged.
+    Uploaded,
+    /// Before the Engine receives the container Start request.
+    BeforeStart,
+    /// The Engine acknowledged the original Start request.
+    Started,
+    /// The original authenticated daemon Hello was observed.
+    Authenticated,
+    /// Before the one Store installation is sent, if needed.
+    BeforeInstall,
+    /// The original Store installation was acknowledged.
+    Installed,
+    /// The post-install daemon Hello observed ControlReady.
+    InstallReady,
+}
+/// Exact known owners at a milestone; absent values have not been observed.
+pub struct SandboxObservation<'a> {
+    /// The original lifecycle boundary.
+    pub milestone: SandboxMilestone,
+    /// The exact acknowledged container, after Create.
+    pub runtime: Option<&'a Sandbox>,
+    /// The original authenticated daemon status, after Hello.
+    pub status: Option<&'a DaemonStatus>,
+    /// The original installation acknowledgement, after Install.
+    pub installed: Option<&'a crate::Installed>,
+}
+fn record(
+    observer: &mut impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
+    milestone: SandboxMilestone,
+    runtime: Option<&Sandbox>,
+    status: Option<&DaemonStatus>,
+    installed: Option<&crate::Installed>,
+) -> Result<(), SandboxCause> {
+    observer(SandboxObservation {
+        milestone,
+        runtime,
+        status,
+        installed,
+    })
+    .map_err(|cause| SandboxCause::Observer { milestone, cause })
+}
 impl SandboxApi {
     /// Uses one explicit local Engine endpoint and metadata wait policy.
     pub fn new(docker: Docker) -> Self {
@@ -194,6 +251,18 @@ impl SandboxApi {
         store: &layerfs_persistence::SealedStore,
         manifest: &layerfs_bridge::provision::StoreManifest,
     ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
+        self.create_file_observed(request, store, manifest, |_| Ok(()))
+    }
+    /// Creates once while the caller durably records lifecycle milestones.
+    /// An observer error stops before the next effect and returns all original
+    /// owners and receipts. The caller never replays an uncertain milestone.
+    pub fn create_file_observed(
+        &self,
+        request: SandboxCreate,
+        store: &layerfs_persistence::SealedStore,
+        manifest: &layerfs_bridge::provision::StoreManifest,
+        mut observer: impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
+    ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
         let existing = request.setup.existing_store.is_some();
         if let Some(selected) = &request.setup.existing_store {
             let mut expected = manifest.clone();
@@ -211,11 +280,29 @@ impl SandboxApi {
                 }));
             }
         }
-        let mut owner = create(&self.docker, request)?;
+        let mut owner = create_observed(&self.docker, request, &mut observer)?;
         if existing {
             // The original startup already selected and waited for this Store.
             // Installing again would change the existing one-attempt lifecycle.
             return Ok(owner);
+        }
+        if let Err(cause) = record(
+            &mut observer,
+            SandboxMilestone::BeforeInstall,
+            Some(&owner.runtime),
+            Some(&owner.startup),
+            None,
+        ) {
+            return Err(Box::new(SandboxFailure {
+                request: owner.request,
+                phase: SandboxPhase::Record,
+                sandbox: Some(owner.runtime),
+                control: Some(owner.control),
+                handshake: owner.handshake,
+                observed: Some(owner.startup),
+                installed: None,
+                cause,
+            }));
         }
         let installed = owner
             .control
@@ -241,6 +328,24 @@ impl SandboxApi {
             }
         };
         owner.installed = Some(installed);
+        if let Err(cause) = record(
+            &mut observer,
+            SandboxMilestone::Installed,
+            Some(&owner.runtime),
+            Some(&owner.startup),
+            owner.installed.as_ref(),
+        ) {
+            return Err(Box::new(SandboxFailure {
+                request: owner.request,
+                phase: SandboxPhase::Record,
+                sandbox: Some(owner.runtime),
+                control: Some(owner.control),
+                handshake: owner.handshake,
+                observed: Some(owner.startup),
+                installed: owner.installed,
+                cause,
+            }));
+        }
         match hello(
             &mut owner.control,
             HelloRequest {
@@ -250,6 +355,24 @@ impl SandboxApi {
         ) {
             Ok(status) if status.phase == DaemonPhase::ControlReady => {
                 owner.startup = status;
+                if let Err(cause) = record(
+                    &mut observer,
+                    SandboxMilestone::InstallReady,
+                    Some(&owner.runtime),
+                    Some(&owner.startup),
+                    owner.installed.as_ref(),
+                ) {
+                    return Err(Box::new(SandboxFailure {
+                        request: owner.request,
+                        phase: SandboxPhase::Record,
+                        sandbox: Some(owner.runtime),
+                        control: Some(owner.control),
+                        handshake: owner.handshake,
+                        observed: Some(owner.startup),
+                        installed: owner.installed,
+                        cause,
+                    }));
+                }
                 Ok(owner)
             }
             Ok(status) => Err(Box::new(SandboxFailure {
@@ -305,6 +428,13 @@ pub(crate) fn create(
     docker: &Docker,
     request: SandboxCreate,
 ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
+    create_observed(docker, request, &mut |_| Ok(()))
+}
+fn create_observed(
+    docker: &Docker,
+    request: SandboxCreate,
+    observer: &mut impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
+) -> Result<ManagedSandbox, Box<SandboxFailure>> {
     let mut phase = SandboxPhase::Validate;
     let mut sandbox = None;
     let mut control = None;
@@ -348,19 +478,46 @@ pub(crate) fn create(
         }
         phase = SandboxPhase::Executable;
         let mut file = File::open(&request.executable).map_err(SandboxCause::Io)?;
+        phase = SandboxPhase::Record;
+        record(observer, SandboxMilestone::BeforeCreate, None, None, None)?;
         phase = SandboxPhase::Create;
         sandbox = Some(
             docker
                 .create_sandbox(request.deployment.clone())
                 .map_err(SandboxCause::Create)?,
         );
+        phase = SandboxPhase::Record;
+        record(
+            observer,
+            SandboxMilestone::Created,
+            sandbox.as_ref(),
+            None,
+            None,
+        )?;
         let owner = sandbox.as_mut().expect("acknowledged container");
         phase = SandboxPhase::Upload;
         owner
             .upload(&mut file, &config)
             .map_err(SandboxCause::Upload)?;
+        phase = SandboxPhase::Record;
+        record(
+            observer,
+            SandboxMilestone::Uploaded,
+            Some(owner),
+            None,
+            None,
+        )?;
+        record(
+            observer,
+            SandboxMilestone::BeforeStart,
+            Some(owner),
+            None,
+            None,
+        )?;
         phase = SandboxPhase::Start;
         owner.start().map_err(SandboxCause::Runtime)?;
+        phase = SandboxPhase::Record;
+        record(observer, SandboxMilestone::Started, Some(owner), None, None)?;
         phase = SandboxPhase::Listener;
         owner
             .wait_listener(request.startup_wait)
@@ -409,6 +566,14 @@ pub(crate) fn create(
         if status.phase != expected {
             return Err(SandboxCause::Setup(ControlError("original startup phase")));
         }
+        phase = SandboxPhase::Record;
+        record(
+            observer,
+            SandboxMilestone::Authenticated,
+            Some(owner),
+            Some(&status),
+            None,
+        )?;
         Ok(status)
     })();
     match result {

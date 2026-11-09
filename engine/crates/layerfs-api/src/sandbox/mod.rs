@@ -12,7 +12,10 @@ mod unmount;
 pub mod values;
 pub use commit::CommitReply;
 #[cfg(unix)]
-pub use create::{connect_address, SandboxCause, SandboxCreate, SandboxFailure, SandboxPhase};
+pub use create::{
+    connect_address, SandboxCause, SandboxCreate, SandboxFailure, SandboxMilestone,
+    SandboxObservation, SandboxPhase,
+};
 #[cfg(unix)]
 pub use create::{ManagedSandbox, SandboxApi};
 pub use mount::BoundWorkspace;

@@ -4,6 +4,7 @@
 #[path = "../../layerfs-sandbox/tests/support/engine.rs"]
 mod engine;
 use engine::{fixed, frame, Peer};
+use layerfs_api::sandbox::SandboxMilestone;
 use layerfs_api::{
     ManagedSandbox, SandboxApi, SandboxCause, SandboxCreate, SandboxPhase, WorkspaceApi,
 };
@@ -535,4 +536,182 @@ fn created_workspace_must_use_the_actual_docker_volume_root() {
     assert_eq!(failure.phase, SandboxPhase::Validate);
     assert!(matches!(failure.cause, SandboxCause::Setup(_)));
     assert!(peer.finish().is_empty());
+}
+
+#[test]
+fn lifecycle_observer_failure_before_start_keeps_original_container() {
+    let project = ProjectFixture::new();
+    let binary = project.directory.join("daemon");
+    fs::write(&binary, b"daemon executable").unwrap();
+    let (docker, peer) = Peer::new(vec![
+        fixed(200, b"{\"Name\":\"lfs-test-borrowed\",\"Driver\":\"local\",\"Scope\":\"local\",\"Options\":null}"),
+        fixed(201, format!("{{\"Id\":\"{CID}\",\"Warnings\":[]}}").as_bytes()),
+        fixed(200, b""),
+    ], 4096);
+    let request = SandboxCreate {
+        deployment: layerfs_sandbox::backend::docker::SandboxRequest {
+            image: IMAGE.into(),
+            store_volume: "lfs-test-borrowed".into(),
+            port: 30421,
+            labels: vec![],
+        },
+        setup: setup([32; 32], duplex::public_key(&[31; 32]).unwrap()),
+        executable: binary,
+        controller_private: [31; 32],
+        daemon_peer: duplex::public_key(&[32; 32]).unwrap(),
+        startup_wait: Duration::from_secs(2),
+        connect_host: None,
+    };
+    let mut seen = Vec::new();
+    let result = SandboxApi::new(docker).create_file_observed(
+        request,
+        &project.project.store,
+        &project.project.manifest,
+        |observation| {
+            seen.push(observation.milestone);
+            if observation.milestone == SandboxMilestone::BeforeCreate {
+                assert!(observation.runtime.is_none());
+            } else {
+                assert_eq!(observation.runtime.unwrap().identity().to_string(), CID);
+            }
+            if observation.milestone == SandboxMilestone::BeforeStart {
+                return Err(std::io::Error::other("injected journal failure"));
+            }
+            Ok(())
+        },
+    );
+    let Err(failure) = result else {
+        panic!("failed journal must stop startup")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Record);
+    assert!(
+        matches!(failure.cause, SandboxCause::Observer { milestone: SandboxMilestone::BeforeStart, ref cause } if cause.to_string() == "injected journal failure")
+    );
+    assert_eq!(
+        failure.sandbox.as_ref().unwrap().identity().to_string(),
+        CID
+    );
+    assert!(failure.control.is_none() && failure.observed.is_none());
+    assert_eq!(
+        seen,
+        [
+            SandboxMilestone::BeforeCreate,
+            SandboxMilestone::Created,
+            SandboxMilestone::Uploaded,
+            SandboxMilestone::BeforeStart
+        ]
+    );
+    let calls = peer.finish();
+    assert_eq!(calls.len(), 3);
+    assert!(!calls
+        .iter()
+        .any(|call| call.starts_with(format!("POST /v1.54/containers/{CID}/start").as_bytes())));
+}
+
+#[test]
+fn lifecycle_observer_failure_after_hello_keeps_control_and_original_status() {
+    let project = ProjectFixture::new();
+    let binary = project.directory.join("daemon-ready");
+    fs::write(&binary, b"daemon executable").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let daemon = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut channel =
+            duplex::accept(socket, &[32; 32], duplex::public_key(&[31; 32]).unwrap()).unwrap();
+        let call = Call::decode(channel.receive.receive().unwrap()).unwrap();
+        assert!(matches!(call.request, Request::Hello(_)));
+        channel
+            .send
+            .send(
+                &Answer {
+                    id: call.id,
+                    reply: Reply::Hello(DaemonStatus {
+                        instance: [9; 32],
+                        phase: DaemonPhase::ControlReady,
+                        overlay_sqlite: Some("3.51.0".into()),
+                        store_sqlite: Some("3.51.0".into()),
+                    }),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let marker = frame(1, b"LAYERFS_DAEMON_LISTEN 0.0.0.0:30421\n");
+    let mut logs = format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nContent-Length: {}\r\n\r\n", marker.len()).into_bytes();
+    logs.extend(marker);
+    let (docker, peer) = Peer::new(vec![
+        fixed(200, b"{\"Name\":\"lfs-test-borrowed\",\"Driver\":\"local\",\"Scope\":\"local\",\"Options\":null}"),
+        fixed(201, format!("{{\"Id\":\"{CID}\",\"Warnings\":[]}}").as_bytes()),
+        fixed(200, b""), fixed(204, b""), logs, endpoint(port),
+    ], 4096);
+    let mut deployment_setup = setup([32; 32], duplex::public_key(&[31; 32]).unwrap());
+    let mut manifest = project.project.manifest.clone();
+    manifest.daemon_sqlite = Some("3.51.0".into());
+    deployment_setup.existing_store = Some(manifest);
+    let request = SandboxCreate {
+        deployment: layerfs_sandbox::backend::docker::SandboxRequest {
+            image: IMAGE.into(),
+            store_volume: "lfs-test-borrowed".into(),
+            port: 30421,
+            labels: vec![],
+        },
+        setup: deployment_setup,
+        executable: binary,
+        controller_private: [31; 32],
+        daemon_peer: duplex::public_key(&[32; 32]).unwrap(),
+        startup_wait: Duration::from_secs(2),
+        connect_host: None,
+    };
+    let mut seen = Vec::new();
+    let result = SandboxApi::new(docker).create_file_observed(
+        request,
+        &project.project.store,
+        &project.project.manifest,
+        |observation| {
+            seen.push(observation.milestone);
+            if observation.milestone == SandboxMilestone::Authenticated {
+                assert_eq!(observation.status.unwrap().instance, [9; 32]);
+                return Err(std::io::Error::other("injected ready receipt failure"));
+            }
+            Ok(())
+        },
+    );
+    let Err(failure) = result else {
+        panic!("failed ready receipt must retain ownership")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Record);
+    assert!(matches!(
+        failure.cause,
+        SandboxCause::Observer {
+            milestone: SandboxMilestone::Authenticated,
+            ..
+        }
+    ));
+    assert_eq!(
+        failure.sandbox.as_ref().unwrap().identity().to_string(),
+        CID
+    );
+    assert_eq!(failure.observed.as_ref().unwrap().instance, [9; 32]);
+    assert!(failure.control.is_some());
+    assert_eq!(
+        seen,
+        [
+            SandboxMilestone::BeforeCreate,
+            SandboxMilestone::Created,
+            SandboxMilestone::Uploaded,
+            SandboxMilestone::BeforeStart,
+            SandboxMilestone::Started,
+            SandboxMilestone::Authenticated
+        ]
+    );
+    assert_eq!(peer.finish().len(), 6);
+    daemon.join().unwrap();
 }

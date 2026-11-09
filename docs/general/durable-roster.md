@@ -82,6 +82,15 @@ refuses until durable catalog ownership can be resolved. Legacy records with
 no durable identity keep their prior disposable behavior. The SDK does not
 yet create such records on its normal Sandbox creation path.
 
+`SandboxApi::create_file_observed` also exposes one ordered creation attempt:
+the caller can record intent before Docker Create and Start, then record the
+acknowledged container, upload, Start, authenticated Hello and optional Store
+installation. An observer failure stops before the next side effect and
+returns the exact container, control owner, status and installation receipt
+already obtained. This callback does not itself persist a journal or resolve
+unknown Docker outcomes; its caller must do so. The Node binding has not yet
+connected these milestones to durable Sandbox creation.
+
 Automatic directory creation uses the fixed `layerfs-durable/<Sandbox-id>`
 layout. It creates the identity directory exclusively under retained parent
 descriptors and synchronizes the volume, parent and private children before
