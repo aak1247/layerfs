@@ -26,6 +26,18 @@ APIs do not persist a roster, authenticate the caller, fence old FUSE mounts,
 reconcile Commit outcomes or recover an SDK control token. They do not yet
 replace the disposable owner used for a mounted Workspace.
 
+`Store::bind_durable` can attach such an owner to the exact Branch snapshot
+supplied by a trusted recovery record. It checks the Workspace identity, the
+original Layer and Commit roots against the Store, and the overlay's recorded
+base against that snapshot. It rejects a second logical binding of the same
+owner. A Branch that has advanced does not replace the original view: a later
+explicit Commit uses the existing merge path. The caller must keep the owner
+private during binding and independently authenticate and persist the full
+snapshot; these APIs do not write or restore that record. A Commit whose overlay
+base and recorded snapshot have not both been reconciled must not be recovered
+as if its outcome were known. Old inode reservation windows are not reused;
+future allocations require the same durable Store authority and scope.
+
 The durable profile is SQLite DELETE/FULL/EXCLUSIVE. Each changed Workspace
 generation, base root, revision, dirty count and volatile-custody flag is
 written in the **same SQLite transaction** as the associated filesystem rows.
@@ -53,7 +65,10 @@ The scoped tests cover same- and cross-process ownership, identity mismatch,
 process termination after acknowledged writes, further writes after reopening,
 and preservation of unresolved states. Service-owner tests also cover stale
 internal routes, base-root mismatch, process loss after a service write and a
-panicked service call retaining its original connection. A test-only sync fault against the
+panicked service call retaining its original connection. A Store binding test
+uses a separately retained snapshot and a live Store to check a moved Branch,
+identity/root refusals and an explicit merge; it is not a mount or crash proof.
+A test-only sync fault against the
 rollback journal verifies that the engine reports an uncertain result and
 quarantines the connection, and that a fresh process sees the prior complete
 transaction. The VM harness can exercise the overlay with `--probe-kind

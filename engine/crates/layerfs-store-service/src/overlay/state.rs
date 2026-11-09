@@ -2,7 +2,7 @@
 use super::{backing::Backing, owner::OwnerError};
 use crate::{JobWork, OwnerWork, ServiceClass};
 use layerfs_overlay::{Overlay, OverlayError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 pub struct State {
@@ -21,14 +21,24 @@ pub struct State {
 }
 pub struct Shared {
     pub namespace: i64,
+    pub durable_identity: Option<[u8; 32]>,
+    pub durable_binding_claimed: AtomicBool,
     pub route: OnceLock<layerfs_workspace::Route>,
     pub state: Mutex<State>,
     pub changed: Condvar,
 }
 impl Shared {
     pub fn new(namespace: i64) -> Self {
+        Self::with_identity(namespace, None)
+    }
+    pub fn durable(namespace: i64, identity: [u8; 32]) -> Self {
+        Self::with_identity(namespace, Some(identity))
+    }
+    fn with_identity(namespace: i64, durable_identity: Option<[u8; 32]>) -> Self {
         Self {
             namespace,
+            durable_identity,
+            durable_binding_claimed: AtomicBool::new(false),
             route: OnceLock::new(),
             state: Mutex::new(State {
                 db: None,

@@ -30,7 +30,7 @@ impl Owner {
             .map_err(OwnerError::Overlay)?;
         db.open_workspace(spec.expected_base_root)
             .map_err(OwnerError::Overlay)?;
-        bind(db, spec.namespace, incarnation)
+        bind(db, spec.namespace, spec.identity, incarnation)
     }
 
     /// Reopens an existing durable Workspace with a fresh route incarnation.
@@ -46,7 +46,7 @@ impl Owner {
                 "durable Workspace base root",
             )));
         }
-        bind(db, spec.namespace, incarnation)
+        bind(db, spec.namespace, spec.identity, incarnation)
     }
 }
 
@@ -65,10 +65,35 @@ fn admission(spec: &DurableWorkspace<'_>) -> Result<[u8; 32], OwnerError> {
     Ok(incarnation)
 }
 
-fn bind(db: Overlay, namespace: i64, incarnation: [u8; 32]) -> Result<Owner, OwnerError> {
+impl OwnerClient {
+    /// Only owners created or recovered through the durable boundary have one.
+    pub(crate) fn durable_identity(&self) -> Result<Option<[u8; 32]>, OwnerError> {
+        Ok(self.connection()?.durable_identity)
+    }
+    /// A single logical binding owns this engine's base and Commit state.
+    pub(crate) fn claim_durable_binding(&self) -> Result<(), OwnerError> {
+        use std::sync::atomic::Ordering;
+        let shared = self.connection()?;
+        if shared.durable_identity.is_none() {
+            return Err(OwnerError::InvalidAdmission);
+        }
+        shared
+            .durable_binding_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| OwnerError::InvalidAdmission)
+    }
+}
+
+fn bind(
+    db: Overlay,
+    namespace: i64,
+    identity: [u8; 32],
+    incarnation: [u8; 32],
+) -> Result<Owner, OwnerError> {
     let route = Route::new(namespace, db.engine(), incarnation).map_err(OwnerError::Overlay)?;
     let profile = db.profile().clone();
-    let shared = Arc::new(Shared::new(namespace));
+    let shared = Arc::new(Shared::durable(namespace, identity));
     // This fresh Shared has no published readers or disposable Backing fd.
     shared.route.set(route).map_err(|_| OwnerError::Stopped)?;
     shared.state.lock().map_err(|_| OwnerError::Stopped)?.db = Some(Box::new(db));
