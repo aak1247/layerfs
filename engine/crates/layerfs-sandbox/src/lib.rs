@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 #[cfg(unix)]
 pub mod backend;
+#[cfg(target_os = "linux")]
+pub mod host_export;
 mod types;
 pub use types::{
     CommandIdentity, ContainerId, ErrorDiagnostic, ExecId, ExecInspection, PendingRequest,
