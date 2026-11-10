@@ -29,6 +29,7 @@ fn failure(
 ) -> Box<SandboxFailure> {
     Box::new(SandboxFailure {
         request: sandbox.request,
+        recovery: sandbox.recovery,
         phase,
         sandbox: Some(sandbox.runtime),
         control: Some(sandbox.control),

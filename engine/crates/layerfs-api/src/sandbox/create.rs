@@ -2,6 +2,7 @@
 use crate::{internal::Control, OperationFailure};
 use layerfs_bridge::{
     control::{ControlError, DaemonPhase, DaemonStatus, HelloRequest, Reply, Request},
+    daemon_recovery_setup::{RecoveryDaemonSetup, RecoveryWorkspaceSetup},
     daemon_setup::DaemonSetup,
     duplex::{initiate_observed, public_key, ChannelError, ChannelWork},
 };
@@ -129,6 +130,8 @@ pub enum SandboxCause {
 pub struct SandboxFailure {
     /// Original inputs with secrets retained privately.
     pub request: SandboxCreate,
+    /// Original recovery authority, if this operation started from recovery.
+    pub recovery: Option<RecoveryWorkspaceSetup>,
     /// Original reached boundary.
     pub phase: SandboxPhase,
     /// Exact acknowledged owned container; no automatically adopted partial ID.
@@ -148,6 +151,7 @@ impl fmt::Debug for SandboxFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SandboxFailure")
             .field("request", &self.request)
+            .field("recovery", &self.recovery)
             .field("phase", &self.phase)
             .field("sandbox", &self.sandbox)
             .field("has_control", &self.control.is_some())
@@ -177,6 +181,7 @@ pub struct ManagedSandbox {
     /// Original acknowledged installation, when this create installed the Project.
     pub installed: Option<crate::Installed>,
     pub(crate) request: SandboxCreate,
+    pub(crate) recovery: Option<RecoveryWorkspaceSetup>,
     /// Original correlated startup status; this is not kernel Workspace Ready.
     pub startup: DaemonStatus,
     /// Actual original duplex handshake work.
@@ -236,6 +241,24 @@ impl SandboxApi {
     pub fn new(docker: Docker) -> Self {
         Self { docker }
     }
+    /// Starts one independently fenced durable recovery and authenticates it.
+    ///
+    /// Before calling, the controller must durably record the complete request,
+    /// recovery authority and prior-owner, mount and consumer fencing evidence.
+    /// It must persist every observation before returning from the observer.
+    /// Starting the daemon may change durable Workspace state before the first
+    /// authenticated reply; an uncertain Start or observer result must never be
+    /// replayed or inferred from a later observation. This operation does not
+    /// attach Workspaces or prove the physical Store has not been copied or
+    /// rolled back.
+    pub fn recover_observed(
+        &self,
+        request: SandboxCreate,
+        recovery: RecoveryWorkspaceSetup,
+        mut observer: impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
+    ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
+        create_observed(&self.docker, request, Some(recovery), &mut observer)
+    }
     /// Creates, privately configures, starts and authenticates once, preserving partial ownership on failure.
     pub fn create(
         &self,
@@ -270,6 +293,7 @@ impl SandboxApi {
             if *selected != expected {
                 return Err(Box::new(SandboxFailure {
                     request,
+                    recovery: None,
                     phase: SandboxPhase::Validate,
                     sandbox: None,
                     control: None,
@@ -280,7 +304,7 @@ impl SandboxApi {
                 }));
             }
         }
-        let mut owner = create_observed(&self.docker, request, &mut observer)?;
+        let mut owner = create_observed(&self.docker, request, None, &mut observer)?;
         if existing {
             // The original startup already selected and waited for this Store.
             // Installing again would change the existing one-attempt lifecycle.
@@ -295,6 +319,7 @@ impl SandboxApi {
         ) {
             return Err(Box::new(SandboxFailure {
                 request: owner.request,
+                recovery: owner.recovery,
                 phase: SandboxPhase::Record,
                 sandbox: Some(owner.runtime),
                 control: Some(owner.control),
@@ -310,6 +335,7 @@ impl SandboxApi {
             .map_err(|cause| {
                 Box::new(SandboxFailure {
                     request: owner.request.clone(),
+                    recovery: owner.recovery.clone(),
                     phase: SandboxPhase::Install,
                     sandbox: None,
                     control: None,
@@ -337,6 +363,7 @@ impl SandboxApi {
         ) {
             return Err(Box::new(SandboxFailure {
                 request: owner.request,
+                recovery: owner.recovery,
                 phase: SandboxPhase::Record,
                 sandbox: Some(owner.runtime),
                 control: Some(owner.control),
@@ -364,6 +391,7 @@ impl SandboxApi {
                 ) {
                     return Err(Box::new(SandboxFailure {
                         request: owner.request,
+                        recovery: owner.recovery,
                         phase: SandboxPhase::Record,
                         sandbox: Some(owner.runtime),
                         control: Some(owner.control),
@@ -377,6 +405,7 @@ impl SandboxApi {
             }
             Ok(status) => Err(Box::new(SandboxFailure {
                 request: owner.request,
+                recovery: owner.recovery,
                 phase: SandboxPhase::Hello,
                 sandbox: Some(owner.runtime),
                 control: Some(owner.control),
@@ -387,6 +416,7 @@ impl SandboxApi {
             })),
             Err(cause) => Err(Box::new(SandboxFailure {
                 request: owner.request,
+                recovery: owner.recovery,
                 phase: SandboxPhase::Hello,
                 sandbox: Some(owner.runtime),
                 control: Some(owner.control),
@@ -399,6 +429,10 @@ impl SandboxApi {
     }
 }
 impl ManagedSandbox {
+    /// The exact authority supplied to this recovered Sandbox, if any.
+    pub fn recovery(&self) -> Option<&RecoveryWorkspaceSetup> {
+        self.recovery.as_ref()
+    }
     /// Explicit startup observation/wait on the same incarnation and Control owner.
     /// A later observation never resolves an earlier unknown operation.
     pub(crate) fn status(
@@ -428,11 +462,12 @@ pub(crate) fn create(
     docker: &Docker,
     request: SandboxCreate,
 ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
-    create_observed(docker, request, &mut |_| Ok(()))
+    create_observed(docker, request, None, &mut |_| Ok(()))
 }
 fn create_observed(
     docker: &Docker,
     request: SandboxCreate,
+    recovery: Option<RecoveryWorkspaceSetup>,
     observer: &mut impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
 ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
     let mut phase = SandboxPhase::Validate;
@@ -441,7 +476,15 @@ fn create_observed(
     let mut handshake = ChannelWork::default();
     let mut observed = None;
     let result = (|| {
-        let config = request.setup.encode().map_err(SandboxCause::Setup)?;
+        let config = match &recovery {
+            Some(workspace) => RecoveryDaemonSetup {
+                daemon: request.setup.clone(),
+                workspace: workspace.clone(),
+            }
+            .encode()
+            .map_err(SandboxCause::Setup)?,
+            None => request.setup.encode().map_err(SandboxCause::Setup)?,
+        };
         #[cfg(target_os = "linux")]
         let export_matches = match (&request.deployment.host_export, &request.setup.host_export) {
             (None, None) => true,
@@ -472,6 +515,17 @@ fn create_observed(
                 if directory == volume || !directory.starts_with(volume) {
                     return Err(SandboxCause::Setup(ControlError(
                         "durable Workspace must be on the Store volume",
+                    )));
+                }
+            }
+        }
+        if let Some(recovery) = &recovery {
+            let volume = std::path::Path::new("/layerfs-store");
+            for directory in [&recovery.catalog_directory, &recovery.overlay_directory] {
+                let directory = std::path::Path::new(directory);
+                if directory == volume || !directory.starts_with(volume) {
+                    return Err(SandboxCause::Setup(ControlError(
+                        "durable Workspace recovery must use the Store volume",
                     )));
                 }
             }
@@ -599,6 +653,7 @@ fn create_observed(
     match result {
         Ok(startup) => Ok(ManagedSandbox {
             request: request.clone(),
+            recovery,
             installed: None,
             runtime: sandbox.take().expect("owned"),
             control: control.take().expect("authenticated"),
@@ -611,6 +666,7 @@ fn create_observed(
         }),
         Err(cause) => Err(Box::new(SandboxFailure {
             request,
+            recovery,
             phase,
             sandbox,
             control,

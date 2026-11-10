@@ -10,6 +10,7 @@ use layerfs_api::{
 };
 use layerfs_bridge::{
     control::{Answer, Call, DaemonPhase, DaemonStatus, Reply, Request},
+    daemon_recovery_setup::{RecoveryDaemonSetup, RecoveryWorkspaceSetup},
     daemon_setup::{DaemonLimits, DaemonSetup, FreshWorkspaceSetup},
     duplex,
 };
@@ -660,6 +661,202 @@ fn created_workspace_must_use_the_actual_docker_volume_root() {
     assert_eq!(failure.phase, SandboxPhase::Validate);
     assert!(matches!(failure.cause, SandboxCause::Setup(_)));
     assert!(peer.finish().is_empty());
+}
+
+fn recovery_inputs(project: &ProjectFixture) -> (SandboxCreate, RecoveryWorkspaceSetup) {
+    let mut deployment_setup = setup([32; 32], duplex::public_key(&[31; 32]).unwrap());
+    let mut manifest = project.project.manifest.clone();
+    manifest.profile = layerfs_bridge::provision::StoreProfile::Durable;
+    manifest.daemon_sqlite = Some("3.51.0".into());
+    deployment_setup.existing_store = Some(manifest);
+    let request = SandboxCreate {
+        deployment: layerfs_sandbox::backend::docker::SandboxRequest {
+            image: IMAGE.into(),
+            store_volume: "lfs-test-borrowed".into(),
+            port: 30421,
+            #[cfg(target_os = "linux")]
+            host_export: None,
+            labels: vec![],
+        },
+        setup: deployment_setup,
+        executable: project.project.store.path.clone(),
+        controller_private: [31; 32],
+        daemon_peer: duplex::public_key(&[32; 32]).unwrap(),
+        startup_wait: Duration::from_secs(2),
+        connect_host: None,
+    };
+    let recovery = RecoveryWorkspaceSetup {
+        sandbox: [9; 32],
+        catalog_directory: "/layerfs-store/sandboxes/one/catalog".into(),
+        overlay_directory: "/layerfs-store/sandboxes/one/overlays".into(),
+        minimum_namespace: 4,
+        boot_id: "12345678-1234-1234-1234-123456789abc".into(),
+        store_device: 42,
+        store_inode: 123,
+    };
+    (request, recovery)
+}
+
+#[test]
+fn recovery_refuses_invalid_or_volatile_authority_before_any_engine_effect() {
+    let project = ProjectFixture::new();
+    for invalid in 0..5 {
+        let (docker, peer) = Peer::new(vec![], 4096);
+        let (mut request, mut recovery) = recovery_inputs(&project);
+        match invalid {
+            0 => request.setup.existing_store = None,
+            1 => {
+                request.setup.existing_store.as_mut().unwrap().profile =
+                    layerfs_bridge::provision::StoreProfile::Disposable;
+            }
+            2 => recovery.overlay_directory = "/layerfs-local/volatile".into(),
+            3 => recovery.catalog_directory = "/layerfs-store/../outside".into(),
+            4 => recovery.minimum_namespace = 0,
+            _ => unreachable!(),
+        }
+        let expected = recovery.clone();
+        let result = SandboxApi::new(docker).recover_observed(request, recovery, |_| {
+            panic!("validation must precede the observer")
+        });
+        let Err(failure) = result else {
+            panic!("invalid recovery must fail")
+        };
+        assert_eq!(failure.phase, SandboxPhase::Validate);
+        assert_eq!(failure.recovery, Some(expected));
+        assert!(matches!(failure.cause, SandboxCause::Setup(_)));
+        assert!(failure.sandbox.is_none() && failure.control.is_none());
+        assert!(peer.finish().is_empty());
+    }
+}
+
+#[test]
+fn recovery_observer_before_start_retains_authority_and_uploads_recovery_record() {
+    let project = ProjectFixture::new();
+    let (docker, peer) = Peer::new(vec![
+        fixed(200, b"{\"Name\":\"lfs-test-borrowed\",\"Driver\":\"local\",\"Scope\":\"local\",\"Options\":null}"),
+        fixed(201, format!("{{\"Id\":\"{CID}\",\"Warnings\":[]}}").as_bytes()),
+        fixed(200, b""),
+    ], 4096);
+    let (request, recovery) = recovery_inputs(&project);
+    let config = RecoveryDaemonSetup {
+        daemon: request.setup.clone(),
+        workspace: recovery.clone(),
+    }
+    .encode()
+    .unwrap();
+    let mut seen = Vec::new();
+    let result = SandboxApi::new(docker).recover_observed(request, recovery.clone(), |item| {
+        seen.push(item.milestone);
+        if item.milestone == SandboxMilestone::BeforeStart {
+            return Err(std::io::Error::other("journal unavailable"));
+        }
+        Ok(())
+    });
+    let Err(failure) = result else {
+        panic!("failed journal must stop startup")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Record);
+    assert_eq!(failure.recovery, Some(recovery));
+    assert!(matches!(
+        failure.cause,
+        SandboxCause::Observer {
+            milestone: SandboxMilestone::BeforeStart,
+            ..
+        }
+    ));
+    assert_eq!(
+        failure.sandbox.as_ref().unwrap().identity().to_string(),
+        CID
+    );
+    assert!(failure.control.is_none());
+    assert_eq!(
+        seen,
+        [
+            SandboxMilestone::BeforeCreate,
+            SandboxMilestone::Created,
+            SandboxMilestone::Uploaded,
+            SandboxMilestone::BeforeStart,
+        ]
+    );
+    let calls = peer.finish();
+    assert_eq!(calls.len(), 3);
+    assert!(calls[2].windows(config.len()).any(|bytes| bytes == config));
+    assert!(!calls
+        .iter()
+        .any(|call| call.starts_with(format!("POST /v1.54/containers/{CID}/start").as_bytes())));
+}
+
+#[test]
+fn recovered_owner_and_failed_close_preserve_original_recovery_authority() {
+    let project = ProjectFixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let daemon = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut channel =
+            duplex::accept(socket, &[32; 32], duplex::public_key(&[31; 32]).unwrap()).unwrap();
+        let call = Call::decode(channel.receive.receive().unwrap()).unwrap();
+        assert!(matches!(call.request, Request::Hello(request) if request.wait_for_store));
+        channel
+            .send
+            .send(
+                &Answer {
+                    id: call.id,
+                    reply: Reply::Hello(DaemonStatus {
+                        instance: [9; 32],
+                        phase: DaemonPhase::ControlReady,
+                        overlay_sqlite: Some("3.51.0".into()),
+                        store_sqlite: Some("3.51.0".into()),
+                    }),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let marker = frame(1, b"LAYERFS_DAEMON_LISTEN 0.0.0.0:30421\n");
+    let mut logs = format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nContent-Length: {}\r\n\r\n", marker.len()).into_bytes();
+    logs.extend(marker);
+    let (docker, peer) = Peer::new(vec![
+        fixed(200, b"{\"Name\":\"lfs-test-borrowed\",\"Driver\":\"local\",\"Scope\":\"local\",\"Options\":null}"),
+        fixed(201, format!("{{\"Id\":\"{CID}\",\"Warnings\":[]}}").as_bytes()),
+        fixed(200, b""), fixed(204, b""), logs, endpoint(port),
+        fixed(409, b"original stop refusal"),
+    ], 4096);
+    let (request, recovery) = recovery_inputs(&project);
+    let api = SandboxApi::new(docker);
+    let mut seen = Vec::new();
+    let owner = api
+        .recover_observed(request, recovery.clone(), |item| {
+            seen.push(item.milestone);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(owner.recovery(), Some(&recovery));
+    assert!(owner.installed.is_none());
+    assert_eq!(
+        seen,
+        [
+            SandboxMilestone::BeforeCreate,
+            SandboxMilestone::Created,
+            SandboxMilestone::Uploaded,
+            SandboxMilestone::BeforeStart,
+            SandboxMilestone::Started,
+            SandboxMilestone::Authenticated
+        ]
+    );
+    let failure = api.close(owner).unwrap_err();
+    assert_eq!(failure.phase, SandboxPhase::Stop);
+    assert_eq!(failure.recovery, Some(recovery));
+    assert!(failure.sandbox.is_some() && failure.control.is_some());
+    assert_eq!(peer.finish().len(), 7);
+    daemon.join().unwrap();
 }
 
 #[test]
