@@ -30,7 +30,7 @@ impl WorkspaceApi<'_> {
     ) -> Result<ReadyMount, Box<OperationFailure>> {
         let request = Request::Attach(token);
         match self.exchange(request.clone())? {
-            Reply::Ready(ready) => Ok(*ready),
+            Reply::Ready(ready) if ready.token == token => Ok(*ready),
             reply => Err(OperationFailure::unexpected(request, reply)),
         }
     }
@@ -42,7 +42,7 @@ impl WorkspaceApi<'_> {
     ) -> Result<WorkspaceStatus, Box<OperationFailure>> {
         let request = Request::Locate(workspace);
         match self.exchange(request.clone())? {
-            Reply::Located(status) => Ok(*status),
+            Reply::Located(status) if status.token.workspace == workspace => Ok(*status),
             reply => Err(OperationFailure::unexpected(request, reply)),
         }
     }

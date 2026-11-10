@@ -65,6 +65,64 @@ impl fmt::Display for ObservedMountFailure {
 impl std::error::Error for ObservedMountFailure {}
 
 impl WorkspaceApi<'_> {
+    /// Attaches one previously recovered binding once, without rebinding it.
+    /// The caller must authenticate the binding, durably record its recovery
+    /// intent and establish that no prior Attach remains unresolved. In
+    /// particular, a later status observation does not settle an unknown Attach.
+    /// The observer must persist each original boundary before returning; on
+    /// failure, the original binding and any Ready receipt are retained.
+    pub fn attach_bound_observed(
+        &mut self,
+        bound: BoundWorkspace,
+        mut observer: impl FnMut(MountObservation<'_>) -> io::Result<()>,
+    ) -> Result<MountedWorkspace, Box<ObservedMountFailure>> {
+        let workspace = bound.token.workspace;
+        let branch = bound.binding.branch.id;
+        if let Err(cause) = observer(MountObservation {
+            milestone: MountMilestone::BeforeAttach,
+            workspace,
+            branch,
+            bound: Some(&bound),
+            ready: None,
+        }) {
+            return Err(Box::new(ObservedMountFailure {
+                milestone: MountMilestone::BeforeAttach,
+                workspace,
+                branch,
+                bound: Some(bound),
+                ready: None,
+                cause: MountCause::Observer(cause),
+            }));
+        }
+        let ready = self.attach(bound.token).map_err(|cause| {
+            Box::new(ObservedMountFailure {
+                milestone: MountMilestone::BeforeAttach,
+                workspace,
+                branch,
+                bound: Some(bound.clone()),
+                ready: None,
+                cause: MountCause::Operation(cause),
+            })
+        })?;
+        if let Err(cause) = observer(MountObservation {
+            milestone: MountMilestone::Attached,
+            workspace,
+            branch,
+            bound: Some(&bound),
+            ready: Some(&ready),
+        }) {
+            return Err(Box::new(ObservedMountFailure {
+                milestone: MountMilestone::Attached,
+                workspace,
+                branch,
+                bound: Some(bound),
+                ready: Some(ready),
+                cause: MountCause::Observer(cause),
+            }));
+        }
+        Ok(MountedWorkspace { bound, ready })
+    }
+
     /// Mounts once while a caller records each boundary before the next effect.
     /// Observer failures keep all acknowledgements and never send the next request.
     pub fn mount_observed(
