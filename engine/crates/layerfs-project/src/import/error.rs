@@ -23,6 +23,8 @@ pub enum ProjectError {
     /// The acquisition backing's files are the source or lie inside it;
     /// nothing was begun.
     BackingInsideSource,
+    /// The source and an explicitly substituted Git directory overlap.
+    SourceDirectoriesOverlap,
     /// A named construction/allocation bound was exceeded.
     Capacity,
     /// The host-provided operation deadline expired.

@@ -11,7 +11,12 @@ use layerfs_persistence::{
 use layerfs_project::{InitCounters, InitStep, Initialized, ProjectError};
 use layerfs_storage::{port::PersistenceError, Storage, StorageError, StoragePolicy};
 use layerfs_telemetry::timer::{Active, TimingScope};
-use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 /// One host Project Init. The Store is created once with acquisition tables.
 #[derive(Debug)]
@@ -63,6 +68,20 @@ pub struct InitFailure {
     /// Original acknowledged fork, if it completed before seal failed.
     pub branch: Option<BranchSnapshot>,
 }
+/// One Git-substituted Init failure, retaining both original inputs.
+#[derive(Debug)]
+pub struct GitInitFailure {
+    /// The original Init failure, request and known outcomes.
+    pub original: Box<InitFailure>,
+    /// The separately authorized Git metadata directory used in the attempt.
+    pub git_directory: PathBuf,
+}
+impl fmt::Display for GitInitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Project Git Init: {}", self.original)
+    }
+}
+impl std::error::Error for GitInitFailure {}
 /// The original failing boundary of one Init-and-seal operation.
 #[derive(Debug)]
 pub enum InitError {
@@ -91,6 +110,7 @@ pub(crate) fn initialize(
     request: InitRequest,
     timer: &TimingScope<'_, Active>,
     counters: Arc<InitCounters>,
+    git_directory: Option<&Path>,
 ) -> Result<SealedProject, Box<InitFailure>> {
     let started = Instant::now();
     let mut initialized = None;
@@ -102,6 +122,9 @@ pub(crate) fn initialize(
             request.catalog.cursor_key,
         )
         .map_err(InitError::Manifest)?;
+        if let Some(git) = git_directory {
+            validate_git_inputs(&request, git).map_err(InitError::Project)?;
+        }
         let config = request
             .store
             .clone()
@@ -109,7 +132,7 @@ pub(crate) fn initialize(
         let handles = Handles::create(config, request.policy, &request.catalog)
             .map_err(InitError::Persistence)?;
         let storage = Storage::new(handles.storage.clone()).map_err(InitError::Storage)?;
-        let imported = layerfs_project::init_observed(
+        let imported = layerfs_project::init::init_observed_using(
             &storage,
             &handles.history,
             layerfs_project::InitRequest {
@@ -122,6 +145,7 @@ pub(crate) fn initialize(
             },
             timer,
             Arc::clone(&counters),
+            git_directory,
         )
         .map_err(InitError::Project)?;
         counters.step(InitStep::Seal);
@@ -194,6 +218,39 @@ pub(crate) fn initialize(
     }
 }
 
+#[cfg(unix)]
+fn validate_git_inputs(request: &InitRequest, git: &Path) -> Result<(), ProjectError> {
+    let source = layerfs_project::scan::check_root(&request.source)?;
+    let original = std::fs::symlink_metadata(request.source.join(".git"))?;
+    if !original.is_file() && !original.is_dir() {
+        return Err(ProjectError::refused(
+            layerfs_project::SourceRefusal::Changed,
+            request.source.join(".git"),
+        ));
+    }
+    let replacement = layerfs_project::scan::check_root(git)?;
+    layerfs_project::import::source::disjoint_directories(
+        &source,
+        &request.source,
+        &replacement,
+        git,
+    )?;
+    let parent = request
+        .store
+        .path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    layerfs_project::import::source::outside_source(&source, parent)?;
+    layerfs_project::import::source::outside_source(&replacement, parent)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_git_inputs(_request: &InitRequest, _git: &Path) -> Result<(), ProjectError> {
+    Err(ProjectError::Unsupported)
+}
+
 /// Host Project Init/seal/install and authenticated fork/history organization.
 /// The facade retains no Store handle. Each method delegates one operation.
 #[derive(Clone, Copy, Debug, Default)]
@@ -210,7 +267,7 @@ impl ProjectApi {
         request: InitRequest,
         timer: &TimingScope<'_, Active>,
     ) -> Result<SealedProject, Box<InitFailure>> {
-        initialize(request, timer, Arc::new(InitCounters::new()))
+        initialize(request, timer, Arc::new(InitCounters::new()), None)
     }
     /// As [`ProjectApi::init`], updating `counters` while it runs so another
     /// thread can show how far it has come; the last step, Seal, covers the
@@ -221,6 +278,34 @@ impl ProjectApi {
         timer: &TimingScope<'_, Active>,
         counters: Arc<InitCounters>,
     ) -> Result<SealedProject, Box<InitFailure>> {
-        initialize(request, timer, counters)
+        initialize(request, timer, counters, None)
+    }
+
+    /// Imports the complete source tree while replacing its root `.git` entry
+    /// with one separately authorized, complete Git metadata directory.
+    ///
+    /// The caller must authorize both sources, fence their writers, ensure
+    /// they remain disjoint through all filesystem aliases, validate the Git
+    /// metadata and retain the exact failure. This performs no Git validation,
+    /// workspace recovery or permission grant. All other entries, including
+    /// ignored files, are imported by the ordinary complete-tree scanner.
+    pub fn init_with_git_directory(
+        &self,
+        request: InitRequest,
+        git_directory: PathBuf,
+        timer: &TimingScope<'_, Active>,
+    ) -> Result<SealedProject, Box<GitInitFailure>> {
+        initialize(
+            request,
+            timer,
+            Arc::new(InitCounters::new()),
+            Some(&git_directory),
+        )
+        .map_err(|original| {
+            Box::new(GitInitFailure {
+                original,
+                git_directory,
+            })
+        })
     }
 }

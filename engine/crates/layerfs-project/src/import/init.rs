@@ -96,13 +96,43 @@ pub fn init_observed(
     timer: &TimingScope<'_, Active>,
     counters: Arc<InitCounters>,
 ) -> ProjectResult<Initialized> {
+    init_observed_using(store, catalog, request, timer, counters, None)
+}
+
+/// Internal composition for a caller-supplied, separately fenced Git tree.
+#[cfg(unix)]
+pub(crate) fn init_observed_using(
+    store: &Storage,
+    catalog: &dyn HistoryCatalog,
+    request: InitRequest<'_>,
+    timer: &TimingScope<'_, Active>,
+    counters: Arc<InitCounters>,
+    git_directory: Option<&Path>,
+) -> ProjectResult<Initialized> {
     use std::os::unix::fs::MetadataExt;
     counters.step(InitStep::Scan);
     let mut progress = ImportProgress::observed(request.deadline, counters);
     progress.tick()?;
     let source = scan::check_root(request.source)?;
+    let git = if let Some(path) = git_directory {
+        let original = std::fs::symlink_metadata(request.source.join(".git"))?;
+        if !original.is_file() && !original.is_dir() {
+            return Err(ProjectError::refused(
+                crate::SourceRefusal::Changed,
+                request.source.join(".git"),
+            ));
+        }
+        let metadata = scan::check_root(path)?;
+        super::source::disjoint_directories(&source, request.source, &metadata, path)?;
+        Some(metadata)
+    } else {
+        None
+    };
     if let Some(placement) = request.acquisition.placement() {
         super::source::outside_source(&source, &placement)?;
+        if let Some(git) = &git {
+            super::source::outside_source(git, &placement)?;
+        }
     }
     let scope = scope_for_seed(request.scope_seed);
     let mut stack = [0; 16];
@@ -118,7 +148,7 @@ pub fn init_observed(
         store,
         catalog,
         &request,
-        &source,
+        (&source, git_directory),
         &backing,
         &mut progress,
         timer,
@@ -181,18 +211,26 @@ fn acquire<'a>(
     store: &'a Storage,
     catalog: &dyn HistoryCatalog,
     request: &InitRequest<'_>,
-    source: &std::fs::Metadata,
+    source: (&std::fs::Metadata, Option<&Path>),
     backing: &Backing<'_>,
     progress: &mut ImportProgress,
     timer: &TimingScope<'_, Active>,
 ) -> ProjectResult<(ObjectId, u64, u64, Save<'a>)> {
+    let (source, git_directory) = source;
     let scanned = {
         let provider = store.reader().map_err(storage)?;
         let save = store.begin_save().map_err(storage)?;
         let built = timer.child("history.import_scan").run(|_| {
             let mut sink = save.sink();
             let mut objects = FilesystemObjects::new(&provider, &mut sink);
-            scan::scan(request.source, source, backing, &mut objects, progress)
+            scan::scan(
+                request.source,
+                source,
+                git_directory,
+                backing,
+                &mut objects,
+                progress,
+            )
         });
         let scanned = match save.take_failure() {
             Some(error) => Err(storage(error)),
@@ -245,6 +283,18 @@ pub fn init_observed(
     _request: InitRequest<'_>,
     _timer: &TimingScope<'_, Active>,
     _counters: Arc<InitCounters>,
+) -> ProjectResult<Initialized> {
+    Err(ProjectError::Unsupported)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn init_observed_using(
+    _storage: &Storage,
+    _catalog: &dyn HistoryCatalog,
+    _request: InitRequest<'_>,
+    _timer: &TimingScope<'_, Active>,
+    _counters: Arc<InitCounters>,
+    _git_directory: Option<&Path>,
 ) -> ProjectResult<Initialized> {
     Err(ProjectError::Unsupported)
 }

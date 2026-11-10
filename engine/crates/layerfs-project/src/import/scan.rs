@@ -81,10 +81,12 @@ impl Roots<'_, '_> {
         parent: Option<u64>,
         position: Option<u64>,
         directory: &Path,
+        git_directory: Option<&Path>,
     ) -> Result<NewEntry, Failure> {
-        let path = || match parent {
-            Some(_) => child_path(directory, &child.name),
-            None => directory.as_os_str().as_bytes().to_vec(),
+        let path = || match (parent, git_directory) {
+            (Some(0), Some(git)) if child.name == b".git" => git.as_os_str().as_bytes().to_vec(),
+            (Some(_), _) => child_path(directory, &child.name),
+            (None, _) => directory.as_os_str().as_bytes().to_vec(),
         };
         let mode = child.portable_mode().map_err(|reason| {
             Failure::refused(reason, PathBuf::from(OsString::from_vec(path())))
@@ -154,6 +156,7 @@ impl Placement {
 pub(crate) fn scan(
     source: &Path,
     root: &Metadata,
+    git_directory: Option<&Path>,
     backing: &Backing<'_>,
     objects: &mut FilesystemObjects<'_>,
     progress: &mut ImportProgress,
@@ -172,7 +175,7 @@ pub(crate) fn scan(
         target: None,
         stamp: Stamp::of(root),
     };
-    let root = roots.entry(root, None, Some(0), source)?;
+    let root = roots.entry(root, None, Some(0), source, None)?;
     placement
         .pending
         .push(backing, root, &mut placement.bound)?;
@@ -193,10 +196,22 @@ pub(crate) fn scan(
         let parent = directory.position;
         let path = PathBuf::from(OsString::from_vec(directory.host_path));
         let (mut count, mut wide) = (0usize, false);
+        let mut replaced_git = false;
         for child in fs::read_dir(&path)? {
             progress.tick()?;
             let child = child?;
-            buffer.push(observe(&child.path(), child.file_name().as_bytes())?);
+            let name = child.file_name();
+            let host = if parent == 0 && name == OsStr::new(".git") {
+                if let Some(git) = git_directory {
+                    replaced_git = true;
+                    git.to_path_buf()
+                } else {
+                    child.path()
+                }
+            } else {
+                child.path()
+            };
+            buffer.push(observe(&host, name.as_bytes())?);
             count += 1;
             progress.counters.entry();
             if buffer.len() == WINDOW_ROWS {
@@ -204,12 +219,18 @@ pub(crate) fn scan(
                 wide = true;
                 progress.work.child_window_rows = WINDOW_ROWS;
                 for child in buffer.drain(..) {
-                    let entry = roots.entry(child, Some(parent), None, &path)?;
+                    let entry = roots.entry(child, Some(parent), None, &path, git_directory)?;
                     placement
                         .pending
                         .push(backing, entry, &mut placement.bound)?;
                 }
             }
+        }
+        if parent == 0 && git_directory.is_some() && !replaced_git {
+            return Err(Failure::refused(
+                SourceRefusal::Changed,
+                source.join(".git"),
+            ));
         }
         let work = &mut progress.work;
         work.directory_children = work.directory_children.max(count);
@@ -218,7 +239,7 @@ pub(crate) fn scan(
         if wide {
             work.wide_directories += 1;
             for child in buffer.drain(..) {
-                let entry = roots.entry(child, Some(parent), None, &path)?;
+                let entry = roots.entry(child, Some(parent), None, &path, git_directory)?;
                 placement
                     .pending
                     .push(backing, entry, &mut placement.bound)?;
@@ -229,7 +250,7 @@ pub(crate) fn scan(
             buffer.sort_unstable_by(|a, b| a.name.cmp(&b.name));
             for child in buffer.drain(..) {
                 let id = placement.assign(child.kind)?;
-                let entry = roots.entry(child, Some(parent), Some(id), &path)?;
+                let entry = roots.entry(child, Some(parent), Some(id), &path, git_directory)?;
                 placement
                     .pending
                     .push(backing, entry, &mut placement.bound)?;

@@ -37,15 +37,35 @@ pub(super) fn read_link(path: &Path, scanned: &Metadata) -> Result<Vec<u8>, Proj
 /// aliased spelling of a directory inside the source is recognised. Nothing is
 /// begun or changed: a backing inside the source would both alter the source
 /// while it is read and be acquired as part of it.
-pub(super) fn outside_source(source: &Metadata, placement: &Path) -> Result<(), ProjectError> {
+pub(crate) fn outside_source(source: &Metadata, placement: &Path) -> Result<(), ProjectError> {
+    if contains(source, placement)? {
+        return Err(ProjectError::BackingInsideSource);
+    }
+    Ok(())
+}
+
+/// Check both directions: neither input may recursively contain the other.
+pub(crate) fn disjoint_directories(
+    source: &Metadata,
+    source_path: &Path,
+    substitute: &Metadata,
+    substitute_path: &Path,
+) -> Result<(), ProjectError> {
+    if contains(source, substitute_path)? || contains(substitute, source_path)? {
+        return Err(ProjectError::SourceDirectoriesOverlap);
+    }
+    Ok(())
+}
+
+fn contains(source: &Metadata, placement: &Path) -> Result<bool, ProjectError> {
     let mut ancestor = fs::canonicalize(placement)?;
     loop {
         let metadata = fs::symlink_metadata(&ancestor)?;
         if metadata.dev() == source.dev() && metadata.ino() == source.ino() {
-            return Err(ProjectError::BackingInsideSource);
+            return Ok(true);
         }
         if !ancestor.pop() {
-            return Ok(());
+            return Ok(false);
         }
     }
 }

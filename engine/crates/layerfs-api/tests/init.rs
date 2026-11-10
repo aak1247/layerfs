@@ -167,3 +167,138 @@ fn refusal_preserves_existing_output_and_original_request() {
     );
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn git_substitution_imports_a_wide_complete_tree_and_seals_the_selected_metadata() {
+    let directory =
+        std::env::temp_dir().join(format!("layerfs-sdk-git-wide-{}", std::process::id()));
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("source")).unwrap();
+    fs::create_dir(directory.join("git-stage")).unwrap();
+    fs::write(
+        directory.join("source/.git"),
+        b"gitdir: /outside/never-imported\n",
+    )
+    .unwrap();
+    fs::write(directory.join("source/ignored-file"), b"ignored data").unwrap();
+    fs::hard_link(
+        directory.join("source/ignored-file"),
+        directory.join("source/alias"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("ignored-file", directory.join("source/link")).unwrap();
+    for n in 0..530 {
+        fs::write(directory.join(format!("source/file-{n:04}")), b"data").unwrap();
+    }
+    fs::write(directory.join("git-stage/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(directory.join("git-stage/index"), b"independent index").unwrap();
+    let mut selected = request(&directory);
+    selected.store = selected
+        .store
+        .with_sqlite_profile(SqlitePersistenceProfile::Durable);
+    selected.deadline = Instant::now() + Duration::from_secs(30);
+    let config = selected.store.clone();
+    let project = Timing::disabled("sdk.git.init", |timer| {
+        ProjectApi::new().init_with_git_directory(selected, directory.join("git-stage"), timer)
+    })
+    .0
+    .unwrap();
+    assert_eq!(project.manifest.profile, StoreProfile::Durable);
+    assert_eq!(project.initialized.namespace_work.wide_directories, 1);
+    let handles = Handles::open_writable(
+        config,
+        &project.manifest.binding,
+        project.manifest.cursor_key,
+    )
+    .unwrap();
+    let storage = layerfs_storage::Storage::new(handles.storage.clone()).unwrap();
+    {
+        let reader = storage.reader().unwrap();
+        let mut tree =
+            FilesystemRead::new(&reader, FilesystemRootId(project.initialized.root)).unwrap();
+        let original = tree
+            .resolve(&LogicalPath::new("ignored-file").unwrap())
+            .unwrap();
+        let alias = tree.resolve(&LogicalPath::new("alias").unwrap()).unwrap();
+        assert_eq!(original.serial, alias.serial);
+        assert_eq!(
+            tree.readlink(&LogicalPath::new("link").unwrap())
+                .unwrap()
+                .as_bytes(),
+            b"ignored-file"
+        );
+        for (name, expected) in [
+            (".git/index", b"independent index".as_slice()),
+            ("ignored-file", b"ignored data".as_slice()),
+        ] {
+            let inode = tree.resolve(&LogicalPath::new(name).unwrap()).unwrap();
+            Timing::disabled("git.oracle", |timer| {
+                let view =
+                    FileView::open(&reader, inode.value.content_root, timer.child("open")).unwrap();
+                let mut actual = Vec::new();
+                view.read_range(&reader, 0..view.logical_len(), &mut actual, timer)
+                    .unwrap();
+                assert_eq!(actual, expected);
+                Ok::<(), layerfs_content::ContentError>(())
+            })
+            .0
+            .unwrap();
+        }
+    }
+    drop(storage);
+    handles.seal().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn git_substitution_refuses_overlap_and_store_inside_input_before_store_creation() {
+    use layerfs_api::ProjectError;
+    let directory =
+        std::env::temp_dir().join(format!("layerfs-sdk-git-refusal-{}", std::process::id()));
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("source")).unwrap();
+    fs::write(directory.join("source/.git"), b"gitdir: /outside\n").unwrap();
+    fs::create_dir(directory.join("git-stage")).unwrap();
+    let nested = directory.join("source/nested");
+    fs::create_dir(&nested).unwrap();
+    let failed = Timing::disabled("sdk.git.init", |timer| {
+        ProjectApi::new().init_with_git_directory(request(&directory), nested.clone(), timer)
+    })
+    .0
+    .unwrap_err();
+    assert!(matches!(
+        failed.original.error,
+        InitError::Project(ProjectError::SourceDirectoriesOverlap)
+    ));
+    assert_eq!(failed.git_directory, nested);
+    assert!(!directory.join("sealed.sqlite").exists());
+    let mut inside = request(&directory);
+    inside.store = PersistenceConfig::sqlite(directory.join("git-stage/sealed.sqlite"));
+    let failed = Timing::disabled("sdk.git.init", |timer| {
+        ProjectApi::new().init_with_git_directory(inside, directory.join("git-stage"), timer)
+    })
+    .0
+    .unwrap_err();
+    assert!(matches!(
+        failed.original.error,
+        InitError::Project(ProjectError::BackingInsideSource)
+    ));
+    assert!(!directory.join("git-stage/sealed.sqlite").exists());
+    fs::remove_file(directory.join("source/.git")).unwrap();
+    std::os::unix::fs::symlink("/outside", directory.join("source/.git")).unwrap();
+    let failed = Timing::disabled("sdk.git.init", |timer| {
+        ProjectApi::new().init_with_git_directory(
+            request(&directory),
+            directory.join("git-stage"),
+            timer,
+        )
+    })
+    .0
+    .unwrap_err();
+    assert!(matches!(
+        failed.original.error,
+        InitError::Project(ProjectError::InvalidInput { .. })
+    ));
+    assert!(!directory.join("sealed.sqlite").exists());
+    fs::remove_dir_all(directory).unwrap();
+}
