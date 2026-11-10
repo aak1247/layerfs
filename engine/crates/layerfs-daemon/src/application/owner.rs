@@ -8,6 +8,7 @@ use crate::{
 };
 use layerfs_bridge::{
     control::{DaemonPhase, DaemonStatus, HelloRequest},
+    daemon_recovery_setup::RecoveryWorkspaceSetup,
     daemon_setup::DaemonSetup,
     duplex as transport,
 };
@@ -50,7 +51,13 @@ pub struct Application {
     pub(super) workers: Mutex<Vec<Option<JoinHandle<()>>>>,
 }
 impl Application {
-    pub(super) fn start(setup: DaemonSetup) -> Result<Arc<Self>, ApplicationError> {
+    pub(super) fn start(
+        setup: DaemonSetup,
+        recovery: Option<RecoveryWorkspaceSetup>,
+    ) -> Result<Arc<Self>, ApplicationError> {
+        if let Some(recovery) = &recovery {
+            super::config::verify_recovery_store(&setup, recovery).map_err(ApplicationError::Io)?;
+        }
         // Open the export before any Overlay or Store effect and retain its
         // exact descriptors through the kernel serving owner's lifetime.
         #[cfg(target_os = "linux")]
@@ -169,8 +176,13 @@ impl Application {
             }
         };
         let service = if let Some(opened) = existing.as_ref() {
-            match super::filesystem::service(opened.store.clone(), &owner, kernel.as_ref(), &setup)
-            {
+            match super::filesystem::service(
+                opened.store.clone(),
+                &owner,
+                kernel.as_ref(),
+                &setup,
+                recovery.as_ref(),
+            ) {
                 Ok(service) => Some(service),
                 Err(mut failure) => {
                     failure.opened = existing.take();

@@ -1,5 +1,8 @@
 //! Actual protected configuration descriptors and process/placement checks.
-use layerfs_bridge::daemon_setup::{DaemonSetup, MAX_DAEMON_SETUP_BYTES};
+use layerfs_bridge::{
+    daemon_recovery_setup::{RecoveryDaemonSetup, RecoveryWorkspaceSetup},
+    daemon_setup::{DaemonSetup, MAX_DAEMON_SETUP_BYTES},
+};
 use nix::{fcntl::OFlag, unistd::Uid};
 use std::{
     fs::{self, OpenOptions},
@@ -8,7 +11,12 @@ use std::{
     path::Path,
 };
 
-pub(super) fn read(path: &Path) -> io::Result<DaemonSetup> {
+pub(super) struct StartupConfig {
+    pub daemon: DaemonSetup,
+    pub recovery: Option<RecoveryWorkspaceSetup>,
+}
+
+pub(super) fn read(path: &Path) -> io::Result<StartupConfig> {
     secure_process()?;
     let mut file = OpenOptions::new()
         .read(true)
@@ -29,7 +37,16 @@ pub(super) fn read(path: &Path) -> io::Result<DaemonSetup> {
     if bytes.len() > MAX_DAEMON_SETUP_BYTES {
         return Err(invalid("private config record size"));
     }
-    let config = DaemonSetup::decode(&bytes).map_err(|_| invalid("private config fields"))?;
+    let (config, recovery) = if RecoveryDaemonSetup::is_encoded(&bytes) {
+        let selected = RecoveryDaemonSetup::decode(&bytes)
+            .map_err(|_| invalid("private recovery config fields"))?;
+        (selected.daemon, Some(selected.workspace))
+    } else {
+        (
+            DaemonSetup::decode(&bytes).map_err(|_| invalid("private config fields"))?,
+            None,
+        )
+    };
     if config.command_uid == uid {
         return Err(invalid("command and daemon identities must differ"));
     }
@@ -79,7 +96,57 @@ pub(super) fn read(path: &Path) -> io::Result<DaemonSetup> {
         }
         protected_file(store)?;
     }
-    Ok(config)
+    if let Some(recovery) = &recovery {
+        for directory in [&recovery.catalog_directory, &recovery.overlay_directory] {
+            let directory = Path::new(directory);
+            if path.starts_with(directory) || directory.starts_with(path) {
+                return Err(invalid("private config overlaps durable Workspace"));
+            }
+            private_directory(directory, false)?;
+            private_directory(
+                directory
+                    .parent()
+                    .ok_or_else(|| invalid("durable directory parent"))?,
+                false,
+            )?;
+        }
+        verify_recovery_store(&config, recovery)?;
+    }
+    Ok(StartupConfig {
+        daemon: config,
+        recovery,
+    })
+}
+
+pub(super) fn verify_recovery_store(
+    config: &DaemonSetup,
+    recovery: &RecoveryWorkspaceSetup,
+) -> io::Result<()> {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+        .open(&config.store)?;
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(&config.store)?;
+    let uid = Uid::effective().as_raw();
+    if boot.trim() != recovery.boot_id
+        || !opened.is_file()
+        || !named.is_file()
+        || opened.uid() != uid
+        || named.uid() != uid
+        || opened.mode() & 0o077 != 0
+        || named.mode() & 0o077 != 0
+        || opened.nlink() != 1
+        || named.nlink() != 1
+        || opened.dev() != recovery.store_device
+        || named.dev() != recovery.store_device
+        || opened.ino() != recovery.store_inode
+        || named.ino() != recovery.store_inode
+    {
+        return Err(invalid("recovery Store identity or privacy changed"));
+    }
+    Ok(())
 }
 pub(super) fn protected_file(path: &Path) -> io::Result<()> {
     let file = OpenOptions::new()

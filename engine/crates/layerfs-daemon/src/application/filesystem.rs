@@ -5,7 +5,7 @@ use crate::{
     store::Store,
     Owner,
 };
-use layerfs_bridge::daemon_setup::DaemonSetup;
+use layerfs_bridge::{daemon_recovery_setup::RecoveryWorkspaceSetup, daemon_setup::DaemonSetup};
 use std::sync::Arc;
 
 /// Control and kernel serving share the same Store handle and overlay owner;
@@ -16,13 +16,14 @@ pub(super) fn service(
     owner: &Owner,
     kernel: Option<&Arc<KernelServing>>,
     setup: &DaemonSetup,
+    recovery: Option<&RecoveryWorkspaceSetup>,
 ) -> Result<Arc<Service>, Box<ServiceStartFailure>> {
     store.set_serial_low_water(setup.limits.serial_low_water);
     let mut service = match kernel {
         Some(kernel) => Service::with_kernel(store, owner, kernel.clone()),
         None => Service::new(store, owner),
     };
-    if let Err(cause) = configure(&mut service, owner, setup) {
+    if let Err(cause) = configure(&mut service, owner, setup, recovery) {
         return Err(Box::new(ServiceStartFailure {
             cause,
             service: Box::new(service),
@@ -38,8 +39,29 @@ fn configure(
     service: &mut Service,
     owner: &Owner,
     setup: &DaemonSetup,
+    recovery: Option<&RecoveryWorkspaceSetup>,
 ) -> Result<(), ServiceStartCause> {
     use std::os::unix::fs::MetadataExt;
+    if let Some(recovery) = recovery {
+        super::config::verify_recovery_store(setup, recovery).map_err(ServiceStartCause::Io)?;
+        return service
+            .recover_durable_control(
+                owner,
+                crate::control::RecoverControlConfig {
+                    catalog_directory: recovery.catalog_directory.clone().into(),
+                    overlay_directory: recovery.overlay_directory.clone().into(),
+                    sandbox: recovery.sandbox,
+                    profile: layerfs_overlay::ProfileConfig {
+                        pager_kib: setup.limits.pager_kib,
+                        max_pages: None,
+                    },
+                    minimum_namespace: recovery.minimum_namespace,
+                    store_device: recovery.store_device,
+                },
+            )
+            .map(|_| ())
+            .map_err(ServiceStartCause::Recovery);
+    }
     let Some(fresh) = &setup.fresh_workspace else {
         return Ok(());
     };
@@ -93,8 +115,9 @@ fn configure(
     _service: &mut Service,
     _owner: &Owner,
     setup: &DaemonSetup,
+    recovery: Option<&RecoveryWorkspaceSetup>,
 ) -> Result<(), ServiceStartCause> {
-    if setup.fresh_workspace.is_some() {
+    if setup.fresh_workspace.is_some() || recovery.is_some() {
         Err(ServiceStartCause::Unsupported)
     } else {
         Ok(())

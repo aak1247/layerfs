@@ -83,6 +83,33 @@ Store and Sandbox, fence the original processes, mounts and consumers, and
 reconcile unknown effects before this one attempt. These checks do not detect
 a wholesale rollback or replacement with a copied Store.
 
+The daemon also accepts a separate, explicitly selected `RecoveryDaemonSetup`
+private startup record. It requires an existing Durable Store manifest and
+the original Sandbox/catalog/Overlay identities, a fresh namespace floor, and
+the current boot ID plus device and inode observed when the caller authenticated
+the physical Store. The protected startup checks the Store's identity and
+privacy before creating the new export claim and again after opening the Store,
+then invokes the pinned-directory recovery above. Ordinary v5–v8 startup
+records keep their previous encoding and behavior. A matching inode and boot
+are checks on the caller's evidence, not proof that a copied or rolled-back
+Store is original, or that a previous owner and its consumers have exited.
+The caller must durably record the original attempt and its external fencing
+evidence, and retain an unknown or partially completed recovery rather than
+replaying it. This startup does not automatically attach Workspaces or recover
+an SDK session.
+
+An isolated Docker/FUSE test used that real daemon startup after separately
+fencing the exact original SDK, container, cgroup and FUSE mount. A wrong Store
+inode was refused before an export claim or Overlay initialization; the valid
+startup discovered the original Workspace, rejected the old token, attached
+under a new namespace and served the original synchronized bytes to the host.
+The four existing fresh-daemon integration cases also passed with the new
+binary. The original and recovered test resources were cleaned after
+acknowledged unmount. The receipt is under
+`~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/daemon-recovery-20261110-Jw9cyn7V/`.
+This is an explicitly fenced, single-host synthetic test, not automatic SDK
+recovery, Pod reconstruction or physical host power-loss verification.
+
 An isolated Docker/FUSE test killed an exact SDK and container after an
 acknowledged host write, verified the original cgroup, mount and FUSE
 connection were gone, and used this recovery method on the original ext4

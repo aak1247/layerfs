@@ -105,7 +105,13 @@ impl Application {
         state: &mut super::owner::State,
         store: std::sync::Arc<crate::store::Store>,
     ) {
-        match super::filesystem::service(store, &self.owner, self.kernel.as_ref(), &self.setup) {
+        match super::filesystem::service(
+            store,
+            &self.owner,
+            self.kernel.as_ref(),
+            &self.setup,
+            None,
+        ) {
             Ok(service) => {
                 state.startup.service = Some(service);
                 state.startup.phase = DaemonPhase::ControlReady;

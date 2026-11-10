@@ -20,6 +20,7 @@ mod control_unmount;
 mod sdk_merge_values;
 pub mod sdk_values;
 
+pub mod daemon_recovery_setup;
 pub mod daemon_setup;
 mod daemon_types;
 mod daemon_wire;

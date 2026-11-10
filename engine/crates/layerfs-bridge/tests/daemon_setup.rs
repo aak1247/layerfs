@@ -1,5 +1,6 @@
 //! Private startup configuration keeps older disposable records readable.
 use layerfs_bridge::{
+    daemon_recovery_setup::{RecoveryDaemonSetup, RecoveryWorkspaceSetup},
     daemon_setup::{DaemonLimits, DaemonSetup, FreshWorkspaceSetup, HostExportIdentity},
     provision::{ProviderKind, StoreManifest, StoreProfile},
 };
@@ -166,4 +167,77 @@ fn fresh_workspace_rejects_overlap_and_disposable_existing_store() {
     assert!(value.encode().is_err());
     value.existing_store.as_mut().unwrap().profile = StoreProfile::Durable;
     assert!(value.encode().is_ok());
+}
+
+#[test]
+fn explicit_recovery_is_bounded_and_cannot_select_fresh_or_disposable_storage() {
+    let mut daemon = setup();
+    daemon.existing_store = Some(StoreManifest {
+        provider: ProviderKind::Sqlite,
+        locator: daemon.store.clone(),
+        profile: StoreProfile::Durable,
+        binding: b"binding".to_vec(),
+        cursor_key: [4; 32],
+        stack: [5; 17],
+        branch: [6; 17],
+        root: [7; 32],
+        bytes: 1,
+        host_sqlite: "3.51.0".into(),
+        daemon_sqlite: Some("3.51.0".into()),
+    });
+    let original = RecoveryDaemonSetup {
+        daemon,
+        workspace: RecoveryWorkspaceSetup {
+            sandbox: [3; 32],
+            catalog_directory: "/volume/sandboxes/one/catalog".into(),
+            overlay_directory: "/volume/sandboxes/one/overlays".into(),
+            minimum_namespace: 17,
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            store_device: 1031,
+            store_inode: 42,
+        },
+    };
+    let encoded = original.encode().unwrap();
+    assert!(RecoveryDaemonSetup::is_encoded(&encoded));
+    assert_eq!(RecoveryDaemonSetup::decode(&encoded).unwrap(), original);
+    assert!(DaemonSetup::decode(&encoded).is_err());
+    assert!(RecoveryDaemonSetup::decode(&original.daemon.encode().unwrap()).is_err());
+    for end in 0..encoded.len() {
+        assert!(RecoveryDaemonSetup::decode(&encoded[..end]).is_err());
+    }
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(RecoveryDaemonSetup::decode(&trailing).is_err());
+    assert!(!format!("{original:?}").contains(&format!("{:?}", original.daemon.private_key)));
+
+    for invalid in 0..8 {
+        let mut changed = original.clone();
+        match invalid {
+            0 => changed.daemon.existing_store = None,
+            1 => changed.daemon.existing_store.as_mut().unwrap().profile = StoreProfile::Disposable,
+            2 => {
+                changed
+                    .daemon
+                    .existing_store
+                    .as_mut()
+                    .unwrap()
+                    .daemon_sqlite = None
+            }
+            3 => changed.workspace.minimum_namespace = 0,
+            4 => changed.workspace.minimum_namespace = i64::MAX,
+            5 => changed.workspace.store_inode = 0,
+            6 => changed.workspace.boot_id = "not-a-boot-id".into(),
+            7 => changed.workspace.overlay_directory = "/workspaces/escape".into(),
+            _ => unreachable!(),
+        }
+        assert!(changed.encode().is_err(), "invalid case {invalid}");
+    }
+    let mut changed = original.clone();
+    changed.daemon.fresh_workspace = Some(FreshWorkspaceSetup {
+        sandbox: [3; 32],
+        catalog_directory: "/volume/sandboxes/one/catalog".into(),
+        overlay_directory: "/volume/sandboxes/one/overlays".into(),
+        create_directories: false,
+    });
+    assert!(changed.encode().is_err());
 }

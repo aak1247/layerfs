@@ -21,6 +21,8 @@ pub enum ServiceStartCause {
     Fresh(Box<crate::control::FreshControlFailure>),
     #[cfg(target_os = "linux")]
     FreshVolume(Box<crate::control::FreshVolumeFailure>),
+    #[cfg(target_os = "linux")]
+    Recovery(Box<crate::control::RecoverControlFailure>),
     #[cfg(not(target_os = "linux"))]
     Unsupported,
 }
