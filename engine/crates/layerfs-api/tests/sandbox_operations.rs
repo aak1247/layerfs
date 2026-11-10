@@ -4,7 +4,7 @@
 #[path = "../../layerfs-sandbox/tests/support/engine.rs"]
 mod engine;
 use engine::{fixed, frame, Peer};
-use layerfs_api::sandbox::SandboxMilestone;
+use layerfs_api::sandbox::{SandboxCloseAttempt, SandboxCloseMilestone, SandboxMilestone};
 use layerfs_api::{
     ManagedSandbox, SandboxApi, SandboxCause, SandboxCreate, SandboxPhase, WorkspaceApi,
 };
@@ -198,6 +198,247 @@ fn close_stops_then_deletes_the_original_owner_without_deleting_its_borrowed_vol
     assert!(!calls
         .iter()
         .any(|call| call.starts_with(b"DELETE /v1.54/volumes/")));
+}
+
+#[test]
+fn observed_close_records_original_results_in_order() {
+    let mut fixture = Fixture::new(vec![fixed(204, b""), fixed(204, b"")]);
+    let mut seen = Vec::new();
+    fixture
+        .api
+        .close_observed(fixture.owner.take().unwrap(), |at| {
+            assert_eq!(at.owner.runtime.identity().to_string(), CID);
+            match at.milestone {
+                SandboxCloseMilestone::BeforeStop | SandboxCloseMilestone::BeforeDelete => {
+                    assert!(at.attempt.is_none())
+                }
+                SandboxCloseMilestone::StopFinished | SandboxCloseMilestone::DeleteFinished => {
+                    assert!(matches!(
+                        at.attempt,
+                        Some(SandboxCloseAttempt::Acknowledged)
+                    ))
+                }
+            }
+            seen.push(at.milestone);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        seen,
+        [
+            SandboxCloseMilestone::BeforeStop,
+            SandboxCloseMilestone::StopFinished,
+            SandboxCloseMilestone::BeforeDelete,
+            SandboxCloseMilestone::DeleteFinished
+        ]
+    );
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 8);
+    assert!(calls[6].starts_with(format!("POST /v1.54/containers/{CID}/stop?t=1 ").as_bytes()));
+    assert!(calls[7]
+        .starts_with(format!("DELETE /v1.54/containers/{CID}?force=false&v=false ").as_bytes()));
+}
+
+#[test]
+fn observed_close_failed_intents_send_no_next_engine_request() {
+    for boundary in [
+        SandboxCloseMilestone::BeforeStop,
+        SandboxCloseMilestone::BeforeDelete,
+    ] {
+        let responses = if boundary == SandboxCloseMilestone::BeforeStop {
+            vec![]
+        } else {
+            vec![fixed(204, b"")]
+        };
+        let mut fixture = Fixture::new(responses);
+        let failure = fixture
+            .api
+            .close_observed(fixture.owner.take().unwrap(), |at| {
+                if at.milestone == boundary {
+                    Err(std::io::Error::other("intent sync failed"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(failure.milestone, boundary);
+        assert_eq!(
+            failure.observer_error.as_ref().unwrap().to_string(),
+            "intent sync failed"
+        );
+        assert_eq!(failure.owner.runtime.identity().to_string(), CID);
+        assert_eq!(failure.request().controller_private, [31; 32]);
+        assert!(failure.delete.is_none());
+        assert_eq!(
+            failure.owner.runtime.disposition().stopped,
+            boundary == SandboxCloseMilestone::BeforeDelete
+        );
+        assert_eq!(
+            fixture.calls().len(),
+            if boundary == SandboxCloseMilestone::BeforeStop {
+                6
+            } else {
+                7
+            }
+        );
+    }
+}
+
+#[test]
+fn observed_close_failed_receipt_recording_retains_each_acknowledged_result() {
+    for boundary in [
+        SandboxCloseMilestone::StopFinished,
+        SandboxCloseMilestone::DeleteFinished,
+    ] {
+        let responses = if boundary == SandboxCloseMilestone::StopFinished {
+            vec![fixed(204, b"")]
+        } else {
+            vec![fixed(204, b""), fixed(204, b"")]
+        };
+        let mut fixture = Fixture::new(responses);
+        let failure = fixture
+            .api
+            .close_observed(fixture.owner.take().unwrap(), |at| {
+                if at.milestone == boundary {
+                    assert!(matches!(
+                        at.attempt,
+                        Some(SandboxCloseAttempt::Acknowledged)
+                    ));
+                    Err(std::io::Error::other("receipt sync failed"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(failure.milestone, boundary);
+        assert_eq!(
+            failure.observer_error.as_ref().unwrap().to_string(),
+            "receipt sync failed"
+        );
+        assert!(matches!(
+            failure.stop,
+            Some(SandboxCloseAttempt::Acknowledged)
+        ));
+        assert_eq!(
+            failure.owner.runtime.disposition().deleted,
+            boundary == SandboxCloseMilestone::DeleteFinished
+        );
+        if boundary == SandboxCloseMilestone::DeleteFinished {
+            assert!(matches!(
+                failure.delete,
+                Some(SandboxCloseAttempt::Acknowledged)
+            ));
+        } else {
+            assert!(failure.delete.is_none());
+        }
+        assert_eq!(
+            fixture.calls().len(),
+            if boundary == SandboxCloseMilestone::StopFinished {
+                7
+            } else {
+                8
+            }
+        );
+    }
+}
+
+#[test]
+fn observed_close_retains_original_engine_failure_without_replay() {
+    for boundary in [
+        SandboxCloseMilestone::StopFinished,
+        SandboxCloseMilestone::DeleteFinished,
+    ] {
+        let responses = if boundary == SandboxCloseMilestone::StopFinished {
+            vec![fixed(409, b"original stop refusal")]
+        } else {
+            vec![fixed(204, b""), fixed(409, b"original delete refusal")]
+        };
+        let mut fixture = Fixture::new(responses);
+        let failure = fixture
+            .api
+            .close_observed(fixture.owner.take().unwrap(), |at| {
+                if at.milestone == boundary {
+                    assert!(matches!(at.attempt, Some(SandboxCloseAttempt::Failed(_))));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(failure.milestone, boundary);
+        assert!(failure.observer_error.is_none());
+        let attempt = if boundary == SandboxCloseMilestone::StopFinished {
+            &failure.stop
+        } else {
+            &failure.delete
+        };
+        let Some(SandboxCloseAttempt::Failed(original)) = attempt else {
+            panic!("original Engine failure")
+        };
+        assert!(original.attempted);
+        assert_eq!(
+            original.requested_container,
+            Some(failure.owner.runtime.identity())
+        );
+        assert_eq!(
+            fixture.calls().len(),
+            if boundary == SandboxCloseMilestone::StopFinished {
+                7
+            } else {
+                8
+            }
+        );
+    }
+}
+
+#[test]
+fn observed_close_preserves_engine_and_journal_failures_together() {
+    for boundary in [
+        SandboxCloseMilestone::StopFinished,
+        SandboxCloseMilestone::DeleteFinished,
+    ] {
+        let responses = if boundary == SandboxCloseMilestone::StopFinished {
+            vec![fixed(409, b"original stop refusal")]
+        } else {
+            vec![fixed(204, b""), fixed(409, b"original delete refusal")]
+        };
+        let mut fixture = Fixture::new(responses);
+        let failure = fixture
+            .api
+            .close_observed(fixture.owner.take().unwrap(), |at| {
+                if at.milestone == boundary {
+                    assert!(matches!(at.attempt, Some(SandboxCloseAttempt::Failed(_))));
+                    Err(std::io::Error::other("original result could not be synced"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(failure.milestone, boundary);
+        assert_eq!(
+            failure.observer_error.as_ref().unwrap().to_string(),
+            "original result could not be synced"
+        );
+        let original = if boundary == SandboxCloseMilestone::StopFinished {
+            &failure.stop
+        } else {
+            &failure.delete
+        };
+        let Some(SandboxCloseAttempt::Failed(original)) = original else {
+            panic!("the original Engine error must be retained")
+        };
+        assert!(original.attempted);
+        assert_eq!(
+            original.requested_container,
+            Some(failure.owner.runtime.identity())
+        );
+        assert_eq!(
+            fixture.calls().len(),
+            if boundary == SandboxCloseMilestone::StopFinished {
+                7
+            } else {
+                8
+            }
+        );
+    }
 }
 #[test]
 fn failed_stop_preserves_original_owner_channel_inputs_and_attempt_without_delete() {

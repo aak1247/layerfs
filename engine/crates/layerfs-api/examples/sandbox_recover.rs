@@ -196,7 +196,19 @@ mod linux {
             "recovery.closed",
             format!("namespace={namespace}\nminor={minor}\n").as_bytes(),
         )?;
-        api.close(owner).map_err(|e| format!("close {e:?}"))?;
+        api.close_observed(owner, |at| {
+            record(
+                &proof,
+                &format!("sandbox-close-{:?}", at.milestone),
+                format!(
+                    "runtime={}\nattempt={:?}\n",
+                    at.owner.runtime.identity(),
+                    at.attempt
+                )
+                .as_bytes(),
+            )
+        })
+        .map_err(|e| format!("close {e:?}"))?;
         record(
             &proof,
             "recovery.sandbox-closed",

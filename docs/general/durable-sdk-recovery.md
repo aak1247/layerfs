@@ -28,6 +28,17 @@ retains that acknowledgement; a refusal or uncertain exchange retains its
 original failure. The caller chooses whether to discard dirty data and must
 keep unknown results without replay. Forced teardown is a separate operation.
 
+`SandboxApi::close_observed` exposes the before and original-result boundaries
+of the one Sandbox Stop and, after an acknowledged Stop, one Delete. The
+caller records each boundary durably; an observer failure retains the owner and
+every result already received and stops before the next effect. An Engine and
+journal failure are both retained. Stop's acknowledged result follows the
+existing Sandbox API contract, including its normalization of Docker's 304;
+it is not a raw HTTP receipt or proof that consumers and mounts have drained.
+This method does not discover or close Workspaces and does not delete the
+borrowed Store. The caller still fences consumers, handles unknown results and
+independently proves any later recovery authority.
+
 ## Isolated Linux proof, 2026-11-10
 
 The `sandbox_recover` example and the original `sandbox_kernel_mount` example
@@ -55,6 +66,11 @@ The same fenced recovery was repeated with `unmount_observed` recording the
 original intent and acknowledged close. The dedicated fixture was fully
 retired after the original and recovered FUSE connections disappeared; its
 receipt is in `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-observed-close-20261110-OaSBsLV1/`.
+
+The fenced recovery was repeated using `close_observed` for the recovered
+Sandbox. The proof recorded both intents and both acknowledged results before
+verifying the original FUSE connections and dedicated test resources were gone.
+Its receipt is in `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-observed-sandbox-retire-20261110-o6N9OT60/`.
 
 This is a single-host process-crash test with an ext4-backed Docker volume. It
 does not prove physical power-loss durability, Kubernetes recovery, automatic

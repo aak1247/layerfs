@@ -1,6 +1,8 @@
 //! Actual ordinary Sandbox lifecycle and its Workspaces, with exact logical and kernel readiness.
 #[cfg(unix)]
 mod close;
+#[cfg(unix)]
+mod close_observed;
 mod commit;
 #[cfg(unix)]
 pub(crate) mod create;
@@ -14,6 +16,11 @@ mod status;
 mod unmount;
 mod unmount_observed;
 pub mod values;
+#[cfg(unix)]
+pub use close_observed::{
+    ObservedSandboxCloseFailure, SandboxCloseAttempt, SandboxCloseMilestone,
+    SandboxCloseObservation,
+};
 pub use commit::CommitReply;
 #[cfg(unix)]
 pub use create::{
