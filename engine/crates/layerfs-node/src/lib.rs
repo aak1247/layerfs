@@ -6,7 +6,7 @@ mod direct;
 mod discovery;
 mod dispatch;
 #[cfg(target_os = "linux")]
-mod durable_records;
+use layerfs_sandbox::durable_records;
 mod exec;
 mod job;
 #[cfg(target_os = "linux")]

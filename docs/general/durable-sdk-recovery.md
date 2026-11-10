@@ -39,6 +39,17 @@ This method does not discover or close Workspaces and does not delete the
 borrowed Store. The caller still fences consumers, handles unknown results and
 independently proves any later recovery authority.
 
+The Linux `layerfs_sandbox::durable_records` utility is shared by the Node
+binding and Rust controllers. It pins a private, caller-owned directory,
+validates individual record names, and checks both inode and mount identity
+before and after durable publication, including record-file mount identity.
+The original attempted-write failure and
+its boundary remain available to the caller. The utility does not acquire an
+exclusive owner lease, establish authorization, or reconcile an unknown write.
+Isolated bind-mount tests overlaid the same directory or record-file inode,
+verified writes were refused, then restored the original mount and completed a
+record write. Their receipts are in `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-record-directory-mount-20261110-qXNZHGZY/` and `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-record-file-mount-20261110-ONRlaZ3X/`.
+
 ## Isolated Linux proof, 2026-11-10
 
 The `sandbox_recover` example and the original `sandbox_kernel_mount` example

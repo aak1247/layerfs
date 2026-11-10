@@ -1,4 +1,8 @@
-//! One checked replacement of a private SDK record on its pinned directory.
+//! Checked writes to caller-owned private lifecycle records on a pinned directory.
+//!
+//! This does not lock the directory, authenticate a previous owner, resolve an
+//! uncertain operation, or authorize a retry. Callers hold their own exclusive
+//! lease and retain any failure and outstanding intent across restarts.
 use std::{
     ffi::OsStr,
     fmt,
@@ -13,24 +17,38 @@ use std::{
 
 /// The exact original boundary; attempted writes must not be replayed.
 #[derive(Debug)]
-pub(crate) struct Failure {
+pub struct Failure {
+    /// Whether this write reached an effect that may have changed storage.
     pub attempted: bool,
     phase: &'static str,
     cause: io::Error,
+}
+impl Failure {
+    /// The original write boundary at which the operation failed.
+    pub fn phase(&self) -> &'static str {
+        self.phase
+    }
+
+    /// The original operating-system error.
+    pub fn cause(&self) -> &io::Error {
+        &self.cause
+    }
 }
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "durable record {}: {}", self.phase, self.cause)
     }
 }
+impl std::error::Error for Failure {}
 
 /// The original private directory, retained across a multi-step attempt.
-pub(crate) struct Directory {
+pub struct Directory {
     file: File,
     canonical: PathBuf,
 }
 impl Directory {
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+    /// Pins an existing private directory owned by the effective user.
+    pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(0x20000)
@@ -39,23 +57,27 @@ impl Directory {
         check_directory(&canonical, &file)?;
         Ok(Self { file, canonical })
     }
-    pub(crate) fn verify(&self) -> io::Result<()> {
+    /// Rechecks the held directory against its original named identity.
+    pub fn verify(&self) -> io::Result<()> {
         check_directory(&self.canonical, &self.file)
     }
-    pub(crate) fn sync(&self) -> io::Result<()> {
+    /// Synchronizes the original directory after verifying its identity.
+    pub fn sync(&self) -> io::Result<()> {
         self.verify()?;
         self.file.sync_all()?;
         self.verify()
     }
-    pub(crate) fn path(&self) -> PathBuf {
+    /// Returns a descriptor-relative path valid while this owner is held.
+    pub fn path(&self) -> PathBuf {
         fd_path(&self.file).join(".")
     }
-    pub(crate) fn save(
-        &self,
-        name: &OsStr,
-        temp_name: &OsStr,
-        bytes: &[u8],
-    ) -> Result<(), Failure> {
+    /// Replaces one record with a separately named synchronized temporary file.
+    pub fn save(&self, name: &OsStr, temp_name: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
+        check_name(name).map_err(directory_failure)?;
+        check_name(temp_name).map_err(directory_failure)?;
+        if name == temp_name {
+            return Err(directory_failure(invalid("record temporary name")));
+        }
         let mut phase = "directory";
         let mut attempted = false;
         let mut directory = Some(self.file.try_clone().map_err(directory_failure)?);
@@ -65,7 +87,13 @@ impl Directory {
             check_directory(&self.canonical, held)?;
             let named = fd_path(held).join(name);
             match fs::symlink_metadata(&named) {
-                Ok(metadata) => check_file_metadata(&metadata)?,
+                Ok(_) => {
+                    let existing = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(0x20000)
+                        .open(&named)?;
+                    check_file(held, name, &existing)?;
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => (),
                 Err(error) => return Err(error),
             }
@@ -115,7 +143,8 @@ impl Directory {
     }
 
     /// A partial intent remains at its original name and blocks a later attempt.
-    pub(crate) fn create(&self, name: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
+    pub fn create(&self, name: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
+        check_name(name).map_err(directory_failure)?;
         let mut phase = "directory";
         let mut attempted = false;
         let mut directory = Some(self.file.try_clone().map_err(directory_failure)?);
@@ -166,7 +195,8 @@ impl Directory {
 
     /// Removes one checked original record, then synchronizes its directory.
     /// The caller retains this Directory if any part of the effect is unknown.
-    pub(crate) fn remove(&self, name: &OsStr) -> io::Result<()> {
+    pub fn remove(&self, name: &OsStr) -> io::Result<()> {
+        check_name(name)?;
         self.verify()?;
         let file = OpenOptions::new()
             .read(true)
@@ -185,7 +215,7 @@ impl Directory {
 
 /// Replaces one record only after syncing its original file and directory.
 /// Unknown effects retain the original file and directory until process exit.
-pub(crate) fn save(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<(), Failure> {
+pub fn save(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<(), Failure> {
     let parent = path
         .parent()
         .ok_or_else(|| directory_failure(invalid("record parent")))?;
@@ -203,6 +233,20 @@ pub(crate) fn save(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<(), Fa
         .save(name, temporary, bytes)
 }
 
+fn check_name(name: &OsStr) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.contains(&0)
+    {
+        return Err(invalid("record name"));
+    }
+    Ok(())
+}
+
 fn directory_failure(cause: io::Error) -> Failure {
     Failure {
         attempted: false,
@@ -216,7 +260,11 @@ fn fd_path(directory: &File) -> PathBuf {
 }
 fn check_directory(path: &Path, directory: &File) -> io::Result<()> {
     let opened = directory.metadata()?;
-    let named = fs::symlink_metadata(path)?;
+    let named_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x10000)
+        .open(path)?;
+    let named = named_directory.metadata()?;
     let uid = fs::metadata("/proc/self")?.uid();
     if !opened.is_dir()
         || !named.is_dir()
@@ -226,17 +274,37 @@ fn check_directory(path: &Path, directory: &File) -> io::Result<()> {
         || named.mode() & 0o077 != 0
         || opened.dev() != named.dev()
         || opened.ino() != named.ino()
+        || mount_id(directory)? != mount_id(&named_directory)?
     {
         return Err(invalid("record directory identity or privacy"));
     }
     Ok(())
 }
+
+fn mount_id(file: &File) -> io::Result<u64> {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let value = info
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or_else(|| invalid("record directory mount identity"))?;
+    value
+        .parse()
+        .map_err(|_| invalid("record directory mount identity"))
+}
 fn check_file(directory: &File, name: &OsStr, file: &File) -> io::Result<()> {
     let opened = file.metadata()?;
-    let named = fs::symlink_metadata(fd_path(directory).join(name))?;
+    let named_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000)
+        .open(fd_path(directory).join(name))?;
+    let named = named_file.metadata()?;
     check_file_metadata(&opened)?;
     check_file_metadata(&named)?;
-    if opened.dev() != named.dev() || opened.ino() != named.ino() {
+    if opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || mount_id(file)? != mount_id(directory)?
+        || mount_id(&named_file)? != mount_id(directory)?
+    {
         return Err(invalid("record file identity"));
     }
     Ok(())
