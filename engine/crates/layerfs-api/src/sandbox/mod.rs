@@ -12,6 +12,7 @@ mod mount;
 mod mount_observed;
 mod status;
 mod unmount;
+mod unmount_observed;
 pub mod values;
 pub use commit::CommitReply;
 #[cfg(unix)]
@@ -26,3 +27,6 @@ pub use mount::WorkspaceApi;
 pub use mount::{MountFailure, MountedWorkspace};
 pub use mount_observed::{MountCause, MountMilestone, MountObservation, ObservedMountFailure};
 pub use unmount::Unmounted;
+pub use unmount_observed::{
+    ObservedUnmountFailure, UnmountAttempt, UnmountMilestone, UnmountObservation,
+};

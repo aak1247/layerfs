@@ -4,7 +4,7 @@
 #[cfg(target_os = "linux")]
 mod linux {
 
-    use layerfs_api::{BoundWorkspace, SandboxApi, SandboxCreate, WorkspaceApi};
+    use layerfs_api::{BoundWorkspace, SandboxApi, SandboxCreate, Unmounted, WorkspaceApi};
     use layerfs_bridge::{
         control::{Activity, MountPhase, WorkspaceToken},
         daemon_recovery_setup::{RecoveryDaemonSetup, RecoveryWorkspaceSetup},
@@ -177,7 +177,20 @@ mod linux {
             "recovery.before-close",
             format!("namespace={namespace}\n").as_bytes(),
         )?;
-        WorkspaceApi::new(&mut owner).unmount(mounted.bound.token, false)?;
+        let outcome = WorkspaceApi::new(&mut owner)
+            .unmount_observed(mounted.bound.token, true, |at| {
+                record(
+                    &proof,
+                    &format!("unmount-{:?}", at.milestone),
+                    format!(
+                        "token={:?}\ndiscard={}\nattempt={:?}\n",
+                        at.token, at.discard, at.attempt
+                    )
+                    .as_bytes(),
+                )
+            })
+            .map_err(|e| format!("unmount {e:?}"))?;
+        assert_eq!(outcome, Unmounted::Closed);
         record(
             &proof,
             "recovery.closed",

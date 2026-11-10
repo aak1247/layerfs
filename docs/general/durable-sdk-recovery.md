@@ -22,6 +22,12 @@ original binding and Ready receipt if the caller's journal fails. A later
 observation cannot settle an earlier unknown Bind, Attach or close. Consumer
 authorization and preserving outstanding operations remain controller duties.
 
+`WorkspaceApi::unmount_observed` records an explicit normal close intent and
+the original result before returning. An observer failure after acknowledgement
+retains that acknowledgement; a refusal or uncertain exchange retains its
+original failure. The caller chooses whether to discard dirty data and must
+keep unknown results without replay. Forced teardown is a separate operation.
+
 ## Isolated Linux proof, 2026-11-10
 
 The `sandbox_recover` example and the original `sandbox_kernel_mount` example
@@ -44,6 +50,11 @@ receipt and individual observations are in
 `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-api-recovery-20261110-Jy3jXxMJ/`.
 The example's textual records illustrate lifecycle boundaries; they are not a
 complete production journal or an implementation of automatic recovery.
+
+The same fenced recovery was repeated with `unmount_observed` recording the
+original intent and acknowledged close. The dedicated fixture was fully
+retired after the original and recovered FUSE connections disappeared; its
+receipt is in `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-observed-close-20261110-OaSBsLV1/`.
 
 This is a single-host process-crash test with an ext4-backed Docker volume. It
 does not prove physical power-loss durability, Kubernetes recovery, automatic

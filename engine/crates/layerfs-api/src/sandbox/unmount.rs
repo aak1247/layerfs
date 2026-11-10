@@ -43,8 +43,10 @@ impl WorkspaceApi<'_> {
     ) -> Result<Unmounted, Box<OperationFailure>> {
         let request = Request::Unmount(UnmountControl { token, discard });
         match self.exchange(request.clone())? {
-            Reply::Unmounted(_) => Ok(Unmounted::Closed),
-            Reply::Dirty(report) if !discard => Ok(Unmounted::Dirty(report)),
+            Reply::Unmounted(received) if received == token => Ok(Unmounted::Closed),
+            Reply::Dirty(report) if !discard && report.token == token => {
+                Ok(Unmounted::Dirty(report))
+            }
             reply => Err(OperationFailure::unexpected(request, reply)),
         }
     }
