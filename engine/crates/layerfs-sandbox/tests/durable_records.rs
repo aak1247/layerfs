@@ -1,12 +1,13 @@
 #![cfg(target_os = "linux")]
 //! Private record publication, path admission and pinned-directory identity.
 
-use layerfs_sandbox::durable_records::Directory;
+use layerfs_sandbox::durable_records::{Directory, Lease};
 use std::{
     ffi::OsStr,
     fs,
     os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::PathBuf,
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -14,6 +15,17 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture(PathBuf);
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
 
 impl Fixture {
     fn new() -> Self {
@@ -26,6 +38,133 @@ impl Fixture {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         Self(path)
     }
+}
+
+#[test]
+fn lease_serializes_the_original_sidecar_across_processes() {
+    let fixture = Fixture::new();
+    let mut lease = Lease::try_acquire(Directory::open(&fixture.0).unwrap()).unwrap();
+    let probe = |expect: &str| {
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lease_child_probe", "--nocapture"])
+            .env("LAYERFS_RECORD_LEASE_CHILD", &fixture.0)
+            .env("LAYERFS_RECORD_LEASE_EXPECT", expect)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+    };
+    probe("busy");
+    assert!(
+        !lease
+            .create(OsStr::new("ownership.lock"), b"replace")
+            .unwrap_err()
+            .attempted
+    );
+    assert!(
+        !lease
+            .save(
+                OsStr::new("intent"),
+                OsStr::new("ownership.lock"),
+                b"replace"
+            )
+            .unwrap_err()
+            .attempted
+    );
+    lease.create(OsStr::new("intent"), b"request").unwrap();
+    lease
+        .save(
+            OsStr::new("intent"),
+            OsStr::new("temporary"),
+            b"acknowledged",
+        )
+        .unwrap();
+    lease.remove(OsStr::new("intent")).unwrap();
+    drop(lease);
+    probe("available");
+}
+
+#[test]
+fn lease_child_probe() {
+    let Some(path) = std::env::var_os("LAYERFS_RECORD_LEASE_CHILD") else {
+        return;
+    };
+    let expected = std::env::var("LAYERFS_RECORD_LEASE_EXPECT").unwrap();
+    let result = Lease::try_acquire(Directory::open(&PathBuf::from(path)).unwrap());
+    match (expected.as_str(), result) {
+        ("busy", Err(error)) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        ("available", Ok(lease)) => lease.verify().unwrap(),
+        (expected, _) => panic!("unexpected lease outcome for {expected}"),
+    }
+}
+
+#[test]
+fn lease_refuses_a_replaced_sidecar_before_writing() {
+    let fixture = Fixture::new();
+    let mut lease = Lease::try_acquire(Directory::open(&fixture.0).unwrap()).unwrap();
+    fs::rename(fixture.0.join("ownership.lock"), fixture.0.join("old-lock")).unwrap();
+    fs::write(fixture.0.join("ownership.lock"), b"replacement").unwrap();
+    fs::set_permissions(
+        fixture.0.join("ownership.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert!(lease.verify().is_err());
+    assert!(
+        !lease
+            .create(OsStr::new("intent"), b"request")
+            .unwrap_err()
+            .attempted
+    );
+    assert!(!fixture.0.join("intent").exists());
+}
+
+#[test]
+fn killed_lease_owner_leaves_original_intent_in_place() {
+    let fixture = Fixture::new();
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lease_child_holds_until_killed", "--nocapture"])
+            .env("LAYERFS_RECORD_LEASE_CRASH_CHILD", &fixture.0)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(fixture.0.join("child-ready"));
+    match Lease::try_acquire(Directory::open(&fixture.0).unwrap()) {
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        Ok(_) => panic!("another process acquired the active lease"),
+    }
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let mut next = Lease::try_acquire(Directory::open(&fixture.0).unwrap()).unwrap();
+    assert_eq!(
+        fs::read(fixture.0.join("pending")).unwrap(),
+        b"original intent"
+    );
+    assert!(next.create(OsStr::new("pending"), b"replayed").is_err());
+    assert_eq!(
+        fs::read(fixture.0.join("pending")).unwrap(),
+        b"original intent"
+    );
+}
+
+#[test]
+fn lease_child_holds_until_killed() {
+    let Some(path) = std::env::var_os("LAYERFS_RECORD_LEASE_CRASH_CHILD") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let mut lease = Lease::try_acquire(Directory::open(&path).unwrap()).unwrap();
+    lease
+        .create(OsStr::new("pending"), b"original intent")
+        .unwrap();
+    fs::write(path.join("child-ready"), b"ready").unwrap();
+    wait_for(path.join("release"));
 }
 
 impl Drop for Fixture {

@@ -44,8 +44,14 @@ binding and Rust controllers. It pins a private, caller-owned directory,
 validates individual record names, and checks both inode and mount identity
 before and after durable publication, including record-file mount identity.
 The original attempted-write failure and
-its boundary remain available to the caller. The utility does not acquire an
-exclusive owner lease, establish authorization, or reconcile an unknown write.
+its boundary remain available to the caller. A separate cooperative `Lease`
+locks the same `ownership.lock` used by the Node SDK, verifies its identity
+around each write, and prevents mutations through the lease from replacing the
+lock. The directory must remain private from untrusted writers. The lease does
+not establish project authorization, prove old consumers have stopped, or
+reconcile an unknown write. Cross-process tests cover retained intent after a
+controller is killed, and the real Node binding and Rust API block each other
+on the same sidecar.
 Isolated bind-mount tests overlaid the same directory or record-file inode,
 verified writes were refused, then restored the original mount and completed a
 record write. Their receipts are in `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-record-directory-mount-20261110-qXNZHGZY/` and `~/.cache/layerfs-worktrees/layerfs-467ee0a0e226/runs/sdk-record-file-mount-20261110-ONRlaZ3X/`.

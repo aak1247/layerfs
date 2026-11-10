@@ -3,6 +3,7 @@
 //! This does not lock the directory, authenticate a previous owner, resolve an
 //! uncertain operation, or authorize a retry. Callers hold their own exclusive
 //! lease and retain any failure and outstanding intent across restarts.
+use nix::fcntl::{Flock, FlockArg};
 use std::{
     ffi::OsStr,
     fmt,
@@ -14,6 +15,8 @@ use std::{
     },
     path::{Path, PathBuf},
 };
+
+const LOCK_NAME: &str = "ownership.lock";
 
 /// The exact original boundary; attempted writes must not be replayed.
 #[derive(Debug)]
@@ -45,6 +48,94 @@ impl std::error::Error for Failure {}
 pub struct Directory {
     file: File,
     canonical: PathBuf,
+}
+
+/// A cooperative exclusive lease on the original private record directory.
+///
+/// The fixed sidecar also coordinates with the Node SDK. The directory must
+/// remain private from untrusted writers; a file lock alone cannot prevent an
+/// unauthorized writer from replacing its inode. This lease does not prove an
+/// earlier owner or consumer has exited and never settles an unknown effect.
+pub struct Lease {
+    directory: Directory,
+    lock: Flock<File>,
+}
+
+impl Lease {
+    /// Acquires the original sidecar once without waiting.
+    pub fn try_acquire(directory: Directory) -> io::Result<Self> {
+        directory.verify()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(0x20000)
+            .open(directory.path().join(LOCK_NAME))?;
+        check_file(&directory.file, OsStr::new(LOCK_NAME), &file)?;
+        let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, error)| io::Error::from(error))?;
+        let lease = Self { directory, lock };
+        lease.verify()?;
+        lease.lock.sync_all()?;
+        lease.directory.sync()?;
+        lease.verify()?;
+        Ok(lease)
+    }
+
+    /// Rechecks the original directory, mount and locked sidecar identity.
+    pub fn verify(&self) -> io::Result<()> {
+        self.directory.verify()?;
+        check_file(&self.directory.file, OsStr::new(LOCK_NAME), &self.lock)
+    }
+
+    /// Descriptor-relative directory path, valid while this lease is held.
+    pub fn path(&self) -> PathBuf {
+        self.directory.path()
+    }
+
+    /// Creates one new record while retaining the lease across the write.
+    pub fn create(&mut self, name: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
+        self.admit(name)?;
+        self.directory.create(name, bytes)?;
+        self.after_effect()
+    }
+
+    /// Replaces one record while retaining the lease across the write.
+    pub fn save(&mut self, name: &OsStr, temporary: &OsStr, bytes: &[u8]) -> Result<(), Failure> {
+        self.admit(name)?;
+        self.admit(temporary)?;
+        self.directory.save(name, temporary, bytes)?;
+        self.after_effect()
+    }
+
+    /// Removes one record; an error after admission retains unknown custody.
+    pub fn remove(&mut self, name: &OsStr) -> Result<(), Failure> {
+        self.admit(name)?;
+        self.directory.remove(name).map_err(|cause| Failure {
+            attempted: true,
+            phase: "remove",
+            cause,
+        })?;
+        self.after_effect()
+    }
+
+    fn admit(&self, name: &OsStr) -> Result<(), Failure> {
+        check_name(name).map_err(directory_failure)?;
+        if name == OsStr::new(LOCK_NAME) {
+            return Err(directory_failure(invalid("record lease name")));
+        }
+        self.verify().map_err(directory_failure)
+    }
+
+    fn after_effect(&self) -> Result<(), Failure> {
+        self.verify().map_err(|cause| Failure {
+            attempted: true,
+            phase: "lease revalidation",
+            cause,
+        })
+    }
 }
 impl Directory {
     /// Pins an existing private directory owned by the effective user.

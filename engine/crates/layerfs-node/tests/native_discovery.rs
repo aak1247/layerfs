@@ -2,8 +2,73 @@
 #![cfg(target_os = "linux")]
 mod support;
 use layerfs_bridge::control::SdkValue;
-use std::{path::Path, process::Command, time::Duration};
+use layerfs_sandbox::durable_records::{Directory, Lease};
+use std::{
+    path::Path,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 use support::{engine::*, *};
+
+#[test]
+fn node_discovery_and_rust_controller_share_the_same_lease() {
+    for node_first in [true, false] {
+        let home = Home::new();
+        std::fs::remove_file(home.0.join("proj/sandboxes/1/sandbox.record")).unwrap();
+        let preload = home.0.join("interop-lock.so");
+        assert!(Command::new("cc")
+            .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/interop_lock.c"))
+            .args(["-ldl", "-o"])
+            .arg(&preload)
+            .status()
+            .unwrap()
+            .success());
+        let wait = |name: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !home.0.join(name).exists() {
+                assert!(Instant::now() < deadline, "Node did not reach {name}");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let call = "assert.equal((await native.call('sandbox.close',args)).refused.code, 'NoSuchSandbox');";
+        let directory = home.0.join("proj");
+        if node_first {
+            thread::scope(|scope| {
+                let node = scope.spawn(|| {
+                    home.node_with_env(
+                        call,
+                        Some(&preload),
+                        &[("LAYERFS_INTEROP_HOLD", "1")],
+                        Duration::from_secs(10),
+                    )
+                });
+                wait("interop-acquired");
+                match Lease::try_acquire(Directory::open(&directory).unwrap()) {
+                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+                    Ok(_) => panic!("Rust acquired the Node SDK's active lease"),
+                }
+                std::fs::write(home.0.join("interop-release"), b"release").unwrap();
+                node.join().unwrap();
+            });
+            Lease::try_acquire(Directory::open(&directory).unwrap())
+                .unwrap()
+                .verify()
+                .unwrap();
+        } else {
+            let lease = Lease::try_acquire(Directory::open(&directory).unwrap()).unwrap();
+            thread::scope(|scope| {
+                let node = scope.spawn(|| home.node(call, Some(&preload), Duration::from_secs(10)));
+                wait("interop-blocked");
+                assert!(!home.0.join("interop-acquired").exists());
+                drop(lease);
+                node.join().unwrap();
+            });
+            assert!(home.0.join("interop-acquired").exists());
+        }
+    }
+}
 
 #[test]
 fn sandbox_capacity_is_read_from_the_record_and_legacy_defaults_to_sixteen() {
