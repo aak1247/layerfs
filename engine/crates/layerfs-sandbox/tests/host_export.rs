@@ -105,6 +105,33 @@ fn lease_rechecks_freshness_after_the_original_observation() {
 }
 
 #[test]
+#[ignore = "requires root and a caller-owned empty shared export"]
+fn reattach_keeps_nonempty_export_and_excludes_fresh_creation() {
+    use std::fs;
+    let path = std::env::var_os("LAYERFS_EXPORT_ROOT").expect("owned export root");
+    let path = Path::new(&path);
+    let root = HostExportRoot::open_fresh(path).unwrap();
+    let identity = root.identity().clone();
+    let original = HostExportLease::try_acquire(root).unwrap();
+    let second = HostExportRoot::reopen(path, &identity).unwrap();
+    assert!(HostExportLease::reattach(second).is_err());
+    let marker = path.join(format!("reattach-owned-marker-{}", std::process::id()));
+    fs::write(&marker, b"original persistent mount contents").unwrap();
+    drop(original);
+    assert!(HostExportRoot::open_fresh(path).is_err());
+    let recovered =
+        HostExportLease::reattach(HostExportRoot::reopen(path, &identity).unwrap()).unwrap();
+    recovered.verify().unwrap();
+    assert_eq!(
+        fs::read(&marker).unwrap(),
+        b"original persistent mount contents"
+    );
+    let second = HostExportRoot::reopen(path, &identity).unwrap();
+    assert!(HostExportLease::reattach(second).is_err());
+    fs::remove_file(marker).unwrap();
+}
+
+#[test]
 #[ignore = "requires root and a caller-owned group-restricted export"]
 fn held_lease_refuses_permission_widening() {
     use std::{fs, os::unix::fs::PermissionsExt};

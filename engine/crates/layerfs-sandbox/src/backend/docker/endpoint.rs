@@ -13,6 +13,35 @@ impl Sandbox {
         id: ContainerId,
         request: super::SandboxRequest,
     ) -> Result<Self, Box<WireFailure>> {
+        Self::reopen_inner(docker, id, request, false)
+    }
+
+    /// Observes the exact running exported container after the controller has
+    /// independently fenced its predecessor and reacquired the saved export
+    /// identity and lease. No lifecycle or Workspace operation is replayed.
+    #[cfg(target_os = "linux")]
+    pub fn reattach_exported(
+        docker: super::Docker,
+        id: ContainerId,
+        request: super::SandboxRequest,
+        expected: &crate::host_export::ExportIdentity,
+    ) -> Result<Self, Box<WireFailure>> {
+        let export = request.host_export.as_ref();
+        let valid = export
+            .is_some_and(|lease| lease.root().identity() == expected && lease.verify().is_ok());
+        let owner = Self::reopen_inner(docker, id, request, true)?;
+        if !valid {
+            return Err(owner.invalid("saved host export identity"));
+        }
+        Ok(owner)
+    }
+
+    fn reopen_inner(
+        docker: super::Docker,
+        id: ContainerId,
+        request: super::SandboxRequest,
+        exported: bool,
+    ) -> Result<Self, Box<WireFailure>> {
         let owner = Self {
             docker,
             id,
@@ -32,9 +61,11 @@ impl Sandbox {
             .check()
             .map_err(|_| owner.invalid("saved deployment"))?;
         #[cfg(target_os = "linux")]
-        if owner.request.host_export.is_some() {
+        if owner.request.host_export.is_some() != exported {
             return Err(owner.invalid("host export reopen requires fenced recovery"));
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = exported;
         owner.endpoint()?;
         Ok(owner)
     }

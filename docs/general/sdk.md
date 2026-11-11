@@ -98,6 +98,16 @@ startup and sends no second install. Its manifest must match the supplied Projec
 only the populated daemon SQLite version may differ from the host Init manifest.
 A mismatched selection fails at Validate before deployment or control effects.
 
+Linux controllers may explicitly call `SandboxApi::reattach_exported` after
+independently fencing their previous owner and validating durable freshness.
+It reacquires the saved export root with `HostExportLease::reattach`, checks the
+exact container topology and original export identity, authenticates the saved
+daemon peer and requires the original daemon incarnation in Hello. It sends no
+Create, Start, Install, Bind, Attach, Commit or command. Existing mounts and
+unknown earlier outcomes remain untouched. The ordinary `Sandbox::reopen`
+continues to reject exported deployments; local locks and matching identity
+numbers alone never authorize recovery.
+
 [Close](../../engine/crates/layerfs-api/src/sandbox/close.rs) consumes the owner. It
 attempts the original one-second stop once, then deletes once after acknowledged
 stop, with force=false and v=false. Stop failure does not attempt delete. Either

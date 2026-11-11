@@ -12,6 +12,8 @@ pub(crate) mod exec;
 mod host_workspace;
 mod mount;
 mod mount_observed;
+#[cfg(target_os = "linux")]
+mod reattach;
 mod status;
 mod unmount;
 mod unmount_observed;

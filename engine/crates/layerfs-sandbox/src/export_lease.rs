@@ -21,6 +21,27 @@ pub struct HostExportLease {
 }
 
 impl HostExportLease {
+    /// Reacquires the exact saved export directory for an independently fenced
+    /// controller. Existing Workspace mounts remain in place. The caller must
+    /// validate the saved root identity before this call and prove the previous
+    /// controller cannot issue further effects. The successful local lock does
+    /// not establish durable freshness or settle an unknown operation.
+    pub fn reattach(root: HostExportRoot) -> io::Result<Self> {
+        root.verify()?;
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let file = File::from(open(root.path(), flags, Mode::empty())?);
+        root.matches_descriptor(&file)?;
+        let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, error)| io::Error::from(error))?;
+        let lease = Self {
+            root,
+            lock,
+            create_attempted: AtomicBool::new(true),
+        };
+        lease.verify()?;
+        Ok(lease)
+    }
+
     /// Attempts the directory lock without waiting and retains the root guard.
     /// No file is created or modified. An uncertain Sandbox result must keep
     /// this owner and its independent durable intent, not retry the operation.
