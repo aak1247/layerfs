@@ -64,10 +64,66 @@ pub(super) fn config<R: Read>(
     Ok(bits == 15 && valid && labelled)
 }
 pub(super) fn host<R: Read>(j: &mut Json<R>) -> Result<bool, RuntimeError> {
+    host_inner(j, None)
+}
+pub(super) fn created_host<R: Read>(j: &mut Json<R>, port: u16) -> Result<bool, RuntimeError> {
+    host_inner(j, Some(port))
+}
+fn host_inner<R: Read>(j: &mut Json<R>, port: Option<u16>) -> Result<bool, RuntimeError> {
     let mut bits = 0;
+    let mut extra = 0_u16;
     let mut valid = true;
     j.object(|j, key| {
-        if key.equals("Privileged") {
+        if let Some(port) = port.filter(|_| key.equals("PortBindings")) {
+            created_field(&mut extra, 1)?;
+            valid &= created_ports(j, port)?;
+        } else if port.is_some() && key.equals("NetworkMode") {
+            created_field(&mut extra, 2)?;
+            valid &= j.string_equals("bridge")?;
+        } else if port.is_some() && key.equals("PidMode") {
+            created_field(&mut extra, 4)?;
+            valid &= j.string_equals("")?;
+        } else if port.is_some() && key.equals("IpcMode") {
+            created_field(&mut extra, 8)?;
+            valid &= j.string_equals("private")?;
+        } else if port.is_some() && key.equals("UsernsMode") {
+            created_field(&mut extra, 16)?;
+            valid &= j.string_equals("")?;
+        } else if port.is_some() && key.equals("UTSMode") {
+            created_field(&mut extra, 32)?;
+            valid &= j.string_equals("")?;
+        } else if port.is_some() && key.equals("AutoRemove") {
+            created_field(&mut extra, 64)?;
+            valid &= !j.boolean()?;
+        } else if port.is_some() && key.equals("PublishAllPorts") {
+            created_field(&mut extra, 128)?;
+            valid &= !j.boolean()?;
+        } else if port.is_some() && key.equals("ReadonlyRootfs") {
+            created_field(&mut extra, 256)?;
+            valid &= !j.boolean()?;
+        } else if port.is_some()
+            && (key.equals("Binds")
+                || key.equals("VolumesFrom")
+                || key.equals("ExtraHosts")
+                || key.equals("Links")
+                || key.equals("GroupAdd")
+                || key.equals("DeviceRequests")
+                || key.equals("DeviceCgroupRules"))
+        {
+            if !j.null()? {
+                j.array(|j| {
+                    valid = false;
+                    j.skip(3)
+                })?;
+            }
+        } else if port.is_some() && key.equals("Tmpfs") {
+            if !j.null()? {
+                j.object(|j, _| {
+                    valid = false;
+                    j.skip(3)
+                })?;
+            }
+        } else if key.equals("Privileged") {
             once(&mut bits, 1)?;
             valid &= !j.boolean()?;
         } else if key.equals("SecurityOpt") {
@@ -117,7 +173,43 @@ pub(super) fn host<R: Read>(j: &mut Json<R>) -> Result<bool, RuntimeError> {
         }
         Ok(())
     })?;
-    Ok(bits == 127 && valid)
+    Ok(bits == 127 && valid && (port.is_none() || extra == 511))
+}
+fn created_field(bits: &mut u16, bit: u16) -> Result<(), RuntimeError> {
+    if *bits & bit != 0 {
+        return Err(RuntimeError::Protocol("duplicate Created host field"));
+    }
+    *bits |= bit;
+    Ok(())
+}
+fn created_ports<R: Read>(j: &mut Json<R>, port: u16) -> Result<bool, RuntimeError> {
+    let mut keys = 0;
+    let mut count = 0;
+    let mut valid = true;
+    j.object(|j, key| {
+        keys += 1;
+        valid &= key.equals(&format!("{port}/tcp"));
+        j.array(|j| {
+            count += 1;
+            let mut bits = 0;
+            j.object(|j, key| {
+                if key.equals("HostIp") {
+                    once(&mut bits, 1)?;
+                    valid &= j.string_equals("127.0.0.1")?;
+                } else if key.equals("HostPort") {
+                    once(&mut bits, 2)?;
+                    valid &= j.string_equals("")?;
+                } else {
+                    valid = false;
+                    j.skip(4)?;
+                }
+                Ok(())
+            })?;
+            valid &= bits == 3;
+            Ok(())
+        })
+    })?;
+    Ok(keys == 1 && count == 1 && valid)
 }
 /// Exactly the one FUSE character device, under its own path.
 fn fuse_device<R: Read>(j: &mut Json<R>) -> Result<bool, RuntimeError> {

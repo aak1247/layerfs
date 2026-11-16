@@ -44,6 +44,21 @@ only the exact acknowledged container/local writable layer with volume deletion
 disabled. There is no Drop cleanup. Partial Create IDs remain observed response
 facts, never automatically adopted resource ownership.
 
+A controller that retained an original Create with a lost reply may explicitly
+select its exact, independently authenticated Created result through
+`Docker::observe_created`. This checks the original ID/image/deployment,
+never-started state, plain local volume, loopback-only unallocated port and
+private host namespaces. It is GET-only. The caller must additionally preserve
+and authenticate its pre-send nonce/scope, Engine, image defaults and original
+failure, and prove that Upload has never been attempted. One matching label or
+an Engine 404 does not grant creation or continuation authority.
+`SandboxApi::continue_created_file_observed` consumes that selected ID, omits
+Create, and invokes the caller's durable Created and BeforeUpload observations
+before the first Upload. It then uses the ordinary BeforeStart/BeforeInstall
+boundaries. A claim or unknown later effect forbids restarting this continuation;
+the SDK does not resolve controller restart, permissions or custody by itself.
+Original Create failure evidence remains separate from this later observation.
+
 After Start, the caller-selected absolute startup deadline covers nonblocking
 Unix connection admission, request/header transfer, buffered body input and log
 frames. Unix EAGAIN is a failed original admission; only EINPROGRESS gets one

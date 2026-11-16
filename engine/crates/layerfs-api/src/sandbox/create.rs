@@ -193,8 +193,10 @@ pub struct ManagedSandbox {
 pub enum SandboxMilestone {
     /// Before the Engine receives the container Create request.
     BeforeCreate,
-    /// The exact container ID has been acknowledged.
+    /// The exact original container ID was acknowledged or independently observed.
     Created,
+    /// Before the first private executable/configuration Upload is sent.
+    BeforeUpload,
     /// Private configuration and executable upload was acknowledged.
     Uploaded,
     /// Before the Engine receives the container Start request.
@@ -286,6 +288,34 @@ impl SandboxApi {
         manifest: &layerfs_bridge::provision::StoreManifest,
         mut observer: impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
     ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
+        self.create_file_continuation(request, store, manifest, None, &mut observer)
+    }
+
+    /// Continues the never-uploaded, never-started container selected from the
+    /// original Create attempt. This observes that exact ID; it never sends
+    /// Create. The caller must first persist and authenticate the original
+    /// request, Engine, unique creation scope, identity and lost-reply evidence.
+    /// Its observer must persist Created before the first Upload. A later
+    /// uncertain Upload, Start or Install must not call this method again.
+    pub fn continue_created_file_observed(
+        &self,
+        request: SandboxCreate,
+        store: &layerfs_persistence::SealedStore,
+        manifest: &layerfs_bridge::provision::StoreManifest,
+        container: layerfs_sandbox::ContainerId,
+        mut observer: impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
+    ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
+        self.create_file_continuation(request, store, manifest, Some(container), &mut observer)
+    }
+
+    fn create_file_continuation(
+        &self,
+        request: SandboxCreate,
+        store: &layerfs_persistence::SealedStore,
+        manifest: &layerfs_bridge::provision::StoreManifest,
+        created: Option<layerfs_sandbox::ContainerId>,
+        mut observer: impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
+    ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
         let existing = request.setup.existing_store.is_some();
         if let Some(selected) = &request.setup.existing_store {
             let mut expected = manifest.clone();
@@ -304,7 +334,7 @@ impl SandboxApi {
                 }));
             }
         }
-        let mut owner = create_observed(&self.docker, request, None, &mut observer)?;
+        let mut owner = create_observed_from(&self.docker, request, None, created, &mut observer)?;
         if existing {
             // The original startup already selected and waited for this Store.
             // Installing again would change the existing one-attempt lifecycle.
@@ -470,6 +500,15 @@ fn create_observed(
     recovery: Option<RecoveryWorkspaceSetup>,
     observer: &mut impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
 ) -> Result<ManagedSandbox, Box<SandboxFailure>> {
+    create_observed_from(docker, request, recovery, None, observer)
+}
+fn create_observed_from(
+    docker: &Docker,
+    request: SandboxCreate,
+    recovery: Option<RecoveryWorkspaceSetup>,
+    created: Option<layerfs_sandbox::ContainerId>,
+    observer: &mut impl FnMut(SandboxObservation<'_>) -> io::Result<()>,
+) -> Result<ManagedSandbox, Box<SandboxFailure>> {
     let mut phase = SandboxPhase::Validate;
     let mut sandbox = None;
     let mut control = None;
@@ -547,14 +586,21 @@ fn create_observed(
         }
         phase = SandboxPhase::Executable;
         let mut file = File::open(&request.executable).map_err(SandboxCause::Io)?;
-        phase = SandboxPhase::Record;
-        record(observer, SandboxMilestone::BeforeCreate, None, None, None)?;
-        phase = SandboxPhase::Create;
-        sandbox = Some(
+        sandbox = Some(if let Some(id) = created {
+            // The caller owns the original Create and admits only its untouched
+            // result. Observation never clears an unknown subsequent effect.
+            phase = SandboxPhase::Create;
+            docker
+                .observe_created(id, request.deployment.clone())
+                .map_err(SandboxCause::Runtime)?
+        } else {
+            phase = SandboxPhase::Record;
+            record(observer, SandboxMilestone::BeforeCreate, None, None, None)?;
+            phase = SandboxPhase::Create;
             docker
                 .create_sandbox(request.deployment.clone())
-                .map_err(SandboxCause::Create)?,
-        );
+                .map_err(SandboxCause::Create)?
+        });
         phase = SandboxPhase::Record;
         record(
             observer,
@@ -564,6 +610,14 @@ fn create_observed(
             None,
         )?;
         let owner = sandbox.as_mut().expect("acknowledged container");
+        phase = SandboxPhase::Record;
+        record(
+            observer,
+            SandboxMilestone::BeforeUpload,
+            Some(owner),
+            None,
+            None,
+        )?;
         phase = SandboxPhase::Upload;
         owner
             .upload(&mut file, &config)

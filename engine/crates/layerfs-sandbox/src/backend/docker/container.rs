@@ -9,6 +9,17 @@ use super::{
 use crate::{ContainerId, RuntimeError, WireFailure};
 use std::io::{self, Read, Write};
 impl SandboxRequest {
+    /// Validated exact JSON body of this request's single Create attempt.
+    /// This performs no Engine request and consumes no host export admission.
+    /// A caller may persist it before sending, to bind later observation to
+    /// the original declaration. It is not authority to adopt a container.
+    pub fn create_body(&self) -> Result<Vec<u8>, RuntimeError> {
+        self.check()?;
+        let mut body = Vec::new();
+        self.encode(&mut body)?;
+        Ok(body)
+    }
+
     /// Kernel mounting needs exactly one capability and one device. The
     /// container stays unprivileged with no-new-privileges; commands run as
     /// their own nonroot identity and inherit neither.
@@ -48,7 +59,7 @@ impl SandboxRequest {
 }
 impl Docker {
     /// One read of an existing exact plain local volume; it has no create effect.
-    fn plain_volume(&self, name: &str) -> Result<(), Box<WireFailure>> {
+    pub(super) fn plain_volume(&self, name: &str) -> Result<(), Box<WireFailure>> {
         let mut response = self.exchange("GET", &format!("/volumes/{name}"), false, |_| Ok(()))?;
         if response.status != 200 {
             return Err(response.fail(RuntimeError::Http(response.status), None));

@@ -1015,6 +1015,7 @@ fn recovery_observer_before_start_retains_authority_and_uploads_recovery_record(
         [
             SandboxMilestone::BeforeCreate,
             SandboxMilestone::Created,
+            SandboxMilestone::BeforeUpload,
             SandboxMilestone::Uploaded,
             SandboxMilestone::BeforeStart,
         ]
@@ -1086,6 +1087,7 @@ fn recovered_owner_and_failed_close_preserve_original_recovery_authority() {
         [
             SandboxMilestone::BeforeCreate,
             SandboxMilestone::Created,
+            SandboxMilestone::BeforeUpload,
             SandboxMilestone::Uploaded,
             SandboxMilestone::BeforeStart,
             SandboxMilestone::Started,
@@ -1161,6 +1163,7 @@ fn lifecycle_observer_failure_before_start_keeps_original_container() {
         [
             SandboxMilestone::BeforeCreate,
             SandboxMilestone::Created,
+            SandboxMilestone::BeforeUpload,
             SandboxMilestone::Uploaded,
             SandboxMilestone::BeforeStart
         ]
@@ -1272,6 +1275,7 @@ fn lifecycle_observer_failure_after_hello_keeps_control_and_original_status() {
         [
             SandboxMilestone::BeforeCreate,
             SandboxMilestone::Created,
+            SandboxMilestone::BeforeUpload,
             SandboxMilestone::Uploaded,
             SandboxMilestone::BeforeStart,
             SandboxMilestone::Started,
@@ -1280,4 +1284,65 @@ fn lifecycle_observer_failure_after_hello_keeps_control_and_original_status() {
     );
     assert_eq!(peer.finish().len(), 6);
     daemon.join().unwrap();
+}
+
+#[test]
+fn created_continuation_records_upload_claim_before_any_new_effect() {
+    let project = ProjectFixture::new();
+    let (mut request, _) = recovery_inputs(&project);
+    request.setup.existing_store = None;
+    let framed = endpoint(12345);
+    let body = std::str::from_utf8(&framed)
+        .unwrap()
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .1;
+    let body = body
+        .replace(r#""State":{"Running":true,"Paused":false,"Restarting":false,"Dead":false}"#,
+            r#""RestartCount":0,"State":{"Status":"created","Running":false,"Paused":false,"Restarting":false,"OOMKilled":false,"Dead":false,"Pid":0,"ExitCode":0,"Error":"","StartedAt":"0001-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}"#)
+        .replace(r#""LogConfig":{"Type":"json-file"}"#,
+            r#""LogConfig":{"Type":"json-file"},"PortBindings":{"30421/tcp":[{"HostIp":"127.0.0.1","HostPort":""}]},"NetworkMode":"bridge","PidMode":"","IpcMode":"private","UsernsMode":"","UTSMode":"","AutoRemove":false,"PublishAllPorts":false,"ReadonlyRootfs":false"#);
+    let (docker, peer) = Peer::new(
+        vec![
+            fixed(
+                200,
+                br#"{"Name":"lfs-test-borrowed","Driver":"local","Scope":"local","Options":null}"#,
+            ),
+            fixed(200, body.as_bytes()),
+        ],
+        4096,
+    );
+    let mut seen = Vec::new();
+    let result = SandboxApi::new(docker).continue_created_file_observed(
+        request,
+        &project.project.store,
+        &project.project.manifest,
+        layerfs_sandbox::ContainerId::parse(CID).unwrap(),
+        |at| {
+            seen.push(at.milestone);
+            if at.milestone == SandboxMilestone::BeforeUpload {
+                Err(std::io::Error::other("durable upload claim unavailable"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    let Err(failure) = result else {
+        panic!("Upload must await its persisted claim")
+    };
+    assert_eq!(failure.phase, SandboxPhase::Record);
+    assert!(matches!(
+        failure.cause,
+        SandboxCause::Observer {
+            milestone: SandboxMilestone::BeforeUpload,
+            ..
+        }
+    ));
+    assert_eq!(
+        seen,
+        [SandboxMilestone::Created, SandboxMilestone::BeforeUpload]
+    );
+    let calls = peer.finish();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|call| call.starts_with(b"GET ")));
 }
