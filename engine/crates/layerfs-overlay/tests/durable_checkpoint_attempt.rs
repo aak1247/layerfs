@@ -2,8 +2,8 @@
 #![cfg(target_os = "linux")]
 
 use layerfs_overlay::{
-    Changes, CleanupState, Inode, InodeKind, MaintenanceCursor, Overlay, OverlayError,
-    ProfileConfig,
+    Changes, CheckpointOutcome, CleanupState, Inode, InodeKind, MaintenanceCursor, Overlay,
+    OverlayError, ProfileConfig,
 };
 use std::{
     fs,
@@ -678,4 +678,177 @@ fn changed_reader_floor_cannot_release_during_scheduled_fold() {
         )
         .unwrap();
     assert_eq!(row, (3, 0, 0));
+}
+
+fn commit_id(tag: u8) -> [u8; 33] {
+    let mut id = [tag; 33];
+    id[0] = 0x12;
+    id
+}
+
+#[test]
+fn known_checkpoint_install_retains_original_outcome_and_later_writes() {
+    for outcome in [
+        CheckpointOutcome::Committed {
+            head: commit_id(1),
+            displaced: Some(commit_id(2)),
+        },
+        CheckpointOutcome::UpToDate { head: None },
+    ] {
+        let fixture = Fixture::new();
+        let db = fixture.create();
+        let recorded = db
+            .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+            .unwrap();
+        let request_id = u64::try_from(recorded.capture().generation.number()).unwrap();
+        let reader = db
+            .acquire_recorded_captured_reader(recorded, request_id)
+            .unwrap();
+        let operation = db
+            .acquire_recorded_captured_operation(recorded, request_id, reader)
+            .unwrap();
+        let source = db.acquire_base_source(99).unwrap();
+        let publication = db
+            .apply(
+                source,
+                &Changes {
+                    inodes: vec![Inode {
+                        serial: 61,
+                        kind: InodeKind::File,
+                        mode: 0o600,
+                        mtime_seconds: 20,
+                        mtime_nanoseconds: 987_654_321,
+                        nlink: 1,
+                        size: 0,
+                        inherited_cutoff: 0,
+                        born: 0,
+                        entries: 0,
+                        subdirs: 0,
+                    }],
+                    ..Changes::default()
+                },
+            )
+            .unwrap();
+        db.reply_attempted(publication).unwrap();
+        db.release_base_source(source).unwrap();
+        let request = b"LFCP\x01known publication";
+        let digest = request_digest(request);
+        let candidate = [18; 32];
+        let target = b"target snapshot";
+        let installed = b"verified installed branch snapshot";
+        db.prepare_checkpoint_publication(recorded, request, digest, candidate, target)
+            .unwrap();
+        let before = db.state().unwrap();
+        assert!(db
+            .install_recorded_checkpoint(recorded, [0; 32], candidate, target, installed, outcome)
+            .is_err());
+        assert!(db
+            .install_recorded_checkpoint(recorded, digest, [19; 32], target, installed, outcome)
+            .is_err());
+        assert_eq!(db.state().unwrap(), before);
+        db.install_recorded_checkpoint(recorded, digest, candidate, target, installed, outcome)
+            .unwrap();
+        let state = db.state().unwrap();
+        assert_eq!(state.base_root, candidate);
+        assert_eq!(state.dirty_inodes, 1);
+        assert_eq!(
+            db.durable_binding().unwrap().as_deref(),
+            Some(installed.as_slice())
+        );
+        assert_eq!(db.active_inodes(0).unwrap()[0].serial, 61);
+        assert!(db
+            .install_recorded_checkpoint(recorded, digest, candidate, target, installed, outcome)
+            .is_err());
+        db.release_captured_reader(reader).unwrap();
+        db.release_operation(operation).unwrap();
+        assert!(db.capture().is_err());
+        drop(db);
+        let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+        let row: (i64, i64, Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>, i64, i64) = sql.query_row(
+            "SELECT phase,outcome_kind,outcome_head,outcome_displaced,installed_snapshot,reader_released,operation_released FROM durable_checkpoint_attempt WHERE id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+        ).unwrap();
+        let (kind, head, displaced) = match outcome {
+            CheckpointOutcome::Committed { head, displaced } => {
+                (1, Some(head.to_vec()), displaced.map(|id| id.to_vec()))
+            }
+            CheckpointOutcome::UpToDate { head } => (2, head.map(|id| id.to_vec()), None),
+        };
+        assert_eq!(row, (4, kind, head, displaced, installed.to_vec(), 1, 1));
+        drop(sql);
+        assert!(
+            Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).is_err()
+        );
+    }
+}
+
+#[test]
+fn failed_checkpoint_install_retains_original_pending_attempt_and_binding() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch("CREATE TRIGGER fail_checkpoint_retire BEFORE INSERT ON cleanup_task WHEN NEW.kind=3 BEGIN SELECT RAISE(ABORT, 'retire failure'); END;").unwrap();
+    drop(sql);
+    let db =
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = b"LFCP\x01request";
+    let digest = request_digest(request);
+    db.prepare_checkpoint_publication(recorded, request, digest, [18; 32], SNAPSHOT)
+        .unwrap();
+    let before = db.state().unwrap();
+    assert!(db
+        .install_recorded_checkpoint(
+            recorded,
+            digest,
+            [18; 32],
+            SNAPSHOT,
+            b"installed",
+            CheckpointOutcome::UpToDate { head: None }
+        )
+        .is_err());
+    assert_eq!(db.state().unwrap(), before);
+    assert_eq!(db.durable_binding().unwrap().as_deref(), Some(SNAPSHOT));
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let (phase, outcome, retire): (i64, Option<i64>, i64) = sql.query_row(
+        "SELECT phase,outcome_kind,(SELECT count(*) FROM cleanup_task WHERE kind=3) FROM durable_checkpoint_attempt WHERE id=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!((phase, outcome, retire), (2, None, 0));
+}
+
+#[test]
+fn different_target_snapshot_keeps_the_pending_attempt_and_binding() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = b"LFCP\x01request";
+    let digest = request_digest(request);
+    db.prepare_checkpoint_publication(recorded, request, digest, [18; 32], b"target snapshot")
+        .unwrap();
+    let before = db.state().unwrap();
+    assert!(db
+        .install_recorded_checkpoint(
+            recorded,
+            digest,
+            [18; 32],
+            b"forged snapshot",
+            b"installed",
+            CheckpointOutcome::UpToDate { head: None }
+        )
+        .is_err());
+    assert_eq!(db.state().unwrap(), before);
+    assert_eq!(db.durable_binding().unwrap().as_deref(), Some(SNAPSHOT));
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let row: (i64, Vec<u8>, i64) = sql.query_row(
+        "SELECT phase,target_snapshot,(SELECT count(*) FROM cleanup_task WHERE kind=3) FROM durable_checkpoint_attempt WHERE id=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(row, (2, b"target snapshot".to_vec(), 0));
 }

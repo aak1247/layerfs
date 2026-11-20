@@ -1,7 +1,7 @@
 //! Local checkpoint identity. Publication and recovery authority live outside Overlay.
 use crate::{
-    Capture, CapturedReader, OperationOwner, Overlay, OverlayError, OverlayResult, RecordedCapture,
-    StatementKind,
+    Capture, CapturedReader, CheckpointOutcome, OperationOwner, Overlay, OverlayError,
+    OverlayResult, RecordedCapture, StatementKind,
 };
 
 #[cfg(target_os = "linux")]
@@ -15,8 +15,9 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
          namespace INTEGER NOT NULL CHECK(namespace>0), generation INTEGER NOT NULL CHECK(generation>0), \
          revision INTEGER NOT NULL CHECK(revision>=0), base_root BLOB NOT NULL CHECK(length(base_root)=32), \
          snapshot BLOB NOT NULL CHECK(length(snapshot)>0 AND length(snapshot)<=4096), \
-         phase INTEGER NOT NULL CHECK(phase IN(1,2,3)), request BLOB, request_digest BLOB, \
+         phase INTEGER NOT NULL CHECK(phase IN(1,2,3,4)), request BLOB, request_digest BLOB, \
          candidate_root BLOB, target_snapshot BLOB, \
+         outcome_kind INTEGER, outcome_head BLOB, outcome_displaced BLOB, installed_snapshot BLOB, \
          reader_owner INTEGER CHECK(reader_owner>0), reader_request INTEGER, reader_floor INTEGER, reader_released INTEGER, \
          operation_owner INTEGER CHECK(operation_owner>0), operation_released INTEGER, \
          CHECK((reader_owner IS NULL AND reader_request IS NULL AND reader_floor IS NULL AND reader_released IS NULL) OR \
@@ -25,10 +26,19 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
            reader_released IS NOT NULL AND reader_released IN(0,1))), \
          CHECK((operation_owner IS NULL AND operation_released IS NULL) OR \
           (operation_owner IS NOT NULL AND operation_released IS NOT NULL AND operation_released IN(0,1) AND reader_owner IS NOT NULL)), \
-         CHECK((phase IN(1,3) AND request IS NULL AND request_digest IS NULL AND candidate_root IS NULL AND target_snapshot IS NULL) OR \
+         CHECK((phase IN(1,3) AND request IS NULL AND request_digest IS NULL AND candidate_root IS NULL AND target_snapshot IS NULL \
+          AND outcome_kind IS NULL AND outcome_head IS NULL AND outcome_displaced IS NULL AND installed_snapshot IS NULL) OR \
          (phase=2 AND request IS NOT NULL AND request_digest IS NOT NULL AND length(request_digest)=32 AND \
           candidate_root IS NOT NULL AND length(candidate_root)=32 AND target_snapshot IS NOT NULL AND \
-          length(target_snapshot)>0 AND length(target_snapshot)<=4096))) STRICT",
+          length(target_snapshot)>0 AND length(target_snapshot)<=4096 AND outcome_kind IS NULL AND \
+          outcome_head IS NULL AND outcome_displaced IS NULL AND installed_snapshot IS NULL) OR \
+         (phase=4 AND request IS NOT NULL AND request_digest IS NOT NULL AND length(request_digest)=32 AND \
+          candidate_root IS NOT NULL AND length(candidate_root)=32 AND target_snapshot IS NOT NULL AND \
+          length(target_snapshot)>0 AND length(target_snapshot)<=4096 AND installed_snapshot IS NOT NULL AND \
+          length(installed_snapshot)>0 AND length(installed_snapshot)<=4096 AND outcome_kind IS NOT NULL AND \
+          ((outcome_kind=1 AND outcome_head IS NOT NULL AND length(outcome_head)=33 AND \
+            (outcome_displaced IS NULL OR length(outcome_displaced)=33)) OR \
+           (outcome_kind=2 AND (outcome_head IS NULL OR length(outcome_head)=33) AND outcome_displaced IS NULL))))) STRICT",
         &[],
         0,
     )?;
@@ -115,6 +125,17 @@ fn identity(
     *hash.finalize().as_bytes()
 }
 
+struct AttemptContext {
+    workspace: Vec<u8>,
+    catalog: Vec<u8>,
+    incarnation: i64,
+    snapshot: Vec<u8>,
+    phase: i64,
+    reader_floor: Option<i64>,
+    candidate: Option<Vec<u8>>,
+    installed_snapshot: Option<Vec<u8>>,
+}
+
 /// Checks the complete original context before a recorded owner or send stage.
 pub(crate) fn check_original(db: &Overlay, recorded: RecordedCapture) -> OverlayResult<i64> {
     check_context(db, recorded, true)
@@ -130,9 +151,9 @@ fn check_context(db: &Overlay, recorded: RecordedCapture, starting: bool) -> Ove
         .durable_namespace()?
         .filter(|value| *value > 0)
         .ok_or(OverlayError::Invalid("recorded capture namespace"))?;
-    let original: Vec<(Vec<u8>, Vec<u8>, i64, Vec<u8>, i64, Option<i64>)> = db.query(
+    let original: Vec<AttemptContext> = db.query(
         StatementKind::Frontier,
-        "SELECT workspace,catalog,incarnation,snapshot,phase,reader_floor FROM durable_checkpoint_attempt \
+        "SELECT workspace,catalog,incarnation,snapshot,phase,reader_floor,candidate_root,installed_snapshot FROM durable_checkpoint_attempt \
          WHERE id=1 AND attempt=?1 AND namespace=?2 AND generation=?3 \
          AND revision=?4 AND base_root=?5",
         &[
@@ -143,25 +164,19 @@ fn check_context(db: &Overlay, recorded: RecordedCapture, starting: bool) -> Ove
             &capture.base_root.as_slice(),
         ],
         112,
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        },
+        |row| Ok(AttemptContext {
+            workspace: row.get(0)?, catalog: row.get(1)?, incarnation: row.get(2)?,
+            snapshot: row.get(3)?, phase: row.get(4)?, reader_floor: row.get(5)?,
+            candidate: row.get(6)?, installed_snapshot: row.get(7)?,
+        }),
     )?;
-    let [(workspace, catalog, incarnation, snapshot, phase, reader_floor)] = original.as_slice()
-    else {
+    let [original] = original.as_slice() else {
         return Err(OverlayError::Invalid("checkpoint publication predecessor"));
     };
-    if (starting && *phase != 1) || (!starting && ![1, 2, 3].contains(phase)) {
+    if (starting && original.phase != 1) || (!starting && ![1, 2, 3, 4].contains(&original.phase)) {
         return Err(OverlayError::Invalid("checkpoint publication predecessor"));
     }
-    match *phase {
+    match original.phase {
         1 | 2 => db.checked_capture(capture)?,
         3 if capture.engine() == db.identity
             && state.captured.is_none()
@@ -169,10 +184,21 @@ fn check_context(db: &Overlay, recorded: RecordedCapture, starting: bool) -> Ove
             && state.installed < capture.generation.0
             && capture.generation.0.checked_add(1) == Some(state.active.0)
             && state.revision >= capture.revision
-            && reader_floor.is_none_or(|floor| floor == state.installed)
+            && original
+                .reader_floor
+                .is_none_or(|floor| floor == state.installed)
             && state
                 .consolidating
                 .is_none_or(|value| value == capture.generation) => {}
+        4 if capture.engine() == db.identity
+            && state.captured.is_none()
+            && state.captured_revision.is_none()
+            && state.consolidating.is_none()
+            && state.installed == capture.generation.0
+            && capture.generation.0.checked_add(1) == Some(state.active.0)
+            && state.revision >= capture.revision
+            && original.candidate.as_deref() == Some(state.base_root.as_slice())
+            && original.installed_snapshot.is_some() => {}
         _ => return Err(OverlayError::Invalid("checkpoint fold state")),
     }
     let identities: Vec<Vec<u8>> = db.query(
@@ -182,19 +208,24 @@ fn check_context(db: &Overlay, recorded: RecordedCapture, starting: bool) -> Ove
         0,
         |row| row.get(0),
     )?;
-    if workspace.len() != 32
-        || catalog.len() != 32
-        || *incarnation <= 0
+    let expected_binding = if original.phase == 4 {
+        original.installed_snapshot.as_deref()
+    } else {
+        Some(original.snapshot.as_slice())
+    };
+    if original.workspace.len() != 32
+        || original.catalog.len() != 32
+        || original.incarnation <= 0
         || identities.len() != 1
-        || identities.first() != Some(workspace)
-        || db.durable_binding()?.as_deref() != Some(snapshot.as_slice())
+        || identities.first() != Some(&original.workspace)
+        || db.durable_binding()?.as_deref() != expected_binding
         || identity(
-            workspace,
-            catalog,
-            *incarnation,
+            &original.workspace,
+            &original.catalog,
+            original.incarnation,
             namespace,
             capture,
-            snapshot,
+            &original.snapshot,
         ) != recorded.attempt
     {
         return Err(OverlayError::Invalid("checkpoint original identity"));
@@ -387,6 +418,79 @@ impl Overlay {
                 return Err(OverlayError::Invalid("checkpoint fold predecessor"));
             }
             self.schedule_failed_capture(recorded.capture)
+        })
+    }
+
+    /// Installs the candidate after the caller verifies the exact Store receipt.
+    /// The original attempt and outcome remain recorded until owner cleanup is
+    /// independently settled; these bytes alone do not authorize recovery.
+    pub fn install_recorded_checkpoint(
+        &self,
+        recorded: RecordedCapture,
+        request_digest: [u8; 32],
+        candidate_root: [u8; 32],
+        expected_target_snapshot: &[u8],
+        installed_snapshot: &[u8],
+        outcome: CheckpointOutcome,
+    ) -> OverlayResult<()> {
+        if installed_snapshot.is_empty() || installed_snapshot.len() > 4096 {
+            return Err(OverlayError::Invalid("checkpoint installed snapshot"));
+        }
+        let (kind, head, displaced) = match outcome {
+            CheckpointOutcome::Committed { head, displaced } => (1_i64, Some(head), displaced),
+            CheckpointOutcome::UpToDate { head } => (2_i64, head, None),
+        };
+        if head.as_ref().is_some_and(|id| id[0] != 0x12)
+            || displaced.as_ref().is_some_and(|id| id[0] != 0x12)
+        {
+            return Err(OverlayError::Invalid("checkpoint outcome identity"));
+        }
+        self.atomic_cleanup(|| {
+            let namespace = check_context(self, recorded, false)?;
+            if !self.install_ready(recorded.capture)? {
+                return Err(OverlayError::BaseSourcesPending);
+            }
+            let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = self.query(
+                StatementKind::Frontier,
+                "SELECT request,request_digest,candidate_root,target_snapshot FROM durable_checkpoint_attempt \
+                 WHERE id=1 AND phase=2 AND attempt=?1 AND namespace=?2",
+                &[&recorded.attempt.as_slice(), &namespace],
+                112,
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let [(request, digest, candidate, target)] = rows.as_slice() else {
+                return Err(OverlayError::Invalid("checkpoint install predecessor"));
+            };
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"layerfs/checkpoint-request/v1\0");
+            hash.update(request);
+            if !request.starts_with(b"LFCP\x01")
+                || digest.as_slice() != request_digest
+                || *hash.finalize().as_bytes() != request_digest
+                || candidate.as_slice() != candidate_root
+                || target.is_empty()
+                || target.len() > 4096
+                || target.as_slice() != expected_target_snapshot
+            {
+                return Err(OverlayError::Invalid("checkpoint install identity"));
+            }
+            let head = head.as_ref().map(|id| id.as_slice());
+            let displaced = displaced.as_ref().map(|id| id.as_slice());
+            let changed = self.execute(
+                StatementKind::Frontier,
+                "UPDATE durable_checkpoint_attempt SET phase=4,outcome_kind=?1,outcome_head=?2,\
+                 outcome_displaced=?3,installed_snapshot=?4 WHERE id=1 AND phase=2 AND attempt=?5 \
+                 AND namespace=?6 AND request_digest=?7 AND candidate_root=?8",
+                &[
+                    &kind, &head, &displaced, &installed_snapshot, &recorded.attempt.as_slice(),
+                    &namespace, &request_digest.as_slice(), &candidate_root.as_slice(),
+                ],
+                installed_snapshot.len() as u64 + 160,
+            )?;
+            if changed != 1 {
+                return Err(OverlayError::Invalid("checkpoint install predecessor"));
+            }
+            self.install_captured_inner(recorded.capture, candidate_root, Some(installed_snapshot))
         })
     }
 

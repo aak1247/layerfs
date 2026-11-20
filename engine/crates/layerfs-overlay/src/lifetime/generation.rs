@@ -38,23 +38,29 @@ impl Overlay {
                     "recorded capture requires disposition",
                 ));
             }
-            match snapshot {
-                Some(snapshot) => {
-                    self.install_durable_binding(capture.base_root, root, snapshot)?
-                }
-                None => self.invalidate_durable_binding(root)?,
-            }
-            self.change_state(|state| {
-                state.base_root = root;
-                state.installed = capture.generation.0;
-                state.captured = None;
-                state.captured_revision = None;
-                Ok(())
-            })?;
-            self.enqueue(crate::maintenance::RETIRE, 0, capture.generation.0)?;
-            self.wake_orphan_sources(capture.generation.0)?;
-            Ok(())
+            self.install_captured_inner(capture, root, snapshot)
         })
+    }
+    pub(crate) fn install_captured_inner(
+        &self,
+        capture: Capture,
+        root: [u8; 32],
+        snapshot: Option<&[u8]>,
+    ) -> OverlayResult<()> {
+        match snapshot {
+            Some(snapshot) => self.install_durable_binding(capture.base_root, root, snapshot)?,
+            None => self.invalidate_durable_binding(root)?,
+        }
+        self.change_state(|state| {
+            state.base_root = root;
+            state.installed = capture.generation.0;
+            state.captured = None;
+            state.captured_revision = None;
+            Ok(())
+        })?;
+        self.enqueue(crate::maintenance::RETIRE, 0, capture.generation.0)?;
+        self.wake_orphan_sources(capture.generation.0)?;
+        Ok(())
     }
     /// Readiness before the one known-install attempt. The daemon fences later
     /// source acquisitions and parks the original job until exact releases.

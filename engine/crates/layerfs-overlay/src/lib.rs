@@ -31,6 +31,7 @@ pub(crate) use maintenance::work as reclaim;
 
 pub use close::CleanupState;
 pub use compound::SourceRows;
+pub use contract::checkpoint::CheckpointOutcome;
 pub use contract::custody::{CapturedReader, FileRead, LookupOwner, OpenFile, OperationOwner};
 pub use contract::indexed_operation_record::{
     indexed_operation_record_changes_bytes, IndexedOperationRecordApply,
