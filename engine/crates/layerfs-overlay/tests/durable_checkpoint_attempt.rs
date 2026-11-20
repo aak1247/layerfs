@@ -1,6 +1,9 @@
 //! The original capture and its prepublication identity share one transaction.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema43.rs"]
+mod durable_schema43;
+
 use layerfs_overlay::{
     Changes, CheckpointOutcome, CleanupState, Inode, InodeKind, MaintenanceCursor, Overlay,
     OverlayError, ProfileConfig,
@@ -648,6 +651,7 @@ fn failed_fold_schedule_rolls_back_phase_and_original_capture() {
 fn changed_reader_floor_cannot_release_during_scheduled_fold() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema43::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER alter_fold_floor AFTER UPDATE OF phase ON durable_checkpoint_attempt WHEN NEW.phase=3 BEGIN UPDATE durable_checkpoint_attempt SET reader_floor=0 WHERE id=1; END;").unwrap();
     drop(sql);

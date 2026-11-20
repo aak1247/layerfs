@@ -80,6 +80,24 @@ impl Overlay {
                 "durable overlay requires reconciliation",
             ));
         }
+        if self.profile.schema_version == 44 {
+            super::durable_conflict::verify_schema(self)?;
+            let pending = self.query(
+                StatementKind::Frontier,
+                "SELECT EXISTS(SELECT 1 FROM durable_conflict_plan) \
+                 OR EXISTS(SELECT 1 FROM durable_conflict_page) \
+                 OR EXISTS(SELECT 1 FROM durable_binding WHERE conflict_generation IS NOT NULL) \
+                 OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13)",
+                &[],
+                8,
+                |row| row.get::<_, bool>(0),
+            )?;
+            if pending.as_slice() != [false] {
+                return Err(OverlayError::Invalid(
+                    "durable conflict requires reconciliation",
+                ));
+            }
+        }
         let pending = self.query(
             StatementKind::Frontier,
             super::durable::BOUND_PENDING_SQL,

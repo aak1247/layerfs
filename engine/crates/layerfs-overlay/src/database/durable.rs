@@ -317,10 +317,7 @@ mod linux {
             crate::diagnostics::startup::batch(&db.connection, &db.work, STATE_SCHEMA)?;
             db.execute(
                 StatementKind::Startup,
-                "CREATE TABLE durable_binding(id INTEGER PRIMARY KEY CHECK(id=1), \
-                 root BLOB NOT NULL CHECK(length(root)=32), \
-                 snapshot BLOB NOT NULL CHECK(length(snapshot)>0 AND length(snapshot)<=4096), \
-                 recoverable INTEGER NOT NULL CHECK(recoverable IN(0,1))) STRICT",
+                crate::database::durable_conflict::BINDING_SCHEMA,
                 &[],
                 0,
             )?;
@@ -351,7 +348,8 @@ mod linux {
             )?;
             crate::database::durable_owners::initialize(&db)?;
             crate::database::durable_attempt::initialize(&db)?;
-            db.execute(StatementKind::Startup, "PRAGMA user_version=43", &[], 0)?;
+            crate::database::durable_conflict::initialize(&db)?;
+            db.execute(StatementKind::Startup, "PRAGMA user_version=44", &[], 0)?;
             db.execute(
                 StatementKind::Startup,
                 "PRAGMA application_id=1279676211",
@@ -366,7 +364,7 @@ mod linux {
             )?;
             Ok(())
         })?;
-        db.profile.schema_version = 43;
+        db.profile.schema_version = 44;
         let sync = db.allocation.sync_durable_file().and_then(|_| {
             File::open(
                 path.parent()
@@ -437,7 +435,7 @@ mod linux {
             super::super::profile::readback(&connection, &work, "PRAGMA user_version", |r| {
                 r.get(0)
             })?;
-        if ![39, 40, 41, 42, 43].contains(&profile.schema_version) {
+        if ![39, 40, 41, 42, 43, 44].contains(&profile.schema_version) {
             return Err(OverlayError::Invalid("durable overlay schema version"));
         }
         let integrity: String =
@@ -521,12 +519,29 @@ mod linux {
         } else {
             false
         };
+        // Conflict pages are not yet admitted by ordinary recovery. Until the
+        // exact descriptor and local binding can be authenticated, retain all
+        // such original state rather than interpreting it as idle work.
+        let pending_conflict = if profile.schema_version == 44 {
+            super::super::profile::readback(
+                &connection,
+                &work,
+                "SELECT EXISTS(SELECT 1 FROM durable_conflict_plan) \
+                 OR EXISTS(SELECT 1 FROM durable_conflict_page) \
+                 OR EXISTS(SELECT 1 FROM durable_binding WHERE conflict_generation IS NOT NULL) \
+                 OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13)",
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
         if state.closed
             || state.captured.is_some()
             || state.consolidating.is_some()
             || held
             || pending
             || pending_attempt
+            || pending_conflict
         {
             return Err(OverlayError::Invalid(
                 "durable overlay requires reconciliation",
@@ -571,6 +586,9 @@ mod linux {
             allocation,
             durable: Some(lease),
         };
+        if db.profile.schema_version == 44 {
+            super::super::durable_conflict::verify_schema(&db)?;
+        }
         if db.profile.has_classified_custody() {
             super::super::durable_kept::restore(&db, state.active.0, bound, kept_count)?;
         }

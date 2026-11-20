@@ -5,21 +5,20 @@ use crate::{
 };
 
 #[cfg(target_os = "linux")]
-pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
-    db.execute(
-        StatementKind::Startup,
-        "CREATE TABLE durable_checkpoint_attempt(\
+pub(super) const CHECKPOINT_SCHEMA: &str = "CREATE TABLE durable_checkpoint_attempt(\
          id INTEGER PRIMARY KEY CHECK(id=1), attempt BLOB NOT NULL UNIQUE CHECK(length(attempt)=32), \
          workspace BLOB NOT NULL CHECK(length(workspace)=32), \
          catalog BLOB NOT NULL CHECK(length(catalog)=32), incarnation INTEGER NOT NULL CHECK(incarnation>0), \
          namespace INTEGER NOT NULL CHECK(namespace>0), generation INTEGER NOT NULL CHECK(generation>0), \
          revision INTEGER NOT NULL CHECK(revision>=0), base_root BLOB NOT NULL CHECK(length(base_root)=32), \
          snapshot BLOB NOT NULL CHECK(length(snapshot)>0 AND length(snapshot)<=4096), \
-         phase INTEGER NOT NULL CHECK(phase IN(1,2,3,4)), request BLOB, request_digest BLOB, \
+         original_pending_digest BLOB CHECK(original_pending_digest IS NULL OR length(original_pending_digest)=32), \
+         phase INTEGER NOT NULL CHECK(phase IN(1,2,3,4,5,6)), request BLOB, request_digest BLOB, \
          candidate_root BLOB, target_snapshot BLOB, \
          outcome_kind INTEGER, outcome_head BLOB, outcome_displaced BLOB, installed_snapshot BLOB, \
          reader_owner INTEGER CHECK(reader_owner>0), reader_request INTEGER, reader_floor INTEGER, reader_released INTEGER, \
          operation_owner INTEGER CHECK(operation_owner>0), operation_released INTEGER, operation_cleanup_completed INTEGER, \
+         conflict_generation INTEGER, conflict_cleanup_completed INTEGER, \
          fold_completed INTEGER, retire_completed INTEGER, \
          CHECK((reader_owner IS NULL AND reader_request IS NULL AND reader_floor IS NULL AND reader_released IS NULL) OR \
           (reader_owner IS NOT NULL AND reader_request IS NOT NULL AND reader_request=generation AND \
@@ -29,13 +28,16 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
           (operation_owner IS NOT NULL AND operation_released IS NOT NULL AND operation_released IN(0,1) AND \
            operation_cleanup_completed IS NOT NULL AND operation_cleanup_completed IN(0,1) AND \
            (operation_cleanup_completed=0 OR operation_released=1) AND reader_owner IS NOT NULL)), \
+         CHECK((conflict_generation IS NULL AND conflict_cleanup_completed IS NULL) OR \
+          (conflict_generation IS NOT NULL AND conflict_cleanup_completed IS NOT NULL AND \
+           conflict_generation=generation AND conflict_cleanup_completed IN(0,1))), \
          CHECK((phase IN(1,2) AND fold_completed IS NULL AND retire_completed IS NULL) OR \
-          (phase=3 AND fold_completed IS NOT NULL AND fold_completed IN(0,1) AND retire_completed IS NOT NULL AND \
+          (phase IN(3,6) AND fold_completed IS NOT NULL AND fold_completed IN(0,1) AND retire_completed IS NOT NULL AND \
            retire_completed IN(0,1) AND (retire_completed=0 OR fold_completed=1)) OR \
-          (phase=4 AND fold_completed IS NULL AND retire_completed IS NOT NULL AND retire_completed IN(0,1))), \
-         CHECK((phase IN(1,3) AND request IS NULL AND request_digest IS NULL AND candidate_root IS NULL AND target_snapshot IS NULL \
+          (phase IN(4,5) AND fold_completed IS NULL AND retire_completed IS NOT NULL AND retire_completed IN(0,1))), \
+         CHECK((phase IN(1,3,5) AND request IS NULL AND request_digest IS NULL AND candidate_root IS NULL AND target_snapshot IS NULL \
           AND outcome_kind IS NULL AND outcome_head IS NULL AND outcome_displaced IS NULL AND installed_snapshot IS NULL) OR \
-         (phase=2 AND request IS NOT NULL AND request_digest IS NOT NULL AND length(request_digest)=32 AND \
+         (phase IN(2,6) AND request IS NOT NULL AND request_digest IS NOT NULL AND length(request_digest)=32 AND \
           candidate_root IS NOT NULL AND length(candidate_root)=32 AND target_snapshot IS NOT NULL AND \
           length(target_snapshot)>0 AND length(target_snapshot)<=4096 AND outcome_kind IS NULL AND \
           outcome_head IS NULL AND outcome_displaced IS NULL AND installed_snapshot IS NULL) OR \
@@ -45,20 +47,21 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
           length(installed_snapshot)>0 AND length(installed_snapshot)<=4096 AND outcome_kind IS NOT NULL AND \
           ((outcome_kind=1 AND outcome_head IS NOT NULL AND length(outcome_head)=33 AND \
             (outcome_displaced IS NULL OR length(outcome_displaced)=33)) OR \
-           (outcome_kind=2 AND (outcome_head IS NULL OR length(outcome_head)=33) AND outcome_displaced IS NULL))))) STRICT",
-        &[],
-        0,
-    )?;
-    db.execute(
-        StatementKind::Startup,
-        "CREATE TRIGGER durable_checkpoint_attempt_owner_immutable \
-         BEFORE UPDATE OF reader_owner,operation_owner ON durable_checkpoint_attempt \
-         WHEN (OLD.reader_owner IS NOT NULL AND NEW.reader_owner IS NOT OLD.reader_owner) OR \
-              (OLD.operation_owner IS NOT NULL AND NEW.operation_owner IS NOT OLD.operation_owner) \
-         BEGIN SELECT RAISE(ABORT,'checkpoint owner identity is immutable'); END",
-        &[],
-        0,
-    )?;
+           (outcome_kind=2 AND (outcome_head IS NULL OR length(outcome_head)=33) AND outcome_displaced IS NULL))))) STRICT";
+
+#[cfg(target_os = "linux")]
+pub(super) const CHECKPOINT_TRIGGER: &str = "CREATE TRIGGER durable_checkpoint_attempt_owner_immutable \
+         BEFORE UPDATE OF reader_owner,reader_request,reader_floor,operation_owner,original_pending_digest ON durable_checkpoint_attempt \
+         WHEN (OLD.reader_owner IS NOT NULL AND (NEW.reader_owner IS NOT OLD.reader_owner OR \
+              NEW.reader_request IS NOT OLD.reader_request OR NEW.reader_floor IS NOT OLD.reader_floor)) OR \
+              (OLD.operation_owner IS NOT NULL AND NEW.operation_owner IS NOT OLD.operation_owner) OR \
+              NEW.original_pending_digest IS NOT OLD.original_pending_digest \
+         BEGIN SELECT RAISE(ABORT,'checkpoint owner identity is immutable'); END";
+
+#[cfg(target_os = "linux")]
+pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
+    db.execute(StatementKind::Startup, CHECKPOINT_SCHEMA, &[], 0)?;
+    db.execute(StatementKind::Startup, CHECKPOINT_TRIGGER, &[], 0)?;
     Ok(())
 }
 

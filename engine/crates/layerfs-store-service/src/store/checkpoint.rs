@@ -66,7 +66,7 @@ impl BoundWorkspace {
                     })
                 })
                 .map_err(CommitError::Owner)?;
-            if version == 43 {
+            if matches!(version, 43 | 44) {
                 if !self.store.has_durable_writer() {
                     return Err(CommitError::History(HistoryError::Unsupported(
                         "checkpoint receipt requires durable Store",

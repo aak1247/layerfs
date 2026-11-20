@@ -45,20 +45,20 @@ pub struct DatabaseProfile {
 impl DatabaseProfile {
     /// Whether the durable format records the authenticated Branch snapshot.
     pub fn has_durable_binding(&self) -> bool {
-        matches!(self.schema_version, 40..=43)
+        matches!(self.schema_version, 40..=44)
     }
 
     /// Whether the durable format records the consumed namespace high-water.
     pub fn has_durable_namespace(&self) -> bool {
-        matches!(self.schema_version, 41..=43)
+        matches!(self.schema_version, 41..=44)
     }
 
     pub(crate) fn has_classified_custody(&self) -> bool {
-        matches!(self.schema_version, 42 | 43)
+        matches!(self.schema_version, 42..=44)
     }
 
     pub(crate) fn has_recorded_owners(&self) -> bool {
-        self.schema_version == 43
+        matches!(self.schema_version, 43 | 44)
     }
 }
 pub(crate) fn initialize(

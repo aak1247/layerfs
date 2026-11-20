@@ -29,7 +29,7 @@
 > current Branch head as the result. It checks durable Store identity and
 > history structure; the caller still owns Workspace fencing and content-root
 > validation. A missing receipt alone does not establish nonpublication.
-> A live schema-43 durable Workspace selects this path only after the actual
+> A live schema-43 or schema-44 durable Workspace selects this path only after the actual
 > durable Store confirms receipt support. Its admitted Commit records capture,
 > construction owners and the final request, publishes once, reads that Store's
 > original receipt, then pairs the Overlay and Workspace base install and
@@ -39,6 +39,10 @@
 > returns a definite prepublication refusal and folds its capture; persisting
 > the local conflict result is still pending. Cold pending-operation and orphan
 > reconciliation remain separate work and are not implied by live settlement.
+> New durable overlays use schema 44, which reserves an independently checked
+> binding and paged conflict description; existing schema 43 is neither
+> rewritten nor migrated on ordinary open. Conflict records remain retained
+> and block ordinary recovery until their authenticated execution path exists.
 
 BoundWorkspace::commit admits one active lifecycle for that Workspace, captures
 once through the existing overlay owner, creates independently owned Storage/Save

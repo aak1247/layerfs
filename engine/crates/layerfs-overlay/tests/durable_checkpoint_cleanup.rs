@@ -1,6 +1,9 @@
 //! Exact local cleanup after a definitely unpublished durable checkpoint.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema43.rs"]
+mod durable_schema43;
+
 use layerfs_overlay::{
     Changes, CheckpointCompletion, CheckpointOutcome, Inode, InodeKind, MaintenanceCursor, Overlay,
     OverlayError, PayloadWrite, ProfileConfig,
@@ -353,6 +356,7 @@ fn installed_attempt_cannot_use_unpublished_cleanup() {
 fn missing_operation_link_cannot_hide_the_original_live_owner() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema43::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     // Model a database whose owner-immutability guard is missing as well as a
     // lost link; the independent token and durable owner must still block it.
