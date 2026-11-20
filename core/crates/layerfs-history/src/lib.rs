@@ -19,12 +19,17 @@
 
 mod contract;
 pub use contract::catalog;
+pub use contract::checkpoint;
 pub use contract::error;
+pub use contract::facts;
 pub use contract::identity;
 pub use contract::query;
 pub use contract::records;
 
 pub use catalog::{HistoryCatalog, HistoryCatalogConfig, PublishLane};
+pub use checkpoint::{
+    checkpoint_request_digest, encode_checkpoint_request, CheckpointAttemptId, CheckpointReceipt,
+};
 pub use error::{HistoryError, HistoryResult};
 pub use identity::{
     BranchId, CatalogId, CommitId, HistoryName, LayerId, LayerStackId, NodeId, WorkspaceId,

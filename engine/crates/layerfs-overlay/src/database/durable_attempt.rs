@@ -37,7 +37,6 @@ pub(crate) fn record(
     if db.durable.is_none()
         || !db.profile.has_recorded_owners()
         || workspace == [0; 32]
-        || catalog == [0; 32]
         || snapshot.is_empty()
         || snapshot.len() > 4096
     {

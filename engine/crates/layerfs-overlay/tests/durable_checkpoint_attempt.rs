@@ -180,3 +180,23 @@ fn bad_identity_or_failed_attempt_insert_rolls_back_the_capture() {
         .unwrap();
     assert_eq!(persisted, (None, 1));
 }
+
+#[test]
+fn catalog_identity_preserves_the_full_history_domain() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, [0; 32], 12, SNAPSHOT)
+        .unwrap();
+    assert_ne!(recorded.attempt(), [0; 32]);
+    drop(db);
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    let catalog: Vec<u8> = connection
+        .query_row(
+            "SELECT catalog FROM durable_checkpoint_attempt WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(catalog, [0; 32]);
+}

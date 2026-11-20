@@ -16,6 +16,7 @@
 //! - a refusal is explicit. Contention is [`HistoryError::Busy`], not a
 //!   semantic conflict and not a silent retry.
 
+use crate::checkpoint::{CheckpointAttemptId, CheckpointReceipt};
 use crate::error::HistoryResult;
 use crate::identity::{BranchId, CatalogId, CommitId, HistoryName, LayerId, LayerStackId, NodeId};
 use crate::records::{
@@ -214,6 +215,25 @@ pub trait HistoryCatalog: Send + Sync {
     /// request forces an overwrite. UpToDate compares the current root.
     /// Unknown retains the original request; nothing is reread or replayed.
     fn commit_branch(&self, request: &CommitRequest) -> HistoryResult<CommitOutcome>;
+
+    /// Publishes once and records its exact outcome in the same Store transaction.
+    /// The default refuses: it never falls back to the unrecorded operation.
+    fn commit_checkpoint(
+        &self,
+        _attempt: CheckpointAttemptId,
+        _request: &CommitRequest,
+    ) -> HistoryResult<CommitOutcome> {
+        Err(crate::HistoryError::Unsupported("checkpoint receipt"))
+    }
+
+    /// Observes an original recorded result without sending its request again.
+    /// Absence is meaningful only for an authenticated Store with this capability.
+    fn checkpoint_receipt(
+        &self,
+        _attempt: CheckpointAttemptId,
+    ) -> HistoryResult<Option<CheckpointReceipt>> {
+        Err(crate::HistoryError::Unsupported("checkpoint receipt"))
+    }
 
     /// Publishes one Commit root as a new Layer against the expected stack head.
     fn add_layer(&self, request: &AddLayerRequest) -> HistoryResult<AddLayerOutcome>;
