@@ -160,9 +160,13 @@ The caller must hold the full-Store external fence and retain the actual Owner
 with a failed transition. An empty legacy roster also upgrades the Store before
 new Workspaces are created. Tests cover a real old-SDK Store and three original
 Workspaces, including a failed middle migration and cold reopening of the same
-files; they do not establish a physical crash, FUSE mount or application startup
-result. Application startup and Native integration have not yet adopted this
-transition.
+files. A separately retained original 277 fixture also completed the transition,
+closed and reopened its original Store and Workspace, and committed a new
+write. Its retained Store and SQLite sidecars were independently copied and
+checked after the test; the outer observation's stricter no-sidecar check failed
+and remains recorded. These tests do not establish a physical crash, FUSE mount
+or application startup result. Application startup and Native integration have
+not yet adopted this transition.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

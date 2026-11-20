@@ -502,6 +502,21 @@ fn transition_config(fixture: &Fixture) -> CatalogTransitionConfig {
 #[test]
 fn catalog_transition_migrates_and_reopens_the_original_workspace() {
     let fixture = Fixture::new();
+    exercise_original_catalog_transition(&fixture);
+}
+
+/// This explicit test is for a caller-owned, fenced legacy fixture. It never
+/// deletes that fixture and must only be invoked against a dedicated sample.
+#[test]
+#[ignore = "requires a caller-owned legacy 277 fixture and exclusive fence"]
+fn catalog_transition_migrates_supplied_original_277_fixture() {
+    let root = std::env::var_os("LAYERFS_TEST_ORIGINAL_277_FIXTURE")
+        .expect("supply a dedicated, exclusively fenced original 277 fixture");
+    let fixture = std::mem::ManuallyDrop::new(Fixture(PathBuf::from(root)));
+    exercise_original_catalog_transition(&fixture);
+}
+
+fn exercise_original_catalog_transition(fixture: &Fixture) {
     let config = fixture.config();
     let original_identity = fs::symlink_metadata(&config.path).unwrap();
     let owner = Owner::start(
@@ -512,7 +527,7 @@ fn catalog_transition_migrates_and_reopens_the_original_workspace() {
     .unwrap();
     let original = fs::File::open(&config.path).unwrap();
     let plan =
-        PreparedCatalogTransition::prepare(transition_config(&fixture), original, &owner).unwrap();
+        PreparedCatalogTransition::prepare(transition_config(fixture), original, &owner).unwrap();
     assert_eq!(plan.records().len(), 1);
     let record = plan.records()[0];
     let recovered = plan.execute(&owner, None, 0).unwrap();
@@ -586,7 +601,7 @@ fn catalog_transition_migrates_and_reopens_the_original_workspace() {
     .unwrap();
     let original = fs::File::open(&config.path).unwrap();
     let plan =
-        PreparedCatalogTransition::prepare(transition_config(&fixture), original, &owner).unwrap();
+        PreparedCatalogTransition::prepare(transition_config(fixture), original, &owner).unwrap();
     assert_eq!(plan.records(), &[record]);
     let recovered = plan.execute(&owner, None, 0).unwrap();
     let next = recovered.tokens[0];
@@ -615,6 +630,9 @@ fn catalog_transition_migrates_and_reopens_the_original_workspace() {
             .unwrap()
             .unwrap(),
         first
+    );
+    println!(
+        "REOPENED_ORIGINAL token={token:?} next={next:?} receipt={receipt:?} snapshot={first:?}"
     );
     let operation = recovered.service.operation(next).unwrap();
     assert_eq!(
