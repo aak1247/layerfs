@@ -33,6 +33,8 @@ pub use catalog_recovery::{
     CatalogActivationFailure, CatalogPreparationFailure, PreparedCatalogRecovery,
     RecoveredCatalogBinding, RetainedCatalogPreparation, RetainedCatalogRecovery,
 };
+#[cfg(target_os = "linux")]
+pub use catalog_recovery::{CatalogMigrationFailure, PreparedLegacyRecovery};
 pub use checkpoint_receipt::{check_checkpoint_outcome, CheckpointObservation, OriginalCheckpoint};
 pub use commit_types::{
     CapturedConstruction, CommitError, CommitFailure, CommitOptions, CommitPhase, CommitSuccess,

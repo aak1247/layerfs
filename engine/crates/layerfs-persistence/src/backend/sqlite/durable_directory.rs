@@ -103,14 +103,86 @@ impl DurableDirectory {
         }
         self.verify_private()
     }
+
+    fn identity(&self) -> crate::StorePhysicalIdentity {
+        crate::StorePhysicalIdentity {
+            path: self.database.clone(),
+            directory: self.directory_id,
+            database: self.database_id,
+        }
+    }
 }
 
 impl super::connection::Session {
+    /// The caller retains its authenticated original File and full Store fence
+    /// across this opening window. Ordinary read-only opens have no such proof.
+    pub(crate) fn connect_original_read_only(
+        path: &Path,
+        original: &File,
+        layout: crate::SqlitePackLayout,
+        acquisition: crate::SqliteAcquisitionSchema,
+    ) -> Result<Self, BackendError> {
+        let directory = DurableDirectory::open(path)?;
+        directory
+            .verify_original_file(original)
+            .map_err(|_| BackendError::Integrity)?;
+        let mut session = Self::connect(
+            path,
+            false,
+            false,
+            crate::SqlitePersistenceProfile::Durable,
+            layout,
+            acquisition,
+        )?;
+        directory
+            .verify_original_file(original)
+            .map_err(|_| BackendError::Integrity)?;
+        session.durable_directory = Some(directory);
+        Ok(session)
+    }
+
     pub(crate) fn verify_original_store_file(&self, original: &File) -> Result<(), BackendError> {
         self.durable_directory
             .as_ref()
             .ok_or(BackendError::Integrity)?
             .verify_original_file(original)
             .map_err(|_| BackendError::Integrity)
+    }
+
+    pub(crate) fn observe_original_store(
+        &self,
+        original: &File,
+    ) -> Result<crate::StorePhysicalIdentity, BackendError> {
+        if self.writable || self.profile.persistence != crate::SqlitePersistenceProfile::Durable {
+            return Err(BackendError::Integrity);
+        }
+        let directory = self
+            .durable_directory
+            .as_ref()
+            .ok_or(BackendError::Integrity)?;
+        directory
+            .verify_original_file(original)
+            .map_err(|_| BackendError::Integrity)?;
+        Ok(directory.identity())
+    }
+
+    pub(crate) fn verify_observed_store(
+        &self,
+        original: &crate::StorePhysicalIdentity,
+    ) -> Result<(), BackendError> {
+        if !self.writable || self.profile.persistence != crate::SqlitePersistenceProfile::Durable {
+            return Err(BackendError::Integrity);
+        }
+        let directory = self
+            .durable_directory
+            .as_ref()
+            .ok_or(BackendError::Integrity)?;
+        directory
+            .verify_private()
+            .map_err(|_| BackendError::Integrity)?;
+        if &directory.identity() != original {
+            return Err(BackendError::Integrity);
+        }
+        Ok(())
     }
 }

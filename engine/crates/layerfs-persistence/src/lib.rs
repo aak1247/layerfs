@@ -29,6 +29,7 @@ pub use storage_provider::{DurableBarrierError, StorageProvider};
 #[cfg(target_os = "linux")]
 pub use store::checkpoint_upgrade::{
     CheckpointUpgradeFailure, CheckpointUpgradeResult, PreparedCheckpointUpgrade,
+    StorePhysicalIdentity,
 };
 pub use store::seal::SealedStore;
 

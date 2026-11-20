@@ -136,6 +136,17 @@ SDKs, including a schema-42 kept row and its first write after reopening.
 This does not yet provide a complete Store/Roster migration or establish a
 process-loss, FUSE or physical durability result.
 
+For a coordinated transition, a specially opened read-only Store checks the
+original open file and private directory before and after opening. The caller
+must hold its authenticated Store-wide fence throughout that window; this is
+not a direct inspection of SQLite's internal file descriptor. A prepared ready
+Workspace drops the old Store provider while keeping its Overlay lease. A new
+Durable writer must match the recorded physical Store, catalog, incarnation,
+historical binding and root before it can apply the local Overlay transition.
+Already-current ready Workspaces can be reauthenticated without another DDL
+transition. The daemon and application startup paths do not yet orchestrate
+these components automatically.
+
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it
 when a fresh durable Workspace setup is explicitly supplied. It is not used to

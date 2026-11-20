@@ -64,6 +64,34 @@ impl Handles {
     ) -> Result<Self, PersistenceError> {
         Self::open(config, binding, cursor_key, false)
     }
+
+    /// Opens a read-only Durable Store inside the caller's authenticated
+    /// original-file and private-directory window. The caller must keep the
+    /// original File and full Store fence throughout opening and observation.
+    /// This checks the protected name before and after opening; it does not
+    /// inspect SQLite's internal file descriptor.
+    #[cfg(target_os = "linux")]
+    pub fn open_original_read_only(
+        config: PersistenceConfig,
+        original: &std::fs::File,
+        binding: &[u8],
+        cursor_key: [u8; 32],
+    ) -> Result<Self, PersistenceError> {
+        if config.backend != BackendSelection::Sqlite
+            || config.sqlite_profile != crate::SqlitePersistenceProfile::Durable
+        {
+            return Err(PersistenceError::Malformed);
+        }
+        let directory = config.path.parent().map(Path::to_path_buf);
+        let session = Session::connect_original_read_only(
+            &config.path,
+            original,
+            config.sqlite_pack_layout,
+            config.sqlite_acquisition,
+        )?
+        .shared();
+        Self::validated(session, directory, binding, cursor_key)
+    }
     fn open(
         config: PersistenceConfig,
         binding: &[u8],

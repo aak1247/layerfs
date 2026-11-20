@@ -122,6 +122,16 @@ impl ReadyRecovery {
         &self.observed
     }
 
+    /// Check the exact supported local format without changing its namespace
+    /// or database. This does not authenticate the Store or consumer fence.
+    #[cfg(target_os = "linux")]
+    pub fn preflight_upgrade(&self, expected: &ReadyRecord) -> OverlayResult<i64> {
+        if &self.observed != expected {
+            return Err(OverlayError::Invalid("legacy migration predecessor"));
+        }
+        super::legacy_upgrade::preflight(&self.db, expected)
+    }
+
     /// Upgrade an exact ready schema-41/42 predecessor while retaining this
     /// original lease and namespace. Store, roster and old-consumer authority
     /// must already have been authenticated by the trusted caller.

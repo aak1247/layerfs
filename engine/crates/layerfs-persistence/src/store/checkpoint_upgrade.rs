@@ -2,7 +2,40 @@
 use crate::{backend::Session, BackendSelection, PersistenceConfig, SqlitePersistenceProfile};
 use layerfs_history::CatalogId;
 use layerfs_storage::port::PersistenceError;
-use std::{fmt, fs::File, os::unix::fs::MetadataExt, sync::Arc};
+use std::{fmt, fs::File, os::unix::fs::MetadataExt, path::PathBuf, sync::Arc};
+
+/// The local identity of a read-only Store session and its original open file.
+/// It does not authenticate the Store's external owner or fence old consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorePhysicalIdentity {
+    pub(crate) path: PathBuf,
+    pub(crate) directory: (u64, u64),
+    pub(crate) database: (u64, u64),
+}
+
+impl crate::StorageProvider {
+    /// Compare a specially opened read-only Durable session with the caller's
+    /// still-held original file and the captured private directory identity.
+    /// Ordinary read-only sessions cannot establish this observation later.
+    pub fn observe_original_store(
+        &self,
+        original: &File,
+    ) -> Result<StorePhysicalIdentity, PersistenceError> {
+        self.session
+            .observe_original_store(original)
+            .map_err(Into::into)
+    }
+
+    /// Verify that this newly opened Durable writer is the observed file.
+    pub fn verify_observed_store(
+        &self,
+        original: &StorePhysicalIdentity,
+    ) -> Result<(), PersistenceError> {
+        self.session
+            .verify_observed_store(original)
+            .map_err(Into::into)
+    }
+}
 
 /// An exclusive local migration session and the original open Store file.
 ///

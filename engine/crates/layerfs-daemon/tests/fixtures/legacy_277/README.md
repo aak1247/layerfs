@@ -1,0 +1,1 @@
+Files captured after the unmodified LayerFS SDK commit `277368a810c3edd4d5e5555d846fcf367cb48e0c` created a synthetic Store, roster and schema-41 Workspace and closed its handles. The Workspace has one committed file and a later acknowledged dirty write. Tests copy this fixture to a private temporary directory before opening it.

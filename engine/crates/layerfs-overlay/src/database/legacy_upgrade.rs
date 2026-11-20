@@ -134,16 +134,15 @@ fn replace_binding(db: &Overlay) -> OverlayResult<()> {
     Ok(())
 }
 
-/// No Store or caller authority is inferred here. The owner of the original
-/// lease must authenticate the Store, roster and old consumer fence first.
-pub(super) fn upgrade(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<()> {
+/// Check the local predecessor before any related Store migration is started.
+/// Store and old-consumer authority are established separately by the caller.
+pub(super) fn preflight(db: &Overlay, record: &ReadyRecord) -> OverlayResult<i64> {
     let version = db.profile.schema_version;
-    if !matches!(version, 41 | 42) {
+    if !matches!(version, 41 | 42 | 45) {
         return Err(OverlayError::Invalid("unsupported legacy migration schema"));
     }
     let original = db.state()?;
-    let stored = stored_state(db)?;
-    if stored.len() != 1 {
+    if stored_state(db)?.len() != 1 {
         return Err(OverlayError::Invalid("legacy durable state absent"));
     }
     if db.durable_namespace()? != Some(record.previous_namespace)
@@ -153,7 +152,23 @@ pub(super) fn upgrade(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<(
         return Err(OverlayError::Invalid("legacy migration predecessor"));
     }
     db.require_recorded_recovery_ready()?;
-    verify_predecessor(db, version)?;
+    if version == 45 {
+        verify_current(db)?;
+    } else {
+        verify_predecessor(db, version)?;
+    }
+    Ok(version)
+}
+
+/// No Store or caller authority is inferred here. The owner of the original
+/// lease must authenticate the Store, roster and old consumer fence first.
+pub(super) fn upgrade(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<()> {
+    let version = preflight(db, record)?;
+    if version == 45 {
+        return Err(OverlayError::Invalid("unsupported legacy migration schema"));
+    }
+    let original = db.state()?;
+    let stored = stored_state(db)?;
     db.atomic_cleanup(|| {
         db.begin()?;
         db.require_recorded_ready_in_cleanup()?;
