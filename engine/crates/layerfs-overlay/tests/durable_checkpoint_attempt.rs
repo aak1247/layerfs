@@ -200,3 +200,147 @@ fn catalog_identity_preserves_the_full_history_domain() {
         .unwrap();
     assert_eq!(catalog, [0; 32]);
 }
+
+fn request_digest(request: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"layerfs/checkpoint-request/v1\0");
+    hash.update(request);
+    *hash.finalize().as_bytes()
+}
+
+#[test]
+fn publication_intent_is_frozen_once_for_the_original_capture() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let capture = recorded.capture();
+    let request = b"LFCP\x01original complete request";
+    let target = b"authenticated target branch snapshot";
+    let candidate = [18; 32];
+    assert!(db
+        .prepare_checkpoint_publication(recorded, request, [0; 32], candidate, target)
+        .is_err());
+    assert!(db
+        .prepare_checkpoint_publication(recorded, request, request_digest(request), candidate, b"")
+        .is_err());
+    assert_eq!(db.state().unwrap().captured, Some(capture.generation));
+    db.prepare_checkpoint_publication(
+        recorded,
+        request,
+        request_digest(request),
+        candidate,
+        target,
+    )
+    .unwrap();
+    assert!(matches!(
+        db.prepare_checkpoint_publication(
+            recorded,
+            request,
+            request_digest(request),
+            candidate,
+            target
+        ),
+        Err(OverlayError::Invalid("checkpoint publication predecessor"))
+    ));
+    assert!(db.install_recorded(capture, candidate, target).is_err());
+    assert!(db.resolve_failed_capture(capture).is_err());
+    drop(db);
+
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let row: (Vec<u8>, i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sql.query_row(
+        "SELECT attempt,phase,request,request_digest,candidate_root,target_snapshot FROM durable_checkpoint_attempt WHERE id=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    ).unwrap();
+    assert_eq!(
+        row,
+        (
+            recorded.attempt().to_vec(),
+            2,
+            request.to_vec(),
+            request_digest(request).to_vec(),
+            candidate.to_vec(),
+            target.to_vec()
+        )
+    );
+    drop(sql);
+    let before = fs::read(fixture.path()).unwrap();
+    assert!(
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).is_err()
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+}
+
+#[test]
+fn failed_publication_intent_write_keeps_original_capture_and_phase() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch("CREATE TRIGGER fail_publication_intent BEFORE UPDATE ON durable_checkpoint_attempt BEGIN SELECT RAISE(ABORT, 'intent failure'); END;").unwrap();
+    drop(sql);
+    let db =
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let before = db.state().unwrap();
+    let request = b"LFCP\x01request";
+    assert!(db
+        .prepare_checkpoint_publication(
+            recorded,
+            request,
+            request_digest(request),
+            [18; 32],
+            SNAPSHOT
+        )
+        .is_err());
+    assert_eq!(db.state().unwrap(), before);
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let row: (i64, Option<Vec<u8>>, Option<Vec<u8>>) = sql
+        .query_row(
+            "SELECT phase,request,request_digest FROM durable_checkpoint_attempt WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (1, None, None));
+}
+
+#[test]
+fn changed_original_attempt_context_cannot_be_frozen_for_publication() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch("CREATE TRIGGER alter_capture_context AFTER INSERT ON durable_checkpoint_attempt BEGIN UPDATE durable_checkpoint_attempt SET catalog=zeroblob(32) WHERE id=1; END;").unwrap();
+    drop(sql);
+    let db =
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let before = db.state().unwrap();
+    let request = b"LFCP\x01request";
+    assert!(matches!(
+        db.prepare_checkpoint_publication(
+            recorded,
+            request,
+            request_digest(request),
+            [18; 32],
+            SNAPSHOT
+        ),
+        Err(OverlayError::Invalid("checkpoint original identity"))
+    ));
+    assert_eq!(db.state().unwrap(), before);
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let (phase, request): (i64, Option<Vec<u8>>) = sql
+        .query_row(
+            "SELECT phase,request FROM durable_checkpoint_attempt WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((phase, request), (1, None));
+}
