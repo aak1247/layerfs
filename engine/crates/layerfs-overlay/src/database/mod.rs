@@ -13,6 +13,8 @@ pub(crate) mod durable_orphan_recovery;
 pub(crate) mod durable_owners;
 pub(crate) mod durable_route;
 pub(crate) mod durable_serial_retirement;
+#[cfg(target_os = "linux")]
+pub(crate) mod legacy_upgrade;
 pub(crate) mod profile;
 pub(crate) mod startup;
 pub(crate) mod statements;

@@ -124,6 +124,18 @@ new SQLite connections close. A failed or unwound uncertain transaction retains
 the original file and session until process exit. This primitive is not yet
 wired into catalog recovery or an automatic Store/Overlay migration.
 
+A locally ready schema-41 or schema-42 Overlay can also be upgraded to 45
+under its original lease and namespace. The operation checks the complete
+supported predecessor schema, preserves its binding, dirty state, cleanup queue
+and classified kept rows, and checks the complete resulting schema in the same
+transaction. Unknown legacy custody remains refused. The caller must first
+authenticate the actual Store and roster and fence the original consumers;
+the local Overlay operation does not establish those facts or advance the
+namespace. Component tests use files produced by the original 277 and d144
+SDKs, including a schema-42 kept row and its first write after reopening.
+This does not yet provide a complete Store/Roster migration or establish a
+process-loss, FUSE or physical durability result.
+
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it
 when a fresh durable Workspace setup is explicitly supplied. It is not used to

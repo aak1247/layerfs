@@ -498,7 +498,7 @@ impl Overlay {
     /// Admission and BEGIN for the first writing statement of an atomic job,
     /// before that statement executes. A failure is returned by that statement
     /// and leaves no transaction open.
-    fn begin(&self) -> OverlayResult<()> {
+    pub(super) fn begin(&self) -> OverlayResult<()> {
         let Transaction::Wanted = self.transaction.get() else {
             return Ok(());
         };

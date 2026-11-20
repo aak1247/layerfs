@@ -121,6 +121,21 @@ impl ReadyRecovery {
     pub fn observed(&self) -> &ReadyRecord {
         &self.observed
     }
+
+    /// Upgrade an exact ready schema-41/42 predecessor while retaining this
+    /// original lease and namespace. Store, roster and old-consumer authority
+    /// must already have been authenticated by the trusted caller.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::result_large_err)]
+    pub fn upgrade_legacy(mut self, expected: &ReadyRecord) -> Result<Self, (OverlayError, Self)> {
+        if &self.observed != expected {
+            return Err((OverlayError::Invalid("legacy migration predecessor"), self));
+        }
+        match super::legacy_upgrade::upgrade(&mut self.db, expected) {
+            Ok(()) => Ok(self),
+            Err(error) => Err((error, self)),
+        }
+    }
     /// Locally rechecks the original ready state, without advancing namespace.
     #[allow(clippy::result_large_err)]
     pub fn complete(self, expected: &ReadyRecord) -> Result<Overlay, (OverlayError, Self)> {

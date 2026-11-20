@@ -275,10 +275,21 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
     // A new durable database has no cleanup work yet. Old databases retain
     // their original table and are never changed by ordinary recovery.
     db.execute(StatementKind::Startup, "DROP TABLE cleanup_task", &[], 0)?;
+    create_cleanup(db)?;
+    create_conflict_objects(db)
+}
+
+#[cfg(target_os = "linux")]
+fn create_cleanup(db: &Overlay) -> OverlayResult<()> {
+    for statement in [CLEANUP_SCHEMA, CLEANUP_READY, CLEANUP_GENERATION] {
+        db.execute(StatementKind::Startup, statement, &[], 0)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_conflict_objects(db: &Overlay) -> OverlayResult<()> {
     for statement in [
-        CLEANUP_SCHEMA,
-        CLEANUP_READY,
-        CLEANUP_GENERATION,
         PLAN_SCHEMA,
         PLAN_ACTIVE,
         PAGE_SCHEMA,
@@ -300,6 +311,43 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
         db.execute(StatementKind::Startup, statement, &[], 0)?;
     }
     Ok(())
+}
+
+/// Replace the legacy cleanup table inside the caller's migration transaction,
+/// retaining every queued key, cursor and state before adding conflict data.
+#[cfg(target_os = "linux")]
+pub(super) fn upgrade_legacy(db: &Overlay) -> OverlayResult<()> {
+    for statement in [
+        "ALTER TABLE cleanup_task RENAME TO legacy_cleanup_task",
+        "DROP INDEX cleanup_task_ready",
+        "DROP INDEX cleanup_task_generation",
+    ] {
+        db.execute(StatementKind::Startup, statement, &[], 0)?;
+    }
+    create_cleanup(db)?;
+    db.execute(
+        StatementKind::Startup,
+        "INSERT INTO cleanup_task(kind,resource,target,phase,cursor,aux,name,ready) SELECT kind,resource,target,phase,cursor,aux,name,ready FROM legacy_cleanup_task",
+        &[],
+        0,
+    )?;
+    let differences: Vec<bool> = db.query(
+        StatementKind::Startup,
+        "SELECT EXISTS(SELECT kind,resource,target,phase,cursor,aux,name,ready FROM legacy_cleanup_task EXCEPT SELECT kind,resource,target,phase,cursor,aux,name,ready FROM cleanup_task) OR EXISTS(SELECT kind,resource,target,phase,cursor,aux,name,ready FROM cleanup_task EXCEPT SELECT kind,resource,target,phase,cursor,aux,name,ready FROM legacy_cleanup_task)",
+        &[],
+        0,
+        |row| row.get(0),
+    )?;
+    if differences.as_slice() != [false] {
+        return Err(OverlayError::Invalid("legacy cleanup queue changed"));
+    }
+    db.execute(
+        StatementKind::Startup,
+        "DROP TABLE legacy_cleanup_task",
+        &[],
+        0,
+    )?;
+    create_conflict_objects(db)
 }
 
 /// The version number and quick_check do not authenticate these required
