@@ -29,6 +29,10 @@
 > current Branch head as the result. It checks durable Store identity and
 > history structure; the caller still owns Workspace fencing and content-root
 > validation. A missing receipt alone does not establish nonpublication.
+> The Workspace's checkpoint install uses the existing prepared-base lock:
+> its exact recorded capture and the locally validated outcome install in the
+> Overlay before the in-memory base is replaced. This does not by itself update
+> the outer BoundWorkspace snapshot or complete the admitted Commit.
 
 BoundWorkspace::commit admits one active lifecycle for that Workspace, captures
 once through the existing overlay owner, creates independently owned Storage/Save

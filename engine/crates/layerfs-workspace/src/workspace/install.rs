@@ -1,7 +1,7 @@
 //! Prepared immutable binding and one known install attempt, preserving input.
 use crate::{BaseView, Workspace, WorkspaceError, WorkspaceResult};
 use layerfs_content::filesystem::FilesystemRootId;
-use layerfs_overlay::{Capture, Overlay, OverlayError};
+use layerfs_overlay::{Capture, CheckpointOutcome, Overlay, OverlayError, RecordedCapture};
 
 /// Scope-checked next immutable root retained before the SQL install attempt.
 /// This is not proof of Save/history publication: that remains the caller's
@@ -10,6 +10,23 @@ pub struct PreparedBase {
     capture: Capture,
     expected: FilesystemRootId,
     next: BaseView,
+}
+
+/// Inputs already checked against the original authenticated Store outcome.
+/// These values do not themselves establish publication or recovery authority.
+#[derive(Clone, Copy)]
+pub struct CheckpointInstall<'a> {
+    pub recorded: RecordedCapture,
+    pub request_digest: [u8; 32],
+    pub target_snapshot: &'a [u8],
+    pub installed_snapshot: &'a [u8],
+    pub outcome: CheckpointOutcome,
+}
+
+enum Install<'a> {
+    Plain,
+    Snapshot(&'a [u8]),
+    Checkpoint(CheckpointInstall<'a>),
 }
 impl PreparedBase {
     pub const fn capture(&self) -> Capture {
@@ -55,7 +72,7 @@ impl Workspace {
         overlay: &Overlay,
         prepared: PreparedBase,
     ) -> Result<(), (WorkspaceError, PreparedBase)> {
-        self.install_with_binding(overlay, prepared, None)
+        self.install_with_binding(overlay, prepared, Install::Plain)
     }
     /// Pairs a known durable history receipt with the local base transition.
     pub fn install_prepared_base_recorded(
@@ -64,15 +81,27 @@ impl Workspace {
         prepared: PreparedBase,
         snapshot: &[u8],
     ) -> Result<(), (WorkspaceError, PreparedBase)> {
-        self.install_with_binding(overlay, prepared, Some(snapshot))
+        self.install_with_binding(overlay, prepared, Install::Snapshot(snapshot))
+    }
+    /// Pairs an authenticated checkpoint outcome and its exact local capture
+    /// with the same base-lock transition used by ordinary installs.
+    pub fn install_prepared_checkpoint(
+        &self,
+        overlay: &Overlay,
+        prepared: PreparedBase,
+        input: CheckpointInstall<'_>,
+    ) -> Result<(), (WorkspaceError, PreparedBase)> {
+        self.install_with_binding(overlay, prepared, Install::Checkpoint(input))
     }
     fn install_with_binding(
         &self,
         overlay: &Overlay,
         prepared: PreparedBase,
-        snapshot: Option<&[u8]>,
+        install: Install<'_>,
     ) -> Result<(), (WorkspaceError, PreparedBase)> {
-        if prepared.capture.engine() != self.route().engine() {
+        if prepared.capture.engine() != self.route().engine()
+            || matches!(&install, Install::Checkpoint(input) if input.recorded.capture() != prepared.capture)
+        {
             return Err((OverlayError::Stale.into(), prepared));
         }
         let mut base = match self.base.write() {
@@ -89,9 +118,19 @@ impl Workspace {
             ));
         }
         let root = prepared.next.identity().0.to_bytes();
-        let installed = match snapshot {
-            Some(snapshot) => overlay.install_recorded(prepared.capture, root, snapshot),
-            None => overlay.install(prepared.capture, root),
+        let installed = match install {
+            Install::Plain => overlay.install(prepared.capture, root),
+            Install::Snapshot(snapshot) => {
+                overlay.install_recorded(prepared.capture, root, snapshot)
+            }
+            Install::Checkpoint(input) => overlay.install_recorded_checkpoint(
+                input.recorded,
+                input.request_digest,
+                root,
+                input.target_snapshot,
+                input.installed_snapshot,
+                input.outcome,
+            ),
         };
         if let Err(error) = installed {
             return Err((error.into(), prepared));
