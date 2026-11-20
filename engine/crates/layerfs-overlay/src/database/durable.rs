@@ -552,12 +552,18 @@ mod linux {
         } else {
             false
         };
+        // Catalog preparation may inspect one still-captured schema-44
+        // checkpoint under this same lease. Its private constructor must
+        // authenticate every deferred owner and task before returning it.
+        let checkpoint = settled_conflict
+            && profile.schema_version == 44
+            && bound
+            && pending_attempt
+            && state.captured.is_some()
+            && !pending_conflict;
         if state.closed
-            || state.captured.is_some()
             || state.consolidating.is_some()
-            || held
-            || pending
-            || pending_attempt
+            || (!checkpoint && (state.captured.is_some() || held || pending || pending_attempt))
             || (pending_conflict && !settled_conflict)
             || (pending_conflict && settled_conflict && (profile.schema_version != 44 || !bound))
         {

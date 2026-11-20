@@ -78,6 +78,14 @@ consumers have stopped. Nonprivileged request-adapter tests exercise the bound
 Store and Overlay barriers for a live conflict and a separately reconstructed
 cold conflict; a physical FUSE mount and Sandbox recovery remain unverified.
 
+The catalog opening path can also retain a schema-44 phase-1 or phase-2
+checkpoint under its original lease and inspect its original capture, classified
+reader and operation ownership, and bounded pages of the frozen request. This
+is a local observation only: the Store service retains it without activation,
+does not advance the namespace, and still refuses the recovery. Matching the
+actual Store receipt, reconciling the capture and proving that the original
+writer has stopped remain required before that Workspace can be used again.
+
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it
 when a fresh durable Workspace setup is explicitly supplied. It is not used to

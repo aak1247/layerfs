@@ -49,6 +49,7 @@ pub use contract::kernel_directory::{
     KernelCookieOffer, KernelDirectory, KernelDirectoryCursor, KernelDirectoryPage,
 };
 pub use database::accounting::{Resources, StoredCounts};
+pub use database::checkpoint_recovery::{CheckpointRecord, PendingCheckpointRecovery};
 pub use database::durable_binding::ConflictSyncIdentity;
 pub use database::pending_recovery::{
     OverlayCatalogRecovery, ReadyRecord, ReadyRecovery, SettledConflict, SettledConflictRecovery,

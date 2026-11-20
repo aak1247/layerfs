@@ -3,8 +3,8 @@
 
 use layerfs_overlay::{
     conflict_page_digest, Changes, CheckpointCompletion, CheckpointOutcome, ConflictCompletion,
-    ConflictStageInput, Inode, InodeKind, MaintenanceCursor, Overlay, OverlayError, PayloadWrite,
-    ProfileConfig, CONFLICT_PAGE_BYTES,
+    ConflictStageInput, Inode, InodeKind, MaintenanceCursor, Overlay, OverlayCatalogRecovery,
+    OverlayError, PayloadWrite, ProfileConfig, CONFLICT_PAGE_BYTES,
 };
 use std::{
     fs,
@@ -126,6 +126,122 @@ fn request_digest(request: &[u8]) -> [u8; 32] {
     hash.update(b"layerfs/checkpoint-request/v1\0");
     hash.update(request);
     *hash.finalize().as_bytes()
+}
+
+#[test]
+fn pending_checkpoint_keeps_original_owners_and_reads_request_in_pages() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    write(&db, b"captured");
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let generation = recorded.capture().generation.number();
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, generation as u64)
+        .unwrap();
+    let _operation = db
+        .acquire_recorded_captured_operation(recorded, generation as u64, reader)
+        .unwrap();
+    write(&db, b"later");
+    let mut request = b"LFCP\x01".to_vec();
+    request.resize(2 * 64 * 1024 + 37, b'x');
+    let digest = request_digest(&request);
+    db.prepare_checkpoint_publication(recorded, &request, digest, [19; 32], b"target")
+        .unwrap();
+    let attempt = recorded.attempt();
+    drop(db);
+    assert!(
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).is_err()
+    );
+    let before = {
+        let sql = rusqlite::Connection::open(&fixture.path()).unwrap();
+        sql.query_row("SELECT a.phase,a.generation,a.reader_owner,a.operation_owner,c.operation_count,d.operation_owners,r.high_namespace FROM durable_checkpoint_attempt a,durable_owner_counts c,durable_custody d,durable_route r WHERE a.id=1 AND c.id=1 AND d.id=1 AND r.id=1", [],
+            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?))).unwrap()
+    };
+    assert_eq!(
+        (before.0, before.1, before.2, before.4, before.5, before.6),
+        (2, generation, reader.owner_id() as i64, 1, 1, 7)
+    );
+    let pending =
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let OverlayCatalogRecovery::PendingCheckpoint(pending) = pending else {
+        panic!("expected pending checkpoint")
+    };
+    let observed = pending.observed();
+    assert_eq!(
+        (
+            observed.workspace,
+            observed.catalog,
+            observed.incarnation,
+            observed.namespace,
+            observed.generation,
+            observed.attempt
+        ),
+        (WORKSPACE, CATALOG, 12, 7, generation, attempt)
+    );
+    assert_eq!(
+        (
+            observed.phase,
+            observed.reader_held,
+            observed.operation_held
+        ),
+        (2, true, true)
+    );
+    assert_eq!(observed.request_digest, Some(digest));
+    assert_eq!(observed.request_bytes, Some(request.len() as u64));
+    for offset in [0, 64 * 1024, 2 * 64 * 1024] {
+        let end = (offset + 64 * 1024).min(request.len());
+        assert_eq!(
+            pending.request_page(offset as u64).unwrap(),
+            request[offset..end]
+        );
+    }
+    assert!(pending.request_page(request.len() as u64).is_err());
+    drop(pending);
+    let sql = rusqlite::Connection::open(&fixture.path()).unwrap();
+    let after = sql.query_row("SELECT a.phase,a.generation,a.reader_owner,a.operation_owner,c.operation_count,d.operation_owners,r.high_namespace FROM durable_checkpoint_attempt a,durable_owner_counts c,durable_custody d,durable_route r WHERE a.id=1 AND c.id=1 AND d.id=1 AND r.id=1", [],
+        |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?))).unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        sql.execute(
+            "UPDATE durable_operation_owner SET capture_revision=capture_revision+1",
+            []
+        )
+        .unwrap(),
+        1
+    );
+    drop(sql);
+    assert!(matches!(
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE),
+        Err(OverlayError::Invalid(
+            "checkpoint recovery operation identity"
+        ))
+    ));
+    let sql = rusqlite::Connection::open(&fixture.path()).unwrap();
+    let retained:(i64,i64) = sql.query_row("SELECT capture_revision,(SELECT high_namespace FROM durable_route WHERE id=1) FROM durable_operation_owner", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(retained, (recorded.capture().revision + 1, 7));
+}
+
+#[test]
+fn pending_checkpoint_rejects_a_detached_conflict_stage_identity() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let generation = recorded.capture().generation.number();
+    drop(db);
+    let sql = rusqlite::Connection::open(&fixture.path()).unwrap();
+    assert_eq!(sql.execute("UPDATE durable_checkpoint_attempt SET conflict_generation=?1,conflict_cleanup_completed=0", [generation]).unwrap(),1);
+    drop(sql);
+    assert!(matches!(
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE),
+        Err(OverlayError::Invalid("checkpoint recovery phase"))
+    ));
+    let sql = rusqlite::Connection::open(&fixture.path()).unwrap();
+    let retained:(i64,i64,i64) = sql.query_row("SELECT conflict_generation,conflict_cleanup_completed,(SELECT high_namespace FROM durable_route WHERE id=1) FROM durable_checkpoint_attempt", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(retained, (generation, 0, 7));
 }
 
 #[test]

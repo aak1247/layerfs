@@ -14,7 +14,7 @@ use layerfs_daemon::{
     Owner, OwnerConfig, OwnerError,
 };
 use layerfs_history::{BranchId, HistoryError, WorkspaceId};
-use layerfs_overlay::{Overlay, OverlayCatalogRecovery, OverlayError, ProfileConfig};
+use layerfs_overlay::{Overlay, OverlayCatalogRecovery, ProfileConfig};
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
 use std::{fs, os::unix::fs::PermissionsExt};
@@ -91,11 +91,29 @@ fn unfinished_recorded_capture_keeps_original_namespace_and_attempt() {
         )
         .unwrap_err();
     assert!(failure.completed.is_empty());
-    assert!(matches!(failure.cause, CatalogRecoveryCause::Open {
+    let CatalogRecoveryCause::Prepare {
         record: failed_record,
-        cause: OwnerError::Overlay(OverlayError::Invalid("durable overlay requires reconciliation")),
-    } if failed_record == record));
+        failure,
+    } = failure.cause
+    else {
+        panic!("expected retained pending checkpoint");
+    };
+    assert_eq!(failed_record, record);
+    assert!(matches!(
+        failure.as_ref(),
+        CatalogPreparationFailure::Retained {
+            cause: BindError::History(HistoryError::Unsupported(
+                "pending checkpoint reconciliation is not yet admitted"
+            )),
+            ..
+        }
+    ));
     assert_eq!(service.workspaces(), Some(0));
+    assert!(
+        Owner::recover_recorded_next(&path, ProfileConfig::default(), workspace.to_bytes(), 2)
+            .is_err()
+    );
+    drop(failure);
     let check =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();

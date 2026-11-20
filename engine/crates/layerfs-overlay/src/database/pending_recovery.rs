@@ -58,12 +58,14 @@ impl fmt::Debug for ReadyRecovery {
 pub enum OverlayCatalogRecovery {
     Ready(ReadyRecovery),
     SettledConflict(SettledConflictRecovery),
+    PendingCheckpoint(super::checkpoint_recovery::PendingCheckpointRecovery),
 }
 impl fmt::Debug for OverlayCatalogRecovery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ready(value) => value.fmt(f),
             Self::SettledConflict(value) => value.fmt(f),
+            Self::PendingCheckpoint(value) => value.fmt(f),
         }
     }
 }
@@ -73,6 +75,10 @@ impl OverlayCatalogRecovery {
     /// not authenticate a Store or prove the previous consumer has stopped.
     pub fn open(path: &Path, config: ProfileConfig, workspace: [u8; 32]) -> OverlayResult<Self> {
         let db = super::durable::recover_for_catalog(path, config, workspace)?;
+        if db.state()?.captured.is_some() {
+            return super::checkpoint_recovery::PendingCheckpointRecovery::open(db)
+                .map(Self::PendingCheckpoint);
+        }
         if super::durable_conflict_stage::active_conflict(&db)?.is_some() {
             let observed = observe(&db)?;
             Ok(Self::SettledConflict(SettledConflictRecovery {

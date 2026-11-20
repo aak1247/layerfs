@@ -131,6 +131,11 @@ impl Store {
                     self.history().require_checkpoint_receipts().map_err(BindError::History)?;
                     (observed.target_snapshot.clone(),observed.marker_root,LocalRecord::Conflict(observed))
                 }
+                OverlayCatalogRecovery::PendingCheckpoint(_) => {
+                    return Err(BindError::History(HistoryError::Unsupported(
+                        "pending checkpoint reconciliation is not yet admitted",
+                    )));
+                }
             };
             let snapshot=layerfs_bridge::snapshot::decode(&bytes).map_err(|e|BindError::Owner(OwnerError::BindingCodec(e)))?;
             if snapshot.branch.id!=request.branch { return Err(identity_error()); }
