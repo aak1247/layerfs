@@ -21,6 +21,8 @@ fn ready(
     recorded: RecordedCapture,
     installed: Option<CheckpointCompletion<'_>>,
     conflict: Option<ConflictCompletion<'_>>,
+    folded_phase: i64,
+    check_payload: bool,
 ) -> OverlayResult<(bool, i64)> {
     let state = db.live()?;
     let namespace = super::durable_attempt::check_context(db, recorded, false)?;
@@ -30,7 +32,7 @@ fn ready(
     } else if conflict.is_some() {
         5_i64
     } else {
-        3_i64
+        folded_phase
     };
     let rows: Vec<Cleanup> = db.query(
         StatementKind::Frontier,
@@ -66,7 +68,9 @@ fn ready(
         return Ok((false, namespace));
     }
     let expected_owners = if let Some(expected) = installed {
-        check_installed(db, recorded, expected)?;
+        if check_payload {
+            check_installed(db, recorded, expected)?;
+        }
         if expected.recorded != recorded {
             return Err(OverlayError::Invalid("checkpoint cleanup original owners"));
         }
@@ -134,7 +138,7 @@ fn ready(
         (Some(owner), Some(request), Some(floor), Some(released))
             if owner > 0
                 && request == generation
-                && if phase == 3 {
+                && if matches!(phase, 3 | 6) {
                     floor == state.installed
                 } else {
                     floor >= 0 && floor < generation
@@ -236,7 +240,7 @@ fn ready(
             ))
         }
     }
-    if (phase == 3 && cleanup.fold_completed != Some(1))
+    if (matches!(phase, 3 | 6) && cleanup.fold_completed != Some(1))
         || (matches!(phase, 4 | 5) && cleanup.fold_completed.is_some())
         || cleanup.retire_completed != Some(1)
         || state.consolidating.is_some()
@@ -326,6 +330,57 @@ fn check_installed(
     Ok(())
 }
 
+/// This only checks local original custody; Store authority remains external.
+pub(super) fn recovery_ready(
+    db: &Overlay,
+    recorded: RecordedCapture,
+    phase: i64,
+    installed: Option<CheckpointCompletion<'_>>,
+) -> OverlayResult<bool> {
+    if !matches!((phase, installed.is_some()), (3 | 6, false) | (4, true)) {
+        return Err(OverlayError::Invalid("checkpoint recovery cleanup phase"));
+    }
+    ready(db, recorded, installed, None, phase, false).map(|(complete, _)| complete)
+}
+
+/// Finish only after local proof and the strict ordinary recovery barrier both
+/// hold in the same transaction. The caller authenticates Store disposition.
+pub(super) fn finish_recovery(
+    db: &Overlay,
+    recorded: RecordedCapture,
+    phase: i64,
+    installed: Option<CheckpointCompletion<'_>>,
+    root: [u8; 32],
+    snapshot: &[u8],
+) -> OverlayResult<()> {
+    if !matches!((phase, installed.is_some()), (3 | 6, false) | (4, true)) {
+        return Err(OverlayError::Invalid("checkpoint recovery cleanup phase"));
+    }
+    db.atomic_cleanup(|| {
+        let (complete, namespace) = ready(db, recorded, installed, None, phase, true)?;
+        if !complete {
+            return Err(OverlayError::Invalid("checkpoint recovery cleanup pending"));
+        }
+        let changed = db.execute(
+            StatementKind::Frontier,
+            "DELETE FROM durable_checkpoint_attempt WHERE id=1 AND phase=?1 AND attempt=?2 AND namespace=?3 AND generation=?4",
+            &[&phase, &recorded.attempt.as_slice(), &namespace, &recorded.capture.generation.0],
+            56,
+        )?;
+        if changed != 1 {
+            return Err(OverlayError::Invalid("checkpoint recovery cleanup predecessor"));
+        }
+        db.require_recorded_ready_in_cleanup()?;
+        if db.durable_namespace()? != Some(namespace)
+            || db.state()?.base_root != root
+            || db.durable_binding()?.as_deref() != Some(snapshot)
+        {
+            return Err(OverlayError::Invalid("checkpoint recovery final binding"));
+        }
+        Ok(())
+    })
+}
+
 impl Overlay {
     /// Observes only the original folded checkpoint's local cleanup; it does
     /// not drive maintenance or authenticate any external Store publication.
@@ -333,14 +388,14 @@ impl Overlay {
         &self,
         recorded: RecordedCapture,
     ) -> OverlayResult<bool> {
-        ready(self, recorded, None, None).map(|(ready, _)| ready)
+        ready(self, recorded, None, None, 3, true).map(|(ready, _)| ready)
     }
 
     /// Rechecks and finishes the original definitely unpublished attempt once.
     /// Its caller must already have established that no publication was sent.
     pub fn finish_folded_checkpoint_cleanup(&self, recorded: RecordedCapture) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
-            let (complete, namespace) = ready(self, recorded, None, None)?;
+            let (complete, namespace) = ready(self, recorded, None, None, 3, true)?;
             if !complete {
                 return Err(OverlayError::Invalid("checkpoint fold cleanup pending"));
             }
@@ -363,7 +418,7 @@ impl Overlay {
         &self,
         expected: CheckpointCompletion<'_>,
     ) -> OverlayResult<bool> {
-        ready(self, expected.recorded, Some(expected), None).map(|(ready, _)| ready)
+        ready(self, expected.recorded, Some(expected), None, 3, true).map(|(ready, _)| ready)
     }
 
     /// Finishes the exact installed checkpoint after its authenticated
@@ -374,7 +429,7 @@ impl Overlay {
     ) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             let recorded = expected.recorded;
-            let (complete, namespace) = ready(self, recorded, Some(expected), None)?;
+            let (complete, namespace) = ready(self, recorded, Some(expected), None, 3, true)?;
             if !complete {
                 return Err(OverlayError::Invalid("checkpoint installed cleanup pending"));
             }
@@ -396,7 +451,15 @@ impl Overlay {
         &self,
         expected: ConflictCompletion<'_>,
     ) -> OverlayResult<bool> {
-        ready(self, expected.stage.recorded(), None, Some(expected)).map(|(ready, _)| ready)
+        ready(
+            self,
+            expected.stage.recorded(),
+            None,
+            Some(expected),
+            3,
+            true,
+        )
+        .map(|(ready, _)| ready)
     }
 
     /// Finishes only the local attempt. Its active conflict plan remains bound
@@ -407,7 +470,7 @@ impl Overlay {
     ) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             let recorded=expected.stage.recorded();
-            let (complete,namespace)=ready(self,recorded,None,Some(expected))?;
+            let (complete,namespace)=ready(self,recorded,None,Some(expected),3,true)?;
             if !complete { return Err(OverlayError::Invalid("conflict cleanup pending")); }
             if self.execute(StatementKind::Frontier,
                 "DELETE FROM durable_checkpoint_attempt WHERE id=1 AND phase=5 AND attempt=?1 AND namespace=?2 AND generation=?3",

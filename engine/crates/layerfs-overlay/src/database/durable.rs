@@ -559,10 +559,9 @@ mod linux {
             && profile.schema_version == 44
             && bound
             && pending_attempt
-            && state.captured.is_some()
             && !pending_conflict;
         if state.closed
-            || state.consolidating.is_some()
+            || (state.consolidating.is_some() && !checkpoint)
             || (!checkpoint && (state.captured.is_some() || held || pending || pending_attempt))
             || (pending_conflict && !settled_conflict)
             || (pending_conflict && settled_conflict && (profile.schema_version != 44 || !bound))

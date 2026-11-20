@@ -51,14 +51,11 @@ pub fn check_checkpoint_outcome(
 }
 
 impl Store {
-    /// Reads the exact recorded outcome from this Store; it never publishes.
-    /// None is only an observation and is not proof that a writer has stopped
-    /// or permission to replay the request. The caller authenticates the Store
-    /// and Workspace custody independently before using the result.
-    pub fn observe_original_checkpoint(
+    /// Validates the frozen input against this Store without reading an outcome.
+    pub(super) fn validate_original_checkpoint(
         &self,
-        original: OriginalCheckpoint<'_>,
-    ) -> HistoryResult<Option<CheckpointObservation>> {
+        original: &OriginalCheckpoint<'_>,
+    ) -> HistoryResult<CommitRequest> {
         let history = self.history();
         if !self.has_durable_writer()
             || history.catalog_id() != original.catalog
@@ -93,6 +90,20 @@ impl Store {
         {
             return Err(HistoryError::Integrity("checkpoint Branch identity"));
         }
+        Ok(request)
+    }
+
+    /// Reads the exact recorded outcome from this Store; it never publishes.
+    /// None is only an observation and is not proof that a writer has stopped
+    /// or permission to replay the request. The caller authenticates the Store
+    /// and Workspace custody independently before using the result.
+    pub fn observe_original_checkpoint(
+        &self,
+        original: OriginalCheckpoint<'_>,
+    ) -> HistoryResult<Option<CheckpointObservation>> {
+        let request = self.validate_original_checkpoint(&original)?;
+        let history = self.history();
+        let target = original.target;
         let Some(receipt) = history.checkpoint_receipt(original.attempt)? else {
             return Ok(None);
         };

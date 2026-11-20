@@ -1,7 +1,8 @@
 //! An unrouteable observation of one original, captured checkpoint.
 use crate::{
-    Capture, CapturedReader, OperationOwner, Overlay, OverlayError, OverlayResult, RecordedCapture,
-    StatementKind,
+    Capture, CapturedReader, CheckpointCompletion, CheckpointOutcome, Generation,
+    MaintenanceCursor, MaintenanceStep, OperationOwner, Overlay, OverlayError, OverlayResult,
+    RecordedCapture, StatementKind,
 };
 use std::fmt;
 
@@ -27,18 +28,25 @@ pub struct CheckpointRecord {
     pub request_digest: Option<[u8; 32]>,
     pub candidate_root: Option<[u8; 32]>,
     pub target_snapshot: Option<Vec<u8>>,
+    pub installed_snapshot: Option<Vec<u8>>,
+    pub outcome: Option<CheckpointOutcome>,
     pub reader_held: bool,
     pub operation_held: bool,
 }
 
-/// Owns the original lease and internally reconstructed custody, but cannot
-/// create a route, advance a namespace, or release the original checkpoint.
+/// Owns the original lease and internally reconstructed custody. Its local
+/// operations cannot authenticate a Store or advance a Workspace namespace.
 pub struct PendingCheckpointRecovery {
     db: Overlay,
     observed: CheckpointRecord,
-    _recorded: RecordedCapture,
-    _reader: Option<CapturedReader>,
-    _operation: Option<OperationOwner>,
+    recorded: RecordedCapture,
+    reader: Option<CapturedReader>,
+    operation: Option<OperationOwner>,
+    reader_held: bool,
+    operation_held: bool,
+    phase: i64,
+    installed: Option<(Vec<u8>, CheckpointOutcome)>,
+    request_verified: bool,
 }
 
 impl fmt::Debug for PendingCheckpointRecovery {
@@ -73,6 +81,12 @@ struct Row {
     operation_completed: Option<i64>,
     conflict_generation: Option<i64>,
     conflict_completed: Option<i64>,
+    installed_snapshot: Option<Vec<u8>>,
+    outcome_kind: Option<i64>,
+    outcome_head: Option<Vec<u8>>,
+    outcome_displaced: Option<Vec<u8>>,
+    fold_completed: Option<i64>,
+    retire_completed: Option<i64>,
 }
 
 fn fixed(value: Vec<u8>) -> OverlayResult<[u8; 32]> {
@@ -88,6 +102,16 @@ fn positive(value: i64) -> OverlayResult<u64> {
         .ok_or(OverlayError::Invalid("checkpoint recovery owner"))
 }
 
+fn commit_id(value: Vec<u8>) -> OverlayResult<[u8; 33]> {
+    let value: [u8; 33] = value
+        .try_into()
+        .map_err(|_| OverlayError::Invalid("checkpoint recovery outcome"))?;
+    if value[0] != 0x12 {
+        return Err(OverlayError::Invalid("checkpoint recovery outcome"));
+    }
+    Ok(value)
+}
+
 impl PendingCheckpointRecovery {
     pub(super) fn open(db: Overlay) -> OverlayResult<Self> {
         let state = db.state()?;
@@ -95,7 +119,8 @@ impl PendingCheckpointRecovery {
             StatementKind::Frontier,
             "SELECT attempt,workspace,catalog,incarnation,namespace,generation,revision,base_root,snapshot,phase,\
              length(request),request_digest,candidate_root,target_snapshot,reader_owner,reader_request,reader_floor,\
-             reader_released,operation_owner,operation_released,operation_cleanup_completed,conflict_generation,conflict_cleanup_completed \
+             reader_released,operation_owner,operation_released,operation_cleanup_completed,conflict_generation,conflict_cleanup_completed,\
+             installed_snapshot,outcome_kind,outcome_head,outcome_displaced,fold_completed,retire_completed \
              FROM durable_checkpoint_attempt WHERE id=1",
             &[], 256,
             |r| Ok(Row { attempt:r.get(0)?, workspace:r.get(1)?, catalog:r.get(2)?, incarnation:r.get(3)?,
@@ -104,7 +129,9 @@ impl PendingCheckpointRecovery {
                 candidate_root:r.get(12)?, target_snapshot:r.get(13)?, reader:r.get(14)?,
                 reader_request:r.get(15)?, reader_floor:r.get(16)?, reader_released:r.get(17)?,
                 operation:r.get(18)?, operation_released:r.get(19)?, operation_completed:r.get(20)?,
-                conflict_generation:r.get(21)?, conflict_completed:r.get(22)? }),
+                conflict_generation:r.get(21)?, conflict_completed:r.get(22)?,
+                installed_snapshot:r.get(23)?, outcome_kind:r.get(24)?, outcome_head:r.get(25)?, outcome_displaced:r.get(26)?,
+                fold_completed:r.get(27)?, retire_completed:r.get(28)? }),
         )?;
         let [row] = rows.as_slice() else {
             return Err(OverlayError::Invalid("checkpoint recovery predecessor"));
@@ -114,42 +141,41 @@ impl PendingCheckpointRecovery {
         let attempt = fixed(row.attempt.clone())?;
         let base_root = fixed(row.base_root.clone())?;
         let incarnation = positive(row.incarnation)?;
-        let generation = state
-            .captured
-            .ok_or(OverlayError::Invalid("checkpoint recovery capture"))?;
-        if generation.number() != row.generation
-            || state.captured_revision != Some(row.revision)
-            || state.base_root != base_root
-            || row.generation.checked_add(1) != Some(state.active.number())
-            || state.installed >= row.generation
-            || state.revision < row.revision
-            || db.durable_namespace()? != Some(row.namespace)
-        {
+        if row.generation <= 0 || db.durable_namespace()? != Some(row.namespace) {
             return Err(OverlayError::Invalid("checkpoint recovery capture"));
         }
         let capture = Capture {
             engine: db.engine(),
-            generation,
+            generation: Generation(row.generation),
             revision: row.revision,
             base_root,
         };
         let recorded = RecordedCapture { capture, attempt };
-        if !matches!(row.phase, 1 | 2)
+        if !matches!(row.phase, 1 | 2 | 3 | 4 | 6)
             || row.conflict_generation.is_some()
             || row.conflict_completed.is_some()
         {
             return Err(OverlayError::Invalid("checkpoint recovery phase"));
         }
+        if matches!(row.phase, 1 | 2)
+            && (row.generation.checked_add(1) != Some(state.active.number())
+                || state.installed >= row.generation
+                || state.revision < row.revision
+                || state.consolidating.is_some())
+        {
+            return Err(OverlayError::Invalid("checkpoint recovery capture"));
+        }
         super::durable_attempt::check_context(&db, recorded, false)?;
         let (request_bytes, request_digest, candidate_root, target_snapshot) = match row.phase {
-            1 if row.request_bytes.is_none()
-                && row.request_digest.is_none()
-                && row.candidate_root.is_none()
-                && row.target_snapshot.is_none() =>
+            1 | 3
+                if row.request_bytes.is_none()
+                    && row.request_digest.is_none()
+                    && row.candidate_root.is_none()
+                    && row.target_snapshot.is_none() =>
             {
                 (None, None, None, None)
             }
-            2 => {
+            2 | 4 | 6 => {
                 let length = positive(
                     row.request_bytes
                         .ok_or(OverlayError::Invalid("checkpoint recovery request"))?,
@@ -173,6 +199,33 @@ impl PendingCheckpointRecovery {
             }
             _ => return Err(OverlayError::Invalid("checkpoint recovery phase")),
         };
+        let (installed_snapshot, outcome) = match row.phase {
+            4 => {
+                let snapshot = row
+                    .installed_snapshot
+                    .clone()
+                    .filter(|value| !value.is_empty() && value.len() <= 4096)
+                    .ok_or(OverlayError::Invalid("checkpoint recovery outcome"))?;
+                let head = row.outcome_head.clone().map(commit_id).transpose()?;
+                let displaced = row.outcome_displaced.clone().map(commit_id).transpose()?;
+                let outcome = match (row.outcome_kind, head, displaced) {
+                    (Some(1), Some(head), displaced) => {
+                        CheckpointOutcome::Committed { head, displaced }
+                    }
+                    (Some(2), head, None) => CheckpointOutcome::UpToDate { head },
+                    _ => return Err(OverlayError::Invalid("checkpoint recovery outcome")),
+                };
+                (Some(snapshot), Some(outcome))
+            }
+            _ if row.installed_snapshot.is_none()
+                && row.outcome_kind.is_none()
+                && row.outcome_head.is_none()
+                && row.outcome_displaced.is_none() =>
+            {
+                (None, None)
+            }
+            _ => return Err(OverlayError::Invalid("checkpoint recovery outcome")),
+        };
         let (reader, reader_held) = match (
             row.reader,
             row.reader_request,
@@ -182,7 +235,11 @@ impl PendingCheckpointRecovery {
             (None, None, None, None) => (None, false),
             (Some(owner), Some(request), Some(floor), Some(released))
                 if request == row.generation
-                    && floor == state.installed
+                    && if row.phase == 4 {
+                        floor >= 0 && floor < row.generation
+                    } else {
+                        floor == state.installed
+                    }
                     && matches!(released, 0 | 1) =>
             {
                 (
@@ -247,6 +304,7 @@ impl PendingCheckpointRecovery {
             }
             open.commit();
         }
+        let installed = installed_snapshot.clone().zip(outcome);
         Ok(Self {
             observed: CheckpointRecord {
                 workspace,
@@ -263,13 +321,20 @@ impl PendingCheckpointRecovery {
                 request_digest,
                 candidate_root,
                 target_snapshot,
+                installed_snapshot,
+                outcome,
                 reader_held,
                 operation_held,
             },
             db,
-            _recorded: recorded,
-            _reader: reader,
-            _operation: operation,
+            recorded,
+            reader,
+            operation,
+            reader_held,
+            operation_held,
+            phase: row.phase,
+            installed,
+            request_verified: false,
         })
     }
 
@@ -296,7 +361,7 @@ impl PendingCheckpointRecovery {
         let limit = i64::try_from(wanted)
             .map_err(|_| OverlayError::Invalid("checkpoint recovery request offset"))?;
         let rows:Vec<Vec<u8>> = self.db.query(StatementKind::Frontier,
-            "SELECT substr(request,?1,?2) FROM durable_checkpoint_attempt WHERE id=1 AND phase=2 AND attempt=?3 AND namespace=?4",
+            "SELECT substr(request,?1,?2) FROM durable_checkpoint_attempt WHERE id=1 AND phase IN(2,4,6) AND attempt=?3 AND namespace=?4",
             &[&start,&limit,&self.observed.attempt.as_slice(),&self.observed.namespace], wanted + 32, |r| r.get(0))?;
         let [page] = rows.as_slice() else {
             return Err(OverlayError::Invalid("checkpoint recovery request"));
@@ -305,6 +370,267 @@ impl PendingCheckpointRecovery {
             return Err(OverlayError::Invalid("checkpoint recovery request"));
         }
         Ok(page.clone())
+    }
+
+    /// The original local phase; it is not an external publication result.
+    pub fn phase(&self) -> i64 {
+        self.phase
+    }
+
+    fn verify_request(&self, request: &[u8]) -> OverlayResult<()> {
+        let length = u64::try_from(request.len())
+            .map_err(|_| OverlayError::Invalid("checkpoint recovery request"))?;
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"layerfs/checkpoint-request/v1\0");
+        hash.update(request);
+        if self.observed.request_bytes != Some(length)
+            || self.observed.request_digest != Some(*hash.finalize().as_bytes())
+        {
+            return Err(OverlayError::Invalid("checkpoint recovery request"));
+        }
+        let mut offset = 0_u64;
+        for expected in request.chunks(REQUEST_PAGE as usize) {
+            if self.request_page(offset)? != expected {
+                return Err(OverlayError::Invalid("checkpoint recovery request"));
+            }
+            offset += expected.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Validate the entire frozen request in bounded local pages. This is
+    /// only an input identity check and does not authenticate a Store.
+    pub fn verify_frozen_request(&mut self, request: &[u8]) -> OverlayResult<()> {
+        self.verify_request(request)?;
+        self.request_verified = true;
+        Ok(())
+    }
+
+    /// Schedule the original phase-1 capture for local folding. The caller
+    /// must independently fence the previous writer and authenticate Store.
+    pub fn fold_before_publication(&mut self) -> OverlayResult<()> {
+        if self.phase != 1 {
+            return Err(OverlayError::Invalid("checkpoint recovery fold phase"));
+        }
+        self.db.fold_unpublished_checkpoint(self.recorded)?;
+        self.phase = 3;
+        Ok(())
+    }
+
+    /// Locally schedule phase 2 for folding while preserving its complete
+    /// request. The caller must establish nonpublication from the same Store
+    /// while holding its publication lane and fencing all original writers.
+    pub fn fold_after_absent_receipt(&mut self) -> OverlayResult<()> {
+        if self.phase != 2 || !self.request_verified {
+            return Err(OverlayError::Invalid("checkpoint recovery fold phase"));
+        }
+        let record = &self.observed;
+        let length = i64::try_from(
+            record
+                .request_bytes
+                .ok_or(OverlayError::Invalid("checkpoint recovery request"))?,
+        )
+        .map_err(|_| OverlayError::Invalid("checkpoint recovery request"))?;
+        let digest = record
+            .request_digest
+            .ok_or(OverlayError::Invalid("checkpoint recovery request"))?;
+        let candidate = record
+            .candidate_root
+            .ok_or(OverlayError::Invalid("checkpoint recovery request"))?;
+        let target = record
+            .target_snapshot
+            .as_deref()
+            .ok_or(OverlayError::Invalid("checkpoint recovery request"))?;
+        self.db.atomic_cleanup(|| {
+            let namespace = super::durable_attempt::check_context(&self.db, self.recorded, false)?;
+            super::durable_conflict_stage::require_no_stage(&self.db, self.recorded, 2)?;
+            let changed = self.db.execute(
+                StatementKind::Frontier,
+                "UPDATE durable_checkpoint_attempt SET phase=6,fold_completed=0,retire_completed=0 \
+                 WHERE id=1 AND phase=2 AND attempt=?1 AND namespace=?2 AND generation=?3 \
+                 AND length(request)=?4 AND request_digest=?5 AND candidate_root=?6 AND target_snapshot=?7",
+                &[&record.attempt.as_slice(), &namespace, &record.generation, &length,
+                  &digest.as_slice(), &candidate.as_slice(), &target],
+                target.len() as u64 + 120,
+            )?;
+            if changed != 1 {
+                return Err(OverlayError::Invalid("checkpoint recovery fold predecessor"));
+            }
+            self.db.schedule_failed_capture(self.recorded.capture)
+        })?;
+        self.phase = 6;
+        Ok(())
+    }
+
+    /// Install locally after the caller authenticates the exact Store result
+    /// and candidate. The outcome fields themselves are not Store authority.
+    pub fn install_original_receipt(
+        &mut self,
+        installed_snapshot: &[u8],
+        outcome: CheckpointOutcome,
+    ) -> OverlayResult<()> {
+        if self.phase != 2 || !self.request_verified {
+            return Err(OverlayError::Invalid("checkpoint recovery install phase"));
+        }
+        let digest = self
+            .observed
+            .request_digest
+            .ok_or(OverlayError::Invalid("checkpoint recovery request"))?;
+        let candidate = self
+            .observed
+            .candidate_root
+            .ok_or(OverlayError::Invalid("checkpoint recovery request"))?;
+        let target = self
+            .observed
+            .target_snapshot
+            .as_deref()
+            .ok_or(OverlayError::Invalid("checkpoint recovery request"))?;
+        let snapshot = installed_snapshot.to_vec();
+        self.db.install_recorded_checkpoint(
+            self.recorded,
+            digest,
+            candidate,
+            target,
+            &snapshot,
+            outcome,
+        )?;
+        self.installed = Some((snapshot, outcome));
+        self.phase = 4;
+        Ok(())
+    }
+
+    /// Releases only the original, locally authenticated owners, in order.
+    /// On error this object keeps the original lease and all remaining state.
+    pub fn release_original_owners(&mut self) -> OverlayResult<()> {
+        if !matches!(self.phase, 3 | 4 | 6) {
+            return Err(OverlayError::Invalid("checkpoint recovery release phase"));
+        }
+        if self.reader_held {
+            self.db.release_captured_reader(
+                self.reader
+                    .ok_or(OverlayError::Invalid("checkpoint recovery reader"))?,
+            )?;
+            self.reader_held = false;
+        }
+        if self.operation_held {
+            self.db.release_operation(
+                self.operation
+                    .ok_or(OverlayError::Invalid("checkpoint recovery operation"))?,
+            )?;
+            self.operation_held = false;
+        }
+        Ok(())
+    }
+
+    fn completion<'a>(&'a self, request: &'a [u8]) -> OverlayResult<CheckpointCompletion<'a>> {
+        let (snapshot, outcome) = self
+            .installed
+            .as_ref()
+            .ok_or(OverlayError::Invalid("checkpoint recovery outcome"))?;
+        Ok(CheckpointCompletion {
+            recorded: self.recorded,
+            request,
+            request_digest: self
+                .observed
+                .request_digest
+                .ok_or(OverlayError::Invalid("checkpoint recovery request"))?,
+            candidate_root: self
+                .observed
+                .candidate_root
+                .ok_or(OverlayError::Invalid("checkpoint recovery request"))?,
+            target_snapshot: self
+                .observed
+                .target_snapshot
+                .as_deref()
+                .ok_or(OverlayError::Invalid("checkpoint recovery request"))?,
+            installed_snapshot: snapshot,
+            outcome: *outcome,
+            reader: self.reader,
+            operation: self.operation,
+        })
+    }
+
+    /// A bounded local readiness observation; it does not drive maintenance.
+    pub fn cleanup_ready(&self, request: Option<&[u8]>) -> OverlayResult<bool> {
+        let installed =
+            if self.phase == 4 {
+                Some(self.completion(
+                    request.ok_or(OverlayError::Invalid("checkpoint recovery request"))?,
+                )?)
+            } else {
+                None
+            };
+        super::durable_cleanup::recovery_ready(&self.db, self.recorded, self.phase, installed)
+    }
+
+    /// One bounded local maintenance step; no old business call is sent.
+    pub fn maintain(
+        &mut self,
+        cursor: MaintenanceCursor,
+    ) -> OverlayResult<Option<MaintenanceStep>> {
+        if !matches!(self.phase, 3 | 4 | 6) || self.reader_held || self.operation_held {
+            return Err(OverlayError::Invalid(
+                "checkpoint recovery maintenance phase",
+            ));
+        }
+        self.db.maintain(cursor)
+    }
+
+    /// Completes local settlement without advancing the namespace. The caller
+    /// must independently revalidate the same Store outcome before calling.
+    #[allow(clippy::result_large_err)]
+    pub fn complete_settled(
+        self,
+        request: Option<&[u8]>,
+        installed: Option<(&[u8], CheckpointOutcome)>,
+    ) -> Result<Overlay, (OverlayError, Self)> {
+        let result = (|| {
+            if self.reader_held || self.operation_held {
+                return Err(OverlayError::Invalid("checkpoint recovery owners held"));
+            }
+            let completion = match self.phase {
+                3 if request.is_none() && installed.is_none() => None,
+                6 if installed.is_none() => {
+                    self.verify_request(
+                        request.ok_or(OverlayError::Invalid("checkpoint recovery request"))?,
+                    )?;
+                    None
+                }
+                4 => {
+                    let request =
+                        request.ok_or(OverlayError::Invalid("checkpoint recovery request"))?;
+                    self.verify_request(request)?;
+                    let completion = self.completion(request)?;
+                    if installed != Some((completion.installed_snapshot, completion.outcome)) {
+                        return Err(OverlayError::Invalid(
+                            "checkpoint recovery installed outcome",
+                        ));
+                    }
+                    Some(completion)
+                }
+                _ => {
+                    return Err(OverlayError::Invalid(
+                        "checkpoint recovery completion phase",
+                    ))
+                }
+            };
+            let (root, snapshot) = match completion {
+                Some(value) => (value.candidate_root, value.installed_snapshot),
+                None => (self.observed.base_root, self.observed.snapshot.as_slice()),
+            };
+            super::durable_cleanup::finish_recovery(
+                &self.db,
+                self.recorded,
+                self.phase,
+                completion,
+                root,
+                snapshot,
+            )
+        })();
+        match result {
+            Ok(()) => Ok(self.db),
+            Err(error) => Err((error, self)),
+        }
     }
 }
 
@@ -329,12 +655,15 @@ fn validate_custody(
          EXISTS(SELECT 1 FROM commit_record WHERE operation<?1) OR EXISTS(SELECT 1 FROM commit_record WHERE operation>?1),\
          EXISTS(SELECT 1 FROM commit_record WHERE operation=?1),\
          EXISTS(SELECT 1 FROM cleanup_task WHERE kind=6 AND resource=?1 AND target=2),\
-         EXISTS(SELECT 1 FROM cleanup_task WHERE ready=0) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind IN(1,2,7,8,10,11,13)) \
+         EXISTS(SELECT 1 FROM cleanup_task WHERE ready=0 AND NOT (resource=0 AND target=?2 AND ((kind=1 AND ?4 IN(3,6)) OR (kind=3 AND ?4 IN(3,4,6))))) \
+         OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind IN(2,7,10,11,13)) \
+         OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=1 AND NOT (resource=0 AND target=?2 AND ?4 IN(3,6))) \
+         OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=8 AND NOT (resource=0 AND target=?2 AND ?4 IN(3,4,6))) \
          OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=9 AND resource>0) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=9 AND resource=0 AND target<?2) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=9 AND resource=0 AND target>?2) \
          OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=6 AND resource<?1) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=6 AND resource>?1) \
          OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=6 AND resource=?1 AND target<2) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=6 AND resource=?1 AND target>2) \
-         OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource>0) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource=0 AND target<=0) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource=0 AND target>?3)",
-        &[&owner,&row.generation,&db.state()?.installed], 64,
+         OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource>0) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource=0 AND target<=0) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource=0 AND target>?3 AND NOT (target=?2 AND ?4 IN(3,4,6)))",
+        &[&owner,&row.generation,&db.state()?.installed,&row.phase], 64,
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
     let [(
         orphan,
@@ -412,6 +741,33 @@ fn validate_custody(
     )?;
     if wake.as_slice() == [true] && (reader_held || row.reader_released != Some(1)) {
         return Err(OverlayError::Invalid("checkpoint recovery reader wake"));
+    }
+    let work: Vec<(bool, bool)> = db.query(
+        StatementKind::Frontier,
+        "SELECT EXISTS(SELECT 1 FROM cleanup_task WHERE kind=1 AND resource=0 AND target=?1), \
+         EXISTS(SELECT 1 FROM cleanup_task WHERE kind=3 AND resource=0 AND target=?1)",
+        &[&row.generation],
+        16,
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let state = db.state()?;
+    let consistent = match (
+        row.phase,
+        row.fold_completed,
+        row.retire_completed,
+        work.as_slice(),
+    ) {
+        (1 | 2, None, None, [(false, false)]) => true,
+        (3 | 6, Some(0), Some(0), [(true, false)]) => {
+            state.consolidating == Some(Generation(row.generation))
+        }
+        (3 | 6, Some(1), Some(0), [(false, true)]) => state.consolidating.is_none(),
+        (3 | 6, Some(1), Some(1), [(false, false)]) => state.consolidating.is_none(),
+        (4, None, Some(0), [(false, true)]) | (4, None, Some(1), [(false, false)]) => true,
+        _ => false,
+    };
+    if !consistent {
+        return Err(OverlayError::Invalid("checkpoint recovery maintenance"));
     }
     Ok(())
 }

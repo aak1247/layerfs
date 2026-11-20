@@ -245,6 +245,101 @@ fn pending_checkpoint_rejects_a_detached_conflict_stage_identity() {
 }
 
 #[test]
+fn pending_checkpoint_rejects_a_changed_active_generation_without_effects() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let generation = recorded.capture().generation.number();
+    drop(db);
+    let sql = rusqlite::Connection::open(&fixture.path()).unwrap();
+    assert_eq!(
+        sql.execute(
+            "UPDATE durable_state SET active=?1 WHERE id=1",
+            [generation + 2]
+        )
+        .unwrap(),
+        1
+    );
+    drop(sql);
+    assert!(matches!(
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE),
+        Err(OverlayError::Invalid("checkpoint recovery capture"))
+    ));
+    let sql = rusqlite::Connection::open(&fixture.path()).unwrap();
+    let retained: (i64, i64, i64, i64) = sql.query_row(
+        "SELECT a.phase,s.active,r.high_namespace,(SELECT count(*) FROM cleanup_task) FROM durable_checkpoint_attempt a,durable_state s,durable_route r WHERE a.id=1 AND s.id=1 AND r.id=1",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).unwrap();
+    assert_eq!(retained, (1, generation + 2, 7, 0));
+}
+
+#[test]
+fn checkpoint_cleanup_rolls_back_when_post_delete_readiness_fails() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let attempt = recorded.attempt();
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch(
+        "CREATE TRIGGER inject_post_delete_work AFTER DELETE ON durable_checkpoint_attempt \
+         BEGIN INSERT INTO cleanup_task(kind,resource,target) VALUES(2,0,1); END;",
+    )
+    .unwrap();
+    drop(sql);
+    let OverlayCatalogRecovery::PendingCheckpoint(mut pending) =
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap()
+    else {
+        panic!("expected original checkpoint")
+    };
+    pending.fold_before_publication().unwrap();
+    pending.release_original_owners().unwrap();
+    let mut cursor = MaintenanceCursor::default();
+    for _ in 0..512 {
+        if pending.cleanup_ready(None).unwrap() {
+            break;
+        }
+        cursor = pending
+            .maintain(cursor)
+            .unwrap()
+            .expect("bounded maintenance")
+            .cursor;
+    }
+    assert!(pending.cleanup_ready(None).unwrap());
+    let Err((error, pending)) = pending.complete_settled(None, None) else {
+        panic!("strict readiness must reject injected work")
+    };
+    assert!(matches!(
+        error,
+        OverlayError::Invalid("durable overlay requires reconciliation")
+    ));
+    drop(pending);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let state: (i64, Vec<u8>, i64, i64, i64) = sql.query_row(
+        "SELECT phase,attempt,fold_completed,retire_completed,(SELECT count(*) FROM cleanup_task WHERE kind=2) FROM durable_checkpoint_attempt WHERE id=1",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).unwrap();
+    assert_eq!(state, (3, attempt.to_vec(), 1, 1, 0));
+    sql.execute_batch("DROP TRIGGER inject_post_delete_work;")
+        .unwrap();
+    drop(sql);
+    let OverlayCatalogRecovery::PendingCheckpoint(pending) =
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap()
+    else {
+        panic!("expected retained checkpoint")
+    };
+    let db = pending
+        .complete_settled(None, None)
+        .unwrap_or_else(|(error, _)| panic!("{error:?}"));
+    db.require_recorded_recovery_ready().unwrap();
+    assert_eq!(db.durable_namespace().unwrap(), Some(7));
+}
+
+#[test]
 fn failed_final_page_folds_and_reclaims_only_the_written_prefix() {
     let fixture = Fixture::new();
     let db = fixture.create();

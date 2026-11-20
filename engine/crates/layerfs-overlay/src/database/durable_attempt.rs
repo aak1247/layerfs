@@ -252,25 +252,26 @@ pub(super) fn check_context(
         return Err(OverlayError::Invalid("checkpoint publication predecessor"));
     };
     if (starting && original.phase != 1)
-        || (!starting && ![1, 2, 3, 4, 5].contains(&original.phase))
-        || (original.phase == 5 && db.profile.schema_version != 44)
+        || (!starting && ![1, 2, 3, 4, 5, 6].contains(&original.phase))
+        || (matches!(original.phase, 5 | 6) && db.profile.schema_version != 44)
     {
         return Err(OverlayError::Invalid("checkpoint publication predecessor"));
     }
     match original.phase {
         1 | 2 => db.checked_capture(capture)?,
-        3 if capture.engine() == db.identity
-            && state.captured.is_none()
-            && state.base_root == capture.base_root
-            && state.installed < capture.generation.0
-            && capture.generation.0.checked_add(1) == Some(state.active.0)
-            && state.revision >= capture.revision
-            && original
-                .reader_floor
-                .is_none_or(|floor| floor == state.installed)
-            && state
-                .consolidating
-                .is_none_or(|value| value == capture.generation) => {}
+        3 | 6
+            if capture.engine() == db.identity
+                && state.captured.is_none()
+                && state.base_root == capture.base_root
+                && state.installed < capture.generation.0
+                && capture.generation.0.checked_add(1) == Some(state.active.0)
+                && state.revision >= capture.revision
+                && original
+                    .reader_floor
+                    .is_none_or(|floor| floor == state.installed)
+                && state
+                    .consolidating
+                    .is_none_or(|value| value == capture.generation) => {}
         4 if capture.engine() == db.identity
             && state.captured.is_none()
             && state.captured_revision.is_none()
@@ -303,7 +304,7 @@ pub(super) fn check_context(
         .transpose()
         .map_err(|_| OverlayError::Invalid("checkpoint pending identity"))?;
     let active = super::durable_conflict_stage::active_conflict(db)?;
-    if matches!(original.phase, 1..=3) {
+    if matches!(original.phase, 1..=3 | 6) {
         if active.as_ref().map(|c| c.digest).as_ref() != pending
             || active.as_ref().is_some_and(|c| {
                 c.workspace != original.workspace
@@ -559,22 +560,22 @@ pub(crate) fn maintenance_completed(
     };
     let statement = match (kind, resource, target) {
         (1, 0, generation) if generation == context.generation => {
-            if context.phase != 3
+            if !matches!(context.phase, 3 | 6)
                 || context.fold_completed != Some(0)
                 || context.retire_completed != Some(0)
             {
                 return Err(OverlayError::Invalid("checkpoint fold completion"));
             }
-            "UPDATE durable_checkpoint_attempt SET fold_completed=1 WHERE id=1 AND phase=3 AND generation=?1 AND fold_completed=0"
+            "UPDATE durable_checkpoint_attempt SET fold_completed=1 WHERE id=1 AND phase IN(3,6) AND generation=?1 AND fold_completed=0"
         }
         (3, 0, generation) if generation == context.generation => {
-            if ![3, 4, 5].contains(&context.phase)
-                || (context.phase == 3 && context.fold_completed != Some(1))
+            if ![3, 4, 5, 6].contains(&context.phase)
+                || (matches!(context.phase, 3 | 6) && context.fold_completed != Some(1))
                 || context.retire_completed != Some(0)
             {
                 return Err(OverlayError::Invalid("checkpoint retirement completion"));
             }
-            "UPDATE durable_checkpoint_attempt SET retire_completed=1 WHERE id=1 AND phase IN(3,4,5) AND generation=?1 AND retire_completed=0"
+            "UPDATE durable_checkpoint_attempt SET retire_completed=1 WHERE id=1 AND phase IN(3,4,5,6) AND generation=?1 AND retire_completed=0"
         }
         (6, owner, _) if context.operation == Some(owner) => {
             if target != 2
@@ -720,7 +721,7 @@ impl Overlay {
             .ok_or(OverlayError::Invalid("checkpoint publication size"))?;
         self.atomic_cleanup(|| {
             let namespace = check_original(self, recorded)?;
-            super::durable_conflict_stage::require_no_stage(self, recorded)?;
+            super::durable_conflict_stage::require_no_stage(self, recorded, 1)?;
             let capture = recorded.capture;
             let changed = self.execute(
                 StatementKind::Frontier,

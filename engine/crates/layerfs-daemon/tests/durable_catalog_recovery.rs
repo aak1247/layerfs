@@ -13,14 +13,14 @@ use layerfs_daemon::{
     store::{BindError, BindRequest, CatalogPreparationFailure},
     Owner, OwnerConfig, OwnerError,
 };
-use layerfs_history::{BranchId, HistoryError, WorkspaceId};
+use layerfs_history::{BranchId, CheckpointAttemptId, HistoryError, WorkspaceId};
 use layerfs_overlay::{Overlay, OverlayCatalogRecovery, ProfileConfig};
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
 use std::{fs, os::unix::fs::PermissionsExt};
 
 #[test]
-fn unfinished_recorded_capture_keeps_original_namespace_and_attempt() {
+fn unfinished_recorded_capture_recovers_without_publication() {
     let fixture = support::Fixture::new_durable(1, "catalog-unfinished-capture");
     let store = open_store(
         fixture.config.clone(),
@@ -73,6 +73,43 @@ fn unfinished_recorded_capture_keeps_original_namespace_and_attempt() {
     let generation = recorded.capture().generation.number();
     drop(db);
 
+    let wrong = store
+        .prepare_catalog_recovery(
+            &path,
+            ProfileConfig::default(),
+            BindRequest {
+                workspace,
+                branch: BranchId::from_authority([99; 16]),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        wrong.as_ref(),
+        CatalogPreparationFailure::Retained {
+            cause: BindError::History(HistoryError::Integrity("checkpoint recovery binding")),
+            ..
+        }
+    ));
+    assert!(
+        Owner::recover_recorded_next(&path, ProfileConfig::default(), workspace.to_bytes(), 2)
+            .is_err()
+    );
+    drop(wrong);
+    let check =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let retained: (i64, i64, i64, Vec<u8>) = check.query_row(
+        "SELECT r.high_namespace,a.phase,a.generation,a.attempt FROM durable_route r,durable_checkpoint_attempt a WHERE r.id=1 AND a.id=1",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).unwrap();
+    assert_eq!(retained, (1, 1, generation, attempt.to_vec()));
+    assert!(store
+        .history()
+        .checkpoint_receipt(CheckpointAttemptId::from_bytes(attempt))
+        .unwrap()
+        .is_none());
+    drop(check);
+
     let owner = Owner::start(
         &fixture.directory.join("unfinished-template.sqlite"),
         ProfileConfig::default(),
@@ -80,7 +117,7 @@ fn unfinished_recorded_capture_keeps_original_namespace_and_attempt() {
     )
     .unwrap();
     let service = Service::new(store.clone(), &owner);
-    let failure = service
+    let recovered = service
         .recover_catalog(
             &mut roster,
             &owner,
@@ -89,42 +126,35 @@ fn unfinished_recorded_capture_keeps_original_namespace_and_attempt() {
             ProfileConfig::default(),
             2,
         )
-        .unwrap_err();
-    assert!(failure.completed.is_empty());
-    let CatalogRecoveryCause::Prepare {
-        record: failed_record,
-        failure,
-    } = failure.cause
-    else {
-        panic!("expected retained pending checkpoint");
-    };
-    assert_eq!(failed_record, record);
-    assert!(matches!(
-        failure.as_ref(),
-        CatalogPreparationFailure::Retained {
-            cause: BindError::History(HistoryError::Unsupported(
-                "pending checkpoint reconciliation is not yet admitted"
-            )),
-            ..
-        }
-    ));
-    assert_eq!(service.workspaces(), Some(0));
-    assert!(
-        Owner::recover_recorded_next(&path, ProfileConfig::default(), workspace.to_bytes(), 2)
-            .is_err()
-    );
-    drop(failure);
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].workspace, workspace);
+    assert!(recovered[0].namespace > 1);
+    assert_eq!(service.workspaces(), Some(1));
+    assert!(service
+        .operation(WorkspaceToken {
+            workspace,
+            namespace: 1
+        })
+        .is_err());
+    assert!(store
+        .history()
+        .checkpoint_receipt(CheckpointAttemptId::from_bytes(attempt))
+        .unwrap()
+        .is_none());
+    drop(service);
+    store.close_reader(workspace).unwrap();
+    owner.stop().unwrap();
     let check =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let current:(i64,i64,i64,Vec<u8>) = check.query_row(
-        "SELECT r.high_namespace,a.phase,a.generation,a.attempt FROM durable_route r,durable_checkpoint_attempt a WHERE r.id=1",
-        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    let current:(i64,i64) = check.query_row(
+        "SELECT high_namespace,(SELECT count(*) FROM durable_checkpoint_attempt) FROM durable_route WHERE id=1",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
     ).unwrap();
-    assert_eq!(current, (1, 1, generation, attempt.to_vec()));
+    assert_eq!(current, (recovered[0].namespace, 0));
+    assert!(generation > 0);
     drop(check);
-    drop(service);
-    owner.stop().unwrap();
     drop(roster);
     drop(store);
     fixture.cleanup();

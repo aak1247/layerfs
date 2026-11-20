@@ -75,6 +75,23 @@ impl Overlay {
     /// and must fence the previous mount and external operations after loss.
     pub fn require_recorded_recovery_ready(&self) -> OverlayResult<()> {
         self.require_bound_ready()?;
+        self.require_recorded_ready_details()
+    }
+
+    /// The checkpoint cleanup job has already deleted its exact attempt in
+    /// this transaction. Its strict checks must see that uncommitted delete.
+    pub(super) fn require_recorded_ready_in_cleanup(&self) -> OverlayResult<()> {
+        self.available()?;
+        if self.transaction.get() != super::connection::Transaction::Begun {
+            return Err(OverlayError::Invalid(
+                "checkpoint cleanup transaction absent",
+            ));
+        }
+        self.require_bound_state_ready()?;
+        self.require_recorded_ready_details()
+    }
+
+    fn require_recorded_ready_details(&self) -> OverlayResult<()> {
         if self.profile.schema_version == 44 {
             super::durable_conflict::verify_schema(self)?;
             let pending = self.query(
@@ -149,6 +166,10 @@ impl Overlay {
         if self.transaction.get() != super::connection::Transaction::None {
             return Err(OverlayError::Invalid("recovery check inside atomic job"));
         }
+        self.require_bound_state_ready()
+    }
+
+    fn require_bound_state_ready(&self) -> OverlayResult<()> {
         if self.durable_binding()?.is_none() {
             return Err(OverlayError::Invalid("durable binding is absent"));
         }

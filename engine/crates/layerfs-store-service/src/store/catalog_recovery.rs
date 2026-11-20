@@ -49,7 +49,7 @@ impl fmt::Debug for RetainedCatalogPreparation {
 
 /// A failed namespace/bind step retains its exact unadmitted database.
 pub struct CatalogActivationFailure {
-    pub cause: OwnerError,
+    pub cause: BindError,
     _pending: Option<Box<OverlayCatalogRecovery>>,
     _opened: Option<Box<Overlay>>,
 }
@@ -64,6 +64,7 @@ impl fmt::Debug for CatalogActivationFailure {
 enum LocalRecord {
     Ready(ReadyRecord),
     Conflict(SettledConflict),
+    Checkpoint(Box<super::checkpoint_recovery::PreparedCheckpoint>),
 }
 
 /// Private fields can only be produced from the actual Store and the original
@@ -112,11 +113,18 @@ impl Store {
         profile: ProfileConfig,
         request: BindRequest,
     ) -> Result<PreparedCatalogRecovery, Box<CatalogPreparationFailure>> {
-        let pending = OverlayCatalogRecovery::open(path, profile, request.workspace.to_bytes())
+        let mut pending = OverlayCatalogRecovery::open(path, profile, request.workspace.to_bytes())
             .map_err(|error| {
                 Box::new(CatalogPreparationFailure::Open(OwnerError::Overlay(error)))
             })?;
-        let prepared=(|| -> Result<(LocalRecord,BranchSnapshot,Option<Arc<super::commit_merge::PendingProjection>>),BindError> {
+        let prepared = if let OverlayCatalogRecovery::PendingCheckpoint(value) = &mut pending {
+            self.prepare_checkpoint_recovery(value, &request)
+                .map(|plan| {
+                    let snapshot = plan.snapshot.clone();
+                    (LocalRecord::Checkpoint(Box::new(plan)), snapshot, None)
+                })
+        } else {
+            (|| -> Result<(LocalRecord,BranchSnapshot,Option<Arc<super::commit_merge::PendingProjection>>),BindError> {
             let (bytes,root,record)=match &pending {
                 OverlayCatalogRecovery::Ready(value)=>{
                     let observed=value.observed().clone();
@@ -131,11 +139,7 @@ impl Store {
                     self.history().require_checkpoint_receipts().map_err(BindError::History)?;
                     (observed.target_snapshot.clone(),observed.marker_root,LocalRecord::Conflict(observed))
                 }
-                OverlayCatalogRecovery::PendingCheckpoint(_) => {
-                    return Err(BindError::History(HistoryError::Unsupported(
-                        "pending checkpoint reconciliation is not yet admitted",
-                    )));
-                }
+                OverlayCatalogRecovery::PendingCheckpoint(_) => unreachable!("checkpoint prepared separately"),
             };
             let snapshot=layerfs_bridge::snapshot::decode(&bytes).map_err(|e|BindError::Owner(OwnerError::BindingCodec(e)))?;
             if snapshot.branch.id!=request.branch { return Err(identity_error()); }
@@ -168,7 +172,8 @@ impl Store {
                 _=>return Err(identity_error()),
             };
             Ok((record,snapshot,conflict))
-        })();
+        })()
+        };
         match prepared {
             Ok((record, snapshot, conflict)) => Ok(PreparedCatalogRecovery {
                 store: self.clone(),
@@ -207,18 +212,19 @@ impl PreparedCatalogRecovery {
             request,
             pending,
             record,
-            snapshot,
+            mut snapshot,
             conflict,
         } = self;
         let previous = match &record {
             LocalRecord::Ready(value) => value.previous_namespace,
             LocalRecord::Conflict(value) => value.previous_namespace,
+            LocalRecord::Checkpoint(value) => value.previous_namespace(),
         };
         let namespace = match previous.checked_add(1) {
             Some(value) if minimum > 0 && value.max(minimum) < i64::MAX => value.max(minimum),
             _ => {
                 return Err(Box::new(CatalogActivationFailure {
-                    cause: OwnerError::IdentityExhausted,
+                    cause: BindError::Owner(OwnerError::IdentityExhausted),
                     _pending: Some(Box::new(pending)),
                     _opened: None,
                 }))
@@ -231,7 +237,7 @@ impl PreparedCatalogRecovery {
             Ok(value) => value,
             Err(cause) => {
                 return Err(Box::new(CatalogActivationFailure {
-                    cause,
+                    cause: BindError::Owner(cause),
                     _pending: Some(Box::new(pending)),
                     _opened: None,
                 }))
@@ -243,7 +249,7 @@ impl PreparedCatalogRecovery {
                     Ok(db) => db,
                     Err((error, value)) => {
                         return Err(Box::new(CatalogActivationFailure {
-                            cause: OwnerError::Overlay(error),
+                            cause: BindError::Owner(OwnerError::Overlay(error)),
                             _pending: Some(Box::new(OverlayCatalogRecovery::Ready(value))),
                             _opened: None,
                         }))
@@ -255,8 +261,44 @@ impl PreparedCatalogRecovery {
                     Ok(db) => db,
                     Err((error, value)) => {
                         return Err(Box::new(CatalogActivationFailure {
-                            cause: OwnerError::Overlay(error),
+                            cause: BindError::Owner(OwnerError::Overlay(error)),
                             _pending: Some(Box::new(OverlayCatalogRecovery::SettledConflict(
+                                value,
+                            ))),
+                            _opened: None,
+                        }))
+                    }
+                }
+            }
+            (
+                OverlayCatalogRecovery::PendingCheckpoint(mut value),
+                LocalRecord::Checkpoint(plan),
+            ) => {
+                let settled = match store.settle_checkpoint_recovery(&mut value, plan) {
+                    Ok(settled) => settled,
+                    Err(cause) => {
+                        return Err(Box::new(CatalogActivationFailure {
+                            cause,
+                            _pending: Some(Box::new(OverlayCatalogRecovery::PendingCheckpoint(
+                                value,
+                            ))),
+                            _opened: None,
+                        }))
+                    }
+                };
+                let installed = settled
+                    .installed
+                    .as_ref()
+                    .map(|(bytes, outcome)| (bytes.as_slice(), *outcome));
+                match value.complete_settled(plan.request(), installed) {
+                    Ok(db) => {
+                        snapshot = settled.snapshot;
+                        db
+                    }
+                    Err((error, value)) => {
+                        return Err(Box::new(CatalogActivationFailure {
+                            cause: BindError::Owner(OwnerError::Overlay(error)),
+                            _pending: Some(Box::new(OverlayCatalogRecovery::PendingCheckpoint(
                                 value,
                             ))),
                             _opened: None,
@@ -266,7 +308,7 @@ impl PreparedCatalogRecovery {
             }
             (pending, _) => {
                 return Err(Box::new(CatalogActivationFailure {
-                    cause: OwnerError::InvalidAdmission,
+                    cause: BindError::Owner(OwnerError::InvalidAdmission),
                     _pending: Some(Box::new(pending)),
                     _opened: None,
                 }))
@@ -274,7 +316,7 @@ impl PreparedCatalogRecovery {
         };
         if let Err(error) = db.advance_durable_namespace(namespace) {
             return Err(Box::new(CatalogActivationFailure {
-                cause: OwnerError::Overlay(error),
+                cause: BindError::Owner(OwnerError::Overlay(error)),
                 _pending: None,
                 _opened: Some(Box::new(db)),
             }));
@@ -288,7 +330,7 @@ impl PreparedCatalogRecovery {
             Ok(owner) => owner,
             Err((cause, db)) => {
                 return Err(Box::new(CatalogActivationFailure {
-                    cause,
+                    cause: BindError::Owner(cause),
                     _pending: None,
                     _opened: Some(Box::new(db)),
                 }))
@@ -297,6 +339,7 @@ impl PreparedCatalogRecovery {
         let conflict = match (record, conflict) {
             (LocalRecord::Ready(_), None) => None,
             (LocalRecord::Conflict(record), Some(value)) => Some((record, value)),
+            (LocalRecord::Checkpoint(_), None) => None,
             _ => unreachable!("prepared recovery projection"),
         };
         let exact_owner = owner.client();

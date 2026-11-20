@@ -50,7 +50,7 @@ For a known published Commit, its new snapshot and the overlay's installed
 base advance in the same SQLite transaction. An install without a known
 receipt marks the binding unresolved in that transaction; recovery refuses it
 until reconciled. A subsequent known publication in the live owner can replace
-that marker. A crash with a pending capture still refuses automatic recovery.
+that marker. Schema 42 still refuses recovery with a pending capture.
 Existing schema 39, 40 and 41 durable files are not converted. The caller must
 independently prove a fresh namespace for schema 39 or 40. Schema 39 also
 requires the caller's independently retained snapshot. Old inode reservation
@@ -72,19 +72,25 @@ incarnation, historical Branch snapshot, marker root and complete ordered path
 page chain before selecting a newer namespace and binding the same Workspace.
 This recovers the pending conflict for an explicit resolution; it does not resend
 the earlier Commit. Ordinary Overlay and Owner recovery continue to reject the
-active conflict, and pending captures, publications and orphan custody remain
-unreconciled. The caller still proves the original processes, mounts and
+active conflict. The caller still proves the original processes, mounts and
 consumers have stopped. Nonprivileged request-adapter tests exercise the bound
 Store and Overlay barriers for a live conflict and a separately reconstructed
 cold conflict; a physical FUSE mount and Sandbox recovery remain unverified.
 
-The catalog opening path can also retain a schema-44 phase-1 or phase-2
-checkpoint under its original lease and inspect its original capture, classified
-reader and operation ownership, and bounded pages of the frozen request. This
-is a local observation only: the Store service retains it without activation,
-does not advance the namespace, and still refuses the recovery. Matching the
-actual Store receipt, reconciling the capture and proving that the original
-writer has stopped remain required before that Workspace can be used again.
+The catalog opening path can also reconcile a schema-44 recorded checkpoint
+under its original lease when its capture and classified reader and operation
+ownership match exactly and no conflict or other unknown custody is present.
+It authenticates the original Store, Workspace, Branch and frozen request; an
+original atomic Store receipt determines the installed result. When the fenced
+original writer cannot publish later and the Store lane confirms no committed
+receipt, the captured changes are folded back into the live Workspace. A missing
+receipt does not prove the request was never sent. The original Commit is not
+sent again, and a newer namespace is selected only after original owners and
+bounded maintenance are settled. Interrupted local settlement reopens the same
+attempt and verifies its recorded phase. Nonprivileged tests cover actual Store
+receipts and definite nonpublication after an injected release failure, using
+the same Store handle and original Workspace; a physical crash, FUSE mount,
+orphan custody and full Store restart remain to be verified.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

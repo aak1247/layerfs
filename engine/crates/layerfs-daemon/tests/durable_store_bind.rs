@@ -10,15 +10,16 @@ use layerfs_bridge::control::{
 use layerfs_content::filesystem::PathName;
 use layerfs_daemon::{
     bootstrap::open_store,
-    control::{Failure, Service},
+    control::{CatalogRecoveryCause, Failure, Service},
     durable_roster::{Authority, Roster, WorkspaceRecord},
     store::{
-        BindRequest, BoundWorkspace, CommitError, CommitOptions, StoreOperation, SynchronizeStep,
+        BindError, BindRequest, BoundWorkspace, CommitError, CommitOptions, StoreOperation,
+        SynchronizeStep,
     },
     Owner, OwnerConfig, OwnerError,
 };
 use layerfs_fuse::{operations::KernelRead, ports::Fenced, MountRequests};
-use layerfs_history::{CommitOutcome, HistoryError, WorkspaceId};
+use layerfs_history::{CheckpointAttemptId, CommitOutcome, HistoryError, WorkspaceId};
 use layerfs_overlay::{
     conflict_page_digest, ConflictCompletion, ConflictStageInput, MaintenanceCursor, Overlay,
     OverlayError, ProfileConfig, CONFLICT_PAGE_BYTES,
@@ -596,6 +597,313 @@ fn write(workspace: &BoundWorkspace, name: &str, bytes: &[u8]) {
         };
         operation.overlay().reply_attempted(publication).unwrap();
     });
+}
+
+fn checkpoint_recovery_after_original_commit(published: bool) {
+    let label = if published {
+        "checkpoint-published-cold"
+    } else {
+        "checkpoint-absent-cold"
+    };
+    let fixture = support::Fixture::new_durable(2, label);
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let catalog = fixture.directory.join("checkpoint-catalog");
+    let overlays = fixture.directory.join("checkpoint-overlays");
+    for directory in [&catalog, &overlays] {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let id = WorkspaceId::from_authority([82; 32]).unwrap();
+    let record = WorkspaceRecord {
+        workspace: id,
+        branch: fixture.branch,
+    };
+    let mut roster = Roster::create(
+        &catalog,
+        Authority::for_catalog([8; 32], store.history()).unwrap(),
+    )
+    .unwrap();
+    roster.record(record).unwrap();
+    let path = overlays.join(record.overlay_name());
+    let db = Overlay::create_durable(&path, ProfileConfig::default(), id.to_bytes()).unwrap();
+    let root = initial.effective_root.to_bytes();
+    db.open_workspace(root).unwrap();
+    db.initialize_durable_binding(root, &layerfs_bridge::snapshot::encode(&initial).unwrap())
+        .unwrap();
+    db.initialize_durable_namespace(1).unwrap();
+    drop(db);
+
+    if published {
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        sql.execute_batch("CREATE TRIGGER fail_original_install BEFORE UPDATE OF phase ON durable_checkpoint_attempt WHEN OLD.phase=2 AND NEW.phase=4 BEGIN SELECT RAISE(ABORT,'original install fault'); END;").unwrap();
+    }
+    let (old_owner, old_snapshot) =
+        Owner::recover_recorded(&path, ProfileConfig::default(), id.to_bytes(), 2).unwrap();
+    let old = store
+        .bind_durable(
+            old_owner.client(),
+            BindRequest {
+                workspace: id,
+                branch: fixture.branch,
+            },
+            old_snapshot,
+        )
+        .unwrap()
+        .workspace;
+    let mut captured = support::bytes(0);
+    captured[0] = b'X';
+    write(&old, "file-000000", &captured);
+    if !published {
+        let sql = rusqlite::Connection::open(&fixture.config.path).unwrap();
+        sql.execute_batch("CREATE TRIGGER fail_original_receipt BEFORE INSERT ON checkpoint_receipt BEGIN SELECT RAISE(ABORT,'original receipt fault'); END;").unwrap();
+    }
+    let failure = old.commit_captured(&CommitOptions::default()).unwrap_err();
+    assert!(failure.publication_prepared);
+    assert!(!failure.locally_settled);
+    assert_eq!(failure.published.is_some(), published);
+    assert!(failure.installed.is_none());
+    if published {
+        let CommitError::Owner(OwnerError::Attempted(attempted)) = &failure.error else {
+            panic!("expected original install fault: {:?}", failure.error)
+        };
+        let OwnerError::Install { cause, .. } = attempted.cause.as_ref() else {
+            panic!("expected original install failure: {:?}", attempted.cause)
+        };
+        let layerfs_workspace::WorkspaceError::Overlay(OverlayError::Sql(
+            rusqlite::Error::SqliteFailure(code, Some(message)),
+        )) = cause.as_ref()
+        else {
+            panic!("expected original SQLite install fault: {:?}", cause)
+        };
+        assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+        assert_eq!(message, "original install fault");
+    } else {
+        assert!(matches!(
+            &failure.error,
+            CommitError::History(HistoryError::Integrity(_))
+        ));
+        assert!(failure.intent.is_some());
+    }
+    let attempt = CheckpointAttemptId::from_bytes(failure.recorded.unwrap().attempt());
+    let original_receipt = store.history().checkpoint_receipt(attempt).unwrap();
+    assert_eq!(original_receipt.is_some(), published);
+    if !published {
+        assert_eq!(
+            store
+                .history()
+                .branch_snapshot(fixture.branch)
+                .unwrap()
+                .unwrap(),
+            initial
+        );
+    }
+    let mut later = support::bytes(1);
+    later[0] = b'Y';
+    write(&old, "file-000001", &later);
+    drop(failure);
+    drop(old);
+    store.close_reader(id).unwrap();
+    old_owner.stop().unwrap();
+
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    if published {
+        sql.execute_batch("DROP TRIGGER fail_original_install;")
+            .unwrap();
+    }
+    let before: (i64, i64, Vec<u8>, i64, i64) = sql.query_row(
+        "SELECT a.phase,r.high_namespace,a.attempt,a.reader_released,a.operation_released FROM durable_checkpoint_attempt a,durable_route r WHERE a.id=1 AND r.id=1",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).unwrap();
+    assert_eq!(before, (2, 2, attempt.to_bytes().to_vec(), 0, 0));
+    sql.execute_batch("CREATE TRIGGER fail_recovery_release BEFORE UPDATE OF reader_released ON durable_checkpoint_attempt WHEN NEW.reader_released=1 BEGIN SELECT RAISE(ABORT,'recovery release fault'); END;").unwrap();
+    drop(sql);
+    if !published {
+        let sql = rusqlite::Connection::open(&fixture.config.path).unwrap();
+        sql.execute_batch("DROP TRIGGER fail_original_receipt;")
+            .unwrap();
+    }
+
+    let owner = Owner::start(
+        &fixture.directory.join("checkpoint-template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 1 },
+    )
+    .unwrap();
+    let service = Service::new(store.clone(), &owner);
+    let refused = service
+        .recover_catalog(
+            &mut roster,
+            &owner,
+            &overlays,
+            [8; 32],
+            ProfileConfig::default(),
+            3,
+        )
+        .unwrap_err();
+    let CatalogRecoveryCause::Activate { failure, .. } = &refused.cause else {
+        panic!("expected local release failure: {:?}", refused.cause)
+    };
+    let BindError::Owner(OwnerError::Overlay(OverlayError::Sql(rusqlite::Error::SqliteFailure(
+        code,
+        Some(message),
+    )))) = &failure.cause
+    else {
+        panic!("expected injected release failure: {:?}", failure.cause)
+    };
+    assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+    assert_eq!(message, "recovery release fault");
+    assert_eq!(service.workspaces(), Some(0));
+    assert_eq!(
+        store.history().checkpoint_receipt(attempt).unwrap(),
+        original_receipt
+    );
+    // The failure owns the original exclusive Overlay connection. Release it
+    // before inspecting the durable, definitively rolled-back fault fixture.
+    drop(refused);
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    let interrupted: (i64, i64, Vec<u8>, i64, i64) = sql.query_row(
+        "SELECT a.phase,r.high_namespace,a.attempt,a.reader_released,a.operation_released FROM durable_checkpoint_attempt a,durable_route r WHERE a.id=1 AND r.id=1",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).unwrap();
+    assert_eq!(
+        interrupted,
+        (
+            if published { 4 } else { 6 },
+            2,
+            attempt.to_bytes().to_vec(),
+            0,
+            0
+        )
+    );
+    sql.execute_batch("DROP TRIGGER fail_recovery_release;")
+        .unwrap();
+    drop(sql);
+
+    let recovered = service
+        .recover_catalog(
+            &mut roster,
+            &owner,
+            &overlays,
+            [8; 32],
+            ProfileConfig::default(),
+            3,
+        )
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    let token = recovered[0];
+    assert_eq!(token.workspace, id);
+    assert!(token.namespace > 2);
+    assert!(service
+        .operation(WorkspaceToken {
+            workspace: id,
+            namespace: 2
+        })
+        .is_err());
+    assert_eq!(
+        store.history().checkpoint_receipt(attempt).unwrap(),
+        original_receipt
+    );
+    let operation = service.operation(token).unwrap();
+    for (name, expected) in [("file-000000", &captured), ("file-000001", &later)] {
+        let readback = access_operation(&operation, |operation, view| {
+            let file = view
+                .lookup(
+                    operation.overlay(),
+                    view.root_serial(),
+                    &PathName::new(name).unwrap(),
+                )
+                .unwrap();
+            let mut bytes = Vec::new();
+            view.read(operation.overlay(), file.serial, 0, 1024, &mut bytes)
+                .unwrap();
+            bytes
+        });
+        assert_eq!(&readback, expected);
+    }
+    let mut next = later.clone();
+    next[0] = b'Z';
+    access_operation(&operation, |operation, view| {
+        let file = view
+            .lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000001").unwrap(),
+            )
+            .unwrap();
+        let result = operation
+            .workspace()
+            .mutate(
+                operation.overlay(),
+                operation.ports(),
+                view,
+                Operation::Write {
+                    serial: file.serial,
+                    position: Position::At(0),
+                    data: next.as_slice().into(),
+                },
+                Time {
+                    seconds: file.metadata.mtime_seconds,
+                    nanoseconds: file.metadata.mtime_nanoseconds,
+                },
+            )
+            .unwrap();
+        let Outcome::Applied { publication, .. } = result else {
+            panic!("new input was not applied")
+        };
+        operation.overlay().reply_attempted(publication).unwrap();
+    });
+    drop(operation);
+    let result = service
+        .execute_control(&Request::Commit(CommitControl {
+            token,
+            force: false,
+            message: None,
+        }))
+        .unwrap()
+        .reply;
+    assert!(matches!(
+        result,
+        Reply::Committed(_) | Reply::MergeCommitted(_)
+    ));
+    assert_eq!(
+        store.history().checkpoint_receipt(attempt).unwrap(),
+        original_receipt
+    );
+    drop(service);
+    store.close_reader(id).unwrap();
+    owner.stop().unwrap();
+    drop(roster);
+    drop(store);
+    let sql = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let count: i64 = sql
+        .query_row("SELECT count(*) FROM checkpoint_receipt", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, if published { 2 } else { 1 });
+    drop(sql);
+    fixture.cleanup();
+}
+
+#[test]
+fn checkpoint_published_receipt_recovers_without_resending() {
+    checkpoint_recovery_after_original_commit(true);
+}
+
+#[test]
+fn checkpoint_absent_receipt_folds_without_resending() {
+    checkpoint_recovery_after_original_commit(false);
 }
 
 fn truncate(workspace: &BoundWorkspace, name: &str) {

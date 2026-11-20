@@ -4,6 +4,7 @@ pub mod captured;
 mod catalog_recovery;
 mod checkpoint;
 pub mod checkpoint_receipt;
+mod checkpoint_recovery;
 pub mod commit;
 pub mod commit_merge;
 pub mod commit_types;

@@ -237,14 +237,21 @@ fn require_format(db: &Overlay) -> OverlayResult<()> {
 
 /// Only one of a staged local conflict and a Store publication may follow the
 /// original capture. Run inside the caller's checkpoint transaction.
-pub(crate) fn require_no_stage(db: &Overlay, recorded: RecordedCapture) -> OverlayResult<()> {
+pub(crate) fn require_no_stage(
+    db: &Overlay,
+    recorded: RecordedCapture,
+    phase: i64,
+) -> OverlayResult<()> {
+    if !matches!(phase, 1 | 2) {
+        return Err(OverlayError::Invalid("checkpoint staging phase"));
+    }
     if db.profile.schema_version != 44 {
         return Ok(());
     }
     let rows: Vec<StagingRow> = db.query(
         StatementKind::Frontier,
-        "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND phase=1",
-        &[&recorded.capture.generation.0, &recorded.attempt.as_slice()], 24,
+        "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND phase=?3",
+        &[&recorded.capture.generation.0, &recorded.attempt.as_slice(), &phase], 32,
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     )?;
     if rows.as_slice() != [(None, None, false, false, false)] {
@@ -298,7 +305,7 @@ impl Overlay {
             .ok_or(OverlayError::Invalid("conflict byte count"))?;
         self.atomic_cleanup(|| {
             let namespace = super::durable_attempt::check_original(self, recorded)?;
-            require_no_stage(self, recorded)?;
+            require_no_stage(self, recorded, 1)?;
             let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = self.query(
                 StatementKind::Frontier,
                 "SELECT workspace,catalog,incarnation FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND phase=1 AND request IS NULL",

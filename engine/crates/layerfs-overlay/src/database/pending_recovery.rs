@@ -75,7 +75,7 @@ impl OverlayCatalogRecovery {
     /// not authenticate a Store or prove the previous consumer has stopped.
     pub fn open(path: &Path, config: ProfileConfig, workspace: [u8; 32]) -> OverlayResult<Self> {
         let db = super::durable::recover_for_catalog(path, config, workspace)?;
-        if db.state()?.captured.is_some() {
+        if super::durable_attempt::pending(&db)? {
             return super::checkpoint_recovery::PendingCheckpointRecovery::open(db)
                 .map(Self::PendingCheckpoint);
         }
