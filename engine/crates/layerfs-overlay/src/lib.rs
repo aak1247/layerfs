@@ -51,6 +51,7 @@ pub use contract::kernel_directory::{
 pub use database::accounting::{Resources, StoredCounts};
 pub use database::checkpoint_recovery::{CheckpointRecord, PendingCheckpointRecovery};
 pub use database::durable_binding::ConflictSyncIdentity;
+pub use database::durable_orphan_recovery::{OrphanRecoveryRecord, PendingOrphanRecovery};
 pub use database::pending_recovery::{
     OverlayCatalogRecovery, ReadyRecord, ReadyRecovery, SettledConflict, SettledConflictRecovery,
 };

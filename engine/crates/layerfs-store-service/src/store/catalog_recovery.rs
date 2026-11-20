@@ -8,7 +8,8 @@ use crate::{Owner, OwnerClient, OwnerError, ServiceClass};
 use layerfs_content::ObjectId;
 use layerfs_history::{BranchSnapshot, HistoryError};
 use layerfs_overlay::{
-    Overlay, OverlayCatalogRecovery, ProfileConfig, ReadyRecord, SettledConflict,
+    OrphanRecoveryRecord, Overlay, OverlayCatalogRecovery, ProfileConfig, ReadyRecord,
+    SettledConflict,
 };
 use layerfs_workspace::Workspace;
 use std::{
@@ -65,6 +66,7 @@ enum LocalRecord {
     Ready(ReadyRecord),
     Conflict(SettledConflict),
     Checkpoint(Box<super::checkpoint_recovery::PreparedCheckpoint>),
+    Orphans(OrphanRecoveryRecord, u64),
 }
 
 /// Private fields can only be produced from the actual Store and the original
@@ -123,6 +125,11 @@ impl Store {
                     let snapshot = plan.snapshot.clone();
                     (LocalRecord::Checkpoint(Box::new(plan)), snapshot, None)
                 })
+        } else if let OverlayCatalogRecovery::PendingOrphans(value) = &mut pending {
+            self.prepare_orphan_recovery(value, &request)
+                .map(|(record, snapshot, serial)| {
+                    (LocalRecord::Orphans(record, serial), snapshot, None)
+                })
         } else {
             (|| -> Result<(LocalRecord,BranchSnapshot,Option<Arc<super::commit_merge::PendingProjection>>),BindError> {
             let (bytes,root,record)=match &pending {
@@ -140,6 +147,7 @@ impl Store {
                     (observed.target_snapshot.clone(),observed.marker_root,LocalRecord::Conflict(observed))
                 }
                 OverlayCatalogRecovery::PendingCheckpoint(_) => unreachable!("checkpoint prepared separately"),
+                OverlayCatalogRecovery::PendingOrphans(_) => unreachable!("orphans prepared separately"),
             };
             let snapshot=layerfs_bridge::snapshot::decode(&bytes).map_err(|e|BindError::Owner(OwnerError::BindingCodec(e)))?;
             if snapshot.branch.id!=request.branch { return Err(identity_error()); }
@@ -219,6 +227,7 @@ impl PreparedCatalogRecovery {
             LocalRecord::Ready(value) => value.previous_namespace,
             LocalRecord::Conflict(value) => value.previous_namespace,
             LocalRecord::Checkpoint(value) => value.previous_namespace(),
+            LocalRecord::Orphans(value, _) => value.previous_namespace,
         };
         let namespace = match previous.checked_add(1) {
             Some(value) if minimum > 0 && value.max(minimum) < i64::MAX => value.max(minimum),
@@ -306,6 +315,28 @@ impl PreparedCatalogRecovery {
                     }
                 }
             }
+            (
+                OverlayCatalogRecovery::PendingOrphans(mut value),
+                LocalRecord::Orphans(expected, root_serial),
+            ) => {
+                if let Err(cause) = store.settle_orphan_recovery(&mut value, *root_serial) {
+                    return Err(Box::new(CatalogActivationFailure {
+                        cause,
+                        _pending: Some(Box::new(OverlayCatalogRecovery::PendingOrphans(value))),
+                        _opened: None,
+                    }));
+                }
+                match value.complete(expected) {
+                    Ok(db) => db,
+                    Err((error, value)) => {
+                        return Err(Box::new(CatalogActivationFailure {
+                            cause: BindError::Owner(OwnerError::Overlay(error)),
+                            _pending: Some(Box::new(OverlayCatalogRecovery::PendingOrphans(value))),
+                            _opened: None,
+                        }))
+                    }
+                }
+            }
             (pending, _) => {
                 return Err(Box::new(CatalogActivationFailure {
                     cause: BindError::Owner(OwnerError::InvalidAdmission),
@@ -340,6 +371,7 @@ impl PreparedCatalogRecovery {
             (LocalRecord::Ready(_), None) => None,
             (LocalRecord::Conflict(record), Some(value)) => Some((record, value)),
             (LocalRecord::Checkpoint(_), None) => None,
+            (LocalRecord::Orphans(_, _), None) => None,
             _ => unreachable!("prepared recovery projection"),
         };
         let exact_owner = owner.client();

@@ -4,7 +4,7 @@ use crate::{
     Overlay, OverlayError, OverlayResult, StatementKind, WorkspaceState,
 };
 pub(crate) const DOMAIN: i64 = -1;
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Orphan {
     pub root: [u8; 32],
     pub top: i64,

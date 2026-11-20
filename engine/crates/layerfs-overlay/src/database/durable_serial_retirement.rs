@@ -64,34 +64,102 @@ struct Origin {
     revision: i64,
 }
 
+impl Origin {
+    fn validate(&self, serial: i64, generation: i64) -> OverlayResult<()> {
+        if serial <= 0
+            || generation <= 0
+            || self.floor < 0
+            || self.active <= 0
+            || self.floor >= self.active
+            || self.revision < 0
+            || self.top_before > self.active
+            || self.top_after < self.floor
+            || match self.kind {
+                1 => {
+                    generation != self.active
+                        || self.top_before != self.active
+                        || self.top_after != self.active
+                }
+                2 => {
+                    generation > self.top_before
+                        || generation <= self.floor
+                        || generation.checked_sub(1) != Some(self.top_after)
+                }
+                _ => true,
+            }
+        {
+            return Err(OverlayError::Invalid("serial retirement origin"));
+        }
+        Ok(())
+    }
+}
+
+/// Decoded original queue identity, not a Store authorization.
+pub(crate) struct DecodedOrigin {
+    pub kind: u8,
+    pub workspace: [u8; 32],
+    pub namespace: i64,
+    pub serial: i64,
+    pub generation: i64,
+    pub root: [u8; 32],
+    pub active: i64,
+    pub revision: i64,
+    pub floor: i64,
+    pub top_after: i64,
+}
+
+pub(crate) fn decode(bytes: &[u8]) -> OverlayResult<DecodedOrigin> {
+    if bytes.len() != ORIGIN_BYTES || &bytes[..5] != MAGIC {
+        return Err(OverlayError::Invalid("serial retirement encoding"));
+    }
+    let array = |offset: usize| -> OverlayResult<[u8; 32]> {
+        bytes[offset..offset + 32]
+            .try_into()
+            .map_err(|_| OverlayError::Invalid("serial retirement encoding"))
+    };
+    let integer = |offset: usize| -> OverlayResult<i64> {
+        Ok(i64::from_be_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .map_err(|_| OverlayError::Invalid("serial retirement encoding"))?,
+        ))
+    };
+    let serial = integer(78)?;
+    let generation = integer(86)?;
+    let origin = Origin {
+        kind: bytes[5],
+        root: array(38)?,
+        floor: integer(94)?,
+        top_before: integer(102)?,
+        top_after: integer(110)?,
+        active: integer(118)?,
+        revision: integer(126)?,
+    };
+    origin.validate(serial, generation)?;
+    let namespace = integer(70)?;
+    let workspace = array(6)?;
+    if namespace < 0 || workspace == [0; 32] {
+        return Err(OverlayError::Invalid("serial retirement identity"));
+    }
+    Ok(DecodedOrigin {
+        kind: origin.kind,
+        workspace,
+        namespace,
+        serial,
+        generation,
+        root: origin.root,
+        active: origin.active,
+        revision: origin.revision,
+        floor: origin.floor,
+        top_after: origin.top_after,
+    })
+}
+
 fn enqueue(db: &Overlay, serial: i64, generation: i64, origin: Origin) -> OverlayResult<()> {
     if db.durable.is_none() || !db.profile.has_serial_retirement_origin() {
         return db.enqueue(SERIAL_RETIRE, serial, generation);
     }
-    if serial <= 0
-        || generation <= 0
-        || origin.floor < 0
-        || origin.active <= 0
-        || origin.floor >= origin.active
-        || origin.revision < 0
-        || origin.top_before > origin.active
-        || origin.top_after < origin.floor
-        || match origin.kind {
-            1 => {
-                generation != origin.active
-                    || origin.top_before != origin.active
-                    || origin.top_after != origin.active
-            }
-            2 => {
-                generation > origin.top_before
-                    || generation <= origin.floor
-                    || generation.checked_sub(1) != Some(origin.top_after)
-            }
-            _ => true,
-        }
-    {
-        return Err(OverlayError::Invalid("serial retirement origin"));
-    }
+    origin.validate(serial, generation)?;
     let workspace: Vec<Vec<u8>> = db.query(
         StatementKind::Frontier,
         "SELECT identity FROM durable_identity WHERE id=1",

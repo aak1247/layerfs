@@ -14,6 +14,7 @@ pub mod durable_bind;
 pub mod hints;
 pub mod open;
 pub mod operation;
+mod orphan_recovery;
 pub mod ports;
 pub mod producer;
 pub mod read_handle;

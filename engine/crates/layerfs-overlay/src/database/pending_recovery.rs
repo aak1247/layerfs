@@ -59,6 +59,7 @@ pub enum OverlayCatalogRecovery {
     Ready(ReadyRecovery),
     SettledConflict(SettledConflictRecovery),
     PendingCheckpoint(super::checkpoint_recovery::PendingCheckpointRecovery),
+    PendingOrphans(super::durable_orphan_recovery::PendingOrphanRecovery),
 }
 impl fmt::Debug for OverlayCatalogRecovery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,6 +67,7 @@ impl fmt::Debug for OverlayCatalogRecovery {
             Self::Ready(value) => value.fmt(f),
             Self::SettledConflict(value) => value.fmt(f),
             Self::PendingCheckpoint(value) => value.fmt(f),
+            Self::PendingOrphans(value) => value.fmt(f),
         }
     }
 }
@@ -78,6 +80,10 @@ impl OverlayCatalogRecovery {
         if super::durable_attempt::pending(&db)? {
             return super::checkpoint_recovery::PendingCheckpointRecovery::open(db)
                 .map(Self::PendingCheckpoint);
+        }
+        if super::durable_orphan_recovery::pending(&db)? {
+            return super::durable_orphan_recovery::PendingOrphanRecovery::open(db, workspace)
+                .map(Self::PendingOrphans);
         }
         if super::durable_conflict_stage::active_conflict(&db)?.is_some() {
             let observed = observe(&db)?;

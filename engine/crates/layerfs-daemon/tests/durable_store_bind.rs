@@ -5,9 +5,9 @@
 mod support;
 
 use layerfs_bridge::control::{
-    Activity, CommitControl, Reply, Request, UnmountControl, WorkspaceToken,
+    Activity, CommitControl, ControlCode, Reply, Request, UnmountControl, WorkspaceToken,
 };
-use layerfs_content::filesystem::PathName;
+use layerfs_content::{filesystem::PathName, ContentError};
 use layerfs_daemon::{
     bootstrap::open_store,
     control::{CatalogRecoveryCause, Failure, Service},
@@ -18,7 +18,11 @@ use layerfs_daemon::{
     },
     Owner, OwnerConfig, OwnerError,
 };
-use layerfs_fuse::{operations::KernelRead, ports::Fenced, MountRequests};
+use layerfs_fuse::{
+    operations::{KernelData, KernelRead, ReadDataInput},
+    ports::Fenced,
+    MountRequests,
+};
 use layerfs_history::{CheckpointAttemptId, CommitOutcome, HistoryError, WorkspaceId};
 use layerfs_overlay::{
     conflict_page_digest, ConflictCompletion, ConflictStageInput, MaintenanceCursor, Overlay,
@@ -26,7 +30,7 @@ use layerfs_overlay::{
 };
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
-use layerfs_workspace::{KernelReadOperation, Operation, Outcome, Position, Time};
+use layerfs_workspace::{KernelReadOperation, Operation, Outcome, Position, Time, WorkspaceError};
 use std::{
     future::Future,
     os::unix::fs::PermissionsExt,
@@ -904,6 +908,402 @@ fn checkpoint_published_receipt_recovers_without_resending() {
 #[test]
 fn checkpoint_absent_receipt_folds_without_resending() {
     checkpoint_recovery_after_original_commit(false);
+}
+
+#[test]
+fn unlinked_open_file_recovers_original_workspace_after_ownerless_retirement() {
+    let fixture = support::Fixture::new_durable(2, "orphan-cold");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let catalog = fixture.directory.join("orphan-catalog");
+    let overlays = fixture.directory.join("orphan-overlays");
+    for directory in [&catalog, &overlays] {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let id = WorkspaceId::from_authority([83; 32]).unwrap();
+    let record = WorkspaceRecord {
+        workspace: id,
+        branch: fixture.branch,
+    };
+    let mut roster = Roster::create(
+        &catalog,
+        Authority::for_catalog([8; 32], store.history()).unwrap(),
+    )
+    .unwrap();
+    roster.record(record).unwrap();
+    let path = overlays.join(record.overlay_name());
+    let db = Overlay::create_durable(&path, ProfileConfig::default(), id.to_bytes()).unwrap();
+    let root = initial.effective_root.to_bytes();
+    db.open_workspace(root).unwrap();
+    db.initialize_durable_binding(root, &layerfs_bridge::snapshot::encode(&initial).unwrap())
+        .unwrap();
+    db.initialize_durable_namespace(1).unwrap();
+    drop(db);
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.execute_batch("CREATE TRIGGER pause_original_migration BEFORE UPDATE OF generation ON fs_data WHEN NEW.generation=-1 BEGIN SELECT RAISE(ABORT,'original orphan migration fault'); END;").unwrap();
+    drop(sql);
+    let (old_owner, snapshot) =
+        Owner::recover_recorded(&path, ProfileConfig::default(), id.to_bytes(), 2).unwrap();
+    let old = store
+        .bind_durable(
+            old_owner.client(),
+            BindRequest {
+                workspace: id,
+                branch: fixture.branch,
+            },
+            snapshot,
+        )
+        .unwrap()
+        .workspace;
+
+    let chunk = vec![b'Q'; 131072];
+    for offset in [0_u64, 131072] {
+        access(&old, |operation, view| {
+            let file = view
+                .lookup(
+                    operation.overlay(),
+                    view.root_serial(),
+                    &PathName::new("file-000000").unwrap(),
+                )
+                .unwrap();
+            let outcome = operation
+                .workspace()
+                .mutate(
+                    operation.overlay(),
+                    operation.ports(),
+                    view,
+                    Operation::Write {
+                        serial: file.serial,
+                        position: Position::At(offset),
+                        data: chunk.as_slice().into(),
+                    },
+                    Time {
+                        seconds: file.metadata.mtime_seconds,
+                        nanoseconds: file.metadata.mtime_nanoseconds,
+                    },
+                )
+                .unwrap();
+            let Outcome::Applied { publication, .. } = outcome else {
+                panic!("write was not applied")
+            };
+            operation.overlay().reply_attempted(publication).unwrap();
+        });
+    }
+    let operation = old.operation().unwrap();
+    let root_serial = operation
+        .workspace()
+        .base()
+        .unwrap()
+        .root()
+        .root_inode()
+        .serial();
+    let client = operation.overlay().clone();
+    let route = old.route();
+    let mount = client.kernel_mount(route, root_serial).unwrap();
+    let requests = MountRequests::new(mount);
+    let services = layerfs_daemon::mount_request(&old, &requests.fence()).unwrap();
+    let lookup = wait(KernelRead::prepare(
+        services.clone(),
+        mount,
+        11,
+        root_serial,
+        None,
+        KernelReadOperation::Lookup {
+            parent: root_serial,
+            name: PathName::new("file-000000").unwrap(),
+        },
+    ))
+    .unwrap();
+    let serial = lookup.value().unwrap().stat.serial;
+    wait(lookup.dispose()).unwrap();
+    let opened = wait(KernelRead::prepare(
+        services.clone(),
+        mount,
+        12,
+        serial,
+        None,
+        KernelReadOperation::Open {
+            serial,
+            writable: true,
+        },
+    ))
+    .unwrap();
+    let handle = opened.value().unwrap().file.unwrap().owner_id();
+    wait(opened.dispose()).unwrap();
+    access(&old, |operation, view| {
+        let result = operation
+            .workspace()
+            .mutate(
+                operation.overlay(),
+                operation.ports(),
+                view,
+                Operation::Unlink {
+                    parent: view.root_serial(),
+                    name: PathName::new("file-000000").unwrap(),
+                },
+                Time {
+                    seconds: 1,
+                    nanoseconds: 2,
+                },
+            )
+            .unwrap();
+        let Outcome::Applied { publication, .. } = result else {
+            panic!("unlink was not applied")
+        };
+        operation.overlay().reply_attempted(publication).unwrap();
+        assert!(matches!(
+            view.lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000000").unwrap()
+            ),
+            Err(WorkspaceError::Content(ContentError::PathNotFound))
+        ));
+    });
+    let migration = old_owner.client().maintenance_failure().unwrap().unwrap();
+    assert!(
+        matches!(migration.as_ref(), OverlayError::Sql(rusqlite::Error::SqliteFailure(code, Some(message))) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER && message == "original orphan migration fault")
+    );
+    let bytes = wait(KernelData::read(
+        services.clone(),
+        mount,
+        13,
+        serial,
+        Some(handle),
+        ReadDataInput::File {
+            offset: 0,
+            length: 1024,
+        },
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(bytes.bytes(), &chunk[..1024]);
+    drop(bytes);
+    let mut later = support::bytes(1);
+    later[0] = b'Y';
+    write(&old, "file-000001", &later);
+    drop(services);
+    drop(requests);
+    drop(client);
+    drop(operation);
+    drop(old);
+    store.close_reader(id).unwrap();
+    old_owner.stop().unwrap();
+
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    let held: (i64,i64,i64,i64) = sql.query_row("SELECT (SELECT count(*) FROM durable_orphan_owner), (SELECT count(*) FROM fs_inode WHERE generation=-1), (SELECT high_namespace FROM durable_route), (SELECT COALESCE(sum(length(data)),0) FROM fs_data WHERE inode=?1 AND generation=1)", [i64::try_from(serial).unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    assert_eq!((held.0, held.1, held.2), (1, 1, 2));
+    assert!(held.3 > 14 * 4096);
+    sql.execute_batch("DROP TRIGGER pause_original_migration;")
+        .unwrap();
+    sql.execute_batch(&format!("CREATE TRIGGER fail_retirement_page BEFORE DELETE ON fs_data WHEN OLD.inode={serial} AND OLD.generation=1 AND NOT EXISTS(SELECT 1 FROM durable_orphan_owner WHERE serial={serial}) BEGIN SELECT RAISE(ABORT,'orphan retirement fault'); END;")).unwrap();
+    drop(sql);
+    let owner = Owner::start(
+        &fixture.directory.join("orphan-template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 1 },
+    )
+    .unwrap();
+    let service = Service::new(store.clone(), &owner);
+    let refused = service
+        .recover_catalog(
+            &mut roster,
+            &owner,
+            &overlays,
+            [8; 32],
+            ProfileConfig::default(),
+            3,
+        )
+        .unwrap_err();
+    let CatalogRecoveryCause::Activate { failure, .. } = &refused.cause else {
+        panic!("expected retirement failure: {:?}", refused.cause)
+    };
+    let BindError::Owner(OwnerError::Overlay(OverlayError::Sql(rusqlite::Error::SqliteFailure(
+        code,
+        Some(message),
+    )))) = &failure.cause
+    else {
+        panic!("expected original retirement fault: {:?}", failure.cause)
+    };
+    assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+    assert_eq!(message, "orphan retirement fault");
+    assert_eq!(service.workspaces(), Some(0));
+    drop(refused);
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    let stranded: (i64,i64,i64,i64,i64) = sql.query_row(
+        "SELECT (SELECT count(*) FROM durable_orphan_owner), (SELECT count(*) FROM fs_inode WHERE generation=-1), (SELECT count(*) FROM cleanup_task WHERE kind=7), (SELECT COALESCE(sum(length(data)),0) FROM fs_data WHERE inode=?1 AND generation=1), (SELECT high_namespace FROM durable_route)",
+        [i64::try_from(serial).unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+    assert_eq!(
+        (stranded.0, stranded.1, stranded.2, stranded.4),
+        (0, 0, 1, 2)
+    );
+    assert!(stranded.3 > 0);
+    sql.execute_batch("DROP TRIGGER fail_retirement_page;")
+        .unwrap();
+    let original: Vec<u8> = sql
+        .query_row(
+            "SELECT name FROM cleanup_task WHERE kind=7 AND resource=?1 AND target=1",
+            [i64::try_from(serial).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(&original[..6], &[b'L', b'F', b'S', b'R', 1, 2]);
+    assert_eq!(&original[6..38], id.to_bytes());
+    assert_eq!(&original[38..70], root);
+    assert_eq!(i64::from_be_bytes(original[70..78].try_into().unwrap()), 2);
+    let trigger: String = sql.query_row("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='durable_serial_retirement_identity'", [], |row| row.get(0)).unwrap();
+    let mut wrong = original.clone();
+    wrong[6] ^= 1;
+    sql.execute_batch("DROP TRIGGER durable_serial_retirement_identity;")
+        .unwrap();
+    assert_eq!(
+        sql.execute(
+            "UPDATE cleanup_task SET name=?1 WHERE kind=7 AND resource=?2 AND target=1",
+            rusqlite::params![&wrong, i64::try_from(serial).unwrap()]
+        )
+        .unwrap(),
+        1
+    );
+    sql.execute_batch(&trigger).unwrap();
+    drop(sql);
+
+    let corrupt = service
+        .recover_catalog(
+            &mut roster,
+            &owner,
+            &overlays,
+            [8; 32],
+            ProfileConfig::default(),
+            3,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        &corrupt.cause,
+        CatalogRecoveryCause::Open {
+            cause: OwnerError::Overlay(OverlayError::Invalid(
+                "serial retirement recovery identity"
+            )),
+            ..
+        }
+    ));
+    assert_eq!(service.workspaces(), Some(0));
+    drop(corrupt);
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    let retained: (i64, Vec<u8>, i64) = sql.query_row("SELECT (SELECT high_namespace FROM durable_route),name,(SELECT COALESCE(sum(length(data)),0) FROM fs_data WHERE inode=?1 AND generation=1) FROM cleanup_task WHERE kind=7 AND resource=?1 AND target=1", [i64::try_from(serial).unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(retained, (2, wrong, stranded.3));
+    sql.execute_batch("DROP TRIGGER durable_serial_retirement_identity;")
+        .unwrap();
+    assert_eq!(
+        sql.execute(
+            "UPDATE cleanup_task SET name=?1 WHERE kind=7 AND resource=?2 AND target=1",
+            rusqlite::params![&original, i64::try_from(serial).unwrap()]
+        )
+        .unwrap(),
+        1
+    );
+    sql.execute_batch(&trigger).unwrap();
+    drop(sql);
+
+    let recovered = service
+        .recover_catalog(
+            &mut roster,
+            &owner,
+            &overlays,
+            [8; 32],
+            ProfileConfig::default(),
+            3,
+        )
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    let token = recovered[0];
+    assert_eq!(token.workspace, id);
+    assert!(token.namespace > 2);
+    assert!(matches!(
+        service.operation(WorkspaceToken {
+            workspace: id,
+            namespace: 2
+        }),
+        Err(Failure::Rejected(
+            ControlCode::Invalid,
+            "stale Workspace namespace"
+        ))
+    ));
+    let operation = service.operation(token).unwrap();
+    access_operation(&operation, |operation, view| {
+        assert!(matches!(
+            view.lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000000").unwrap()
+            ),
+            Err(WorkspaceError::Content(ContentError::PathNotFound))
+        ));
+        let file = view
+            .lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000001").unwrap(),
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        view.read(operation.overlay(), file.serial, 0, 1024, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, later);
+        let result = operation
+            .workspace()
+            .mutate(
+                operation.overlay(),
+                operation.ports(),
+                view,
+                Operation::Write {
+                    serial: file.serial,
+                    position: Position::At(0),
+                    data: b"new".as_slice().into(),
+                },
+                Time {
+                    seconds: file.metadata.mtime_seconds,
+                    nanoseconds: file.metadata.mtime_nanoseconds,
+                },
+            )
+            .unwrap();
+        let Outcome::Applied { publication, .. } = result else {
+            panic!("new write was not applied")
+        };
+        operation.overlay().reply_attempted(publication).unwrap();
+    });
+    access_operation(&operation, |operation, view| {
+        let file = view
+            .lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000001").unwrap(),
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        view.read(operation.overlay(), file.serial, 0, 1024, &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes[..3], b"new");
+    });
+    drop(operation);
+    drop(service);
+    store.close_reader(id).unwrap();
+    owner.stop().unwrap();
+    drop(roster);
+    drop(store);
+    fixture.cleanup();
 }
 
 fn truncate(workspace: &BoundWorkspace, name: &str) {

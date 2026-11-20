@@ -9,6 +9,7 @@ pub(crate) mod durable_cleanup;
 pub(crate) mod durable_conflict;
 pub(crate) mod durable_conflict_stage;
 pub(crate) mod durable_kept;
+pub(crate) mod durable_orphan_recovery;
 pub(crate) mod durable_owners;
 pub(crate) mod durable_route;
 pub(crate) mod durable_serial_retirement;

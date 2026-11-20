@@ -89,17 +89,28 @@ sent again, and a newer namespace is selected only after original owners and
 bounded maintenance are settled. Interrupted local settlement reopens the same
 attempt and verifies its recorded phase. Nonprivileged tests cover actual Store
 receipts and definite nonpublication after an injected release failure, using
-the same Store handle and original Workspace; a physical crash, FUSE mount,
-orphan custody and full Store restart remain to be verified.
+the same Store handle and original Workspace; a physical crash, FUSE mount and
+full Store restart remain to be verified.
 
 Schema 45 additionally records the original last-unlink or orphan-layer release
 identity in the serial-retirement queue item in the same transaction as that
 event. Its Workspace, namespace, generation, original root and layer frontier
 are immutable while the item remains queued. An absent namespace remains an
-unqualified local fact. This record does not by itself authorize recovery:
-ordinary reopen still retains and refuses orphan custody and serial-retirement
-work. Schema 44 remains readable with its original behavior and is not silently
-upgraded; its older queue items cannot be assigned a new origin after the fact.
+unqualified local fact. This record does not by itself authorize recovery.
+After the caller fences the original writer, mount, consumers and handles,
+catalog recovery can settle schema-45 orphan custody with no concurrent
+checkpoint, local conflict, operation owner or unknown work. Under the original
+lease it validates owner counts, orphan-domain rows, queued origin identities,
+visible tombstones and the actual Store's original binding and content roots
+before bounded cleanup. Old file handles are not recreated; a new namespace is
+selected only after strict recorded readiness. Interrupted ownerless retirement
+and wake work continue from the original queue. Nonprivileged tests exercise
+the real Workspace unlink and request adapter with a retained file handle,
+including an injected interruption after the owner is removed; they do not
+establish actual FUSE mount, process-crash or full Store-restart behavior.
+Ordinary Overlay reopen remains conservative. Schema 44 remains readable with
+its original behavior and is not silently upgraded; its older queue items
+cannot be assigned a new origin after the fact.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

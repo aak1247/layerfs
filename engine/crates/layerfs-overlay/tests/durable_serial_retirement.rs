@@ -3,7 +3,9 @@
 
 mod payload_support;
 
-use layerfs_overlay::{Changes, MaintenanceCursor, Overlay, OverlayError, ProfileConfig};
+use layerfs_overlay::{
+    Changes, MaintenanceCursor, Overlay, OverlayCatalogRecovery, OverlayError, ProfileConfig,
+};
 use payload_support::File;
 use std::{
     fs,
@@ -375,6 +377,108 @@ fn altered_retirement_trigger_refuses_reopen_without_changing_the_database() {
         Err(OverlayError::Invalid(
             "durable serial retirement schema identity"
         ))
+    ));
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+}
+
+#[test]
+fn wake_only_interruption_can_finish_without_minting_an_owner() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute(
+        "INSERT INTO cleanup_task(kind,resource,target) VALUES(8,0,1)",
+        [],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO cleanup_task(kind,resource,target) VALUES(9,0,1)",
+        [],
+    )
+    .unwrap();
+    drop(sql);
+    let recovery =
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let OverlayCatalogRecovery::PendingOrphans(mut pending) = recovery else {
+        panic!("wake-only work must remain under the original pending lease")
+    };
+    let record = pending.observed().clone();
+    assert_eq!(record.previous_namespace, 7);
+    assert!(pending.owner_roots(0).unwrap().is_empty());
+    assert!(pending.retirement_roots((0, 0)).unwrap().is_empty());
+    pending.schedule(1).unwrap();
+    let mut cursor = MaintenanceCursor::default();
+    for _ in 0..8 {
+        if pending.ready().unwrap() {
+            break;
+        }
+        cursor = pending
+            .maintain(cursor)
+            .unwrap()
+            .expect("wake work stalled")
+            .cursor;
+    }
+    assert!(pending.ready().unwrap());
+    let db = pending.complete(&record).unwrap();
+    assert_eq!(db.durable_namespace().unwrap(), Some(7));
+    db.advance_durable_namespace(8).unwrap();
+    assert_eq!(db.durable_namespace().unwrap(), Some(8));
+    db.close_database().unwrap();
+}
+
+#[test]
+fn inconsistent_orphan_domain_or_floor_is_refused_before_any_write() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let source = db.acquire_base_source(1).unwrap();
+    let mut file = File::new(&db, source, 9, Vec::new());
+    file.write(0, b"held bytes");
+    let _handle = db
+        .open_file(source, 2, &file.inode(file.expect.len() as u64), true)
+        .unwrap();
+    let mut removed = file.inode(file.expect.len() as u64);
+    removed.nlink = 0;
+    let publication = db
+        .apply(
+            source,
+            &Changes {
+                inodes: vec![removed],
+                ..Changes::default()
+            },
+        )
+        .unwrap();
+    db.reply_attempted(publication).unwrap();
+    drop(file);
+    db.release_base_source(source).unwrap();
+    drop(db);
+
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute(
+        "INSERT INTO fs_data(inode,generation,cell_offset,epoch,data) VALUES(10,-1,0,0,X'01')",
+        [],
+    )
+    .unwrap();
+    drop(sql);
+    let before = fs::read(fixture.path()).unwrap();
+    assert!(matches!(
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE),
+        Err(OverlayError::Invalid("orphan recovery unowned row"))
+    ));
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute("DELETE FROM fs_data WHERE inode=10 AND generation=-1", [])
+        .unwrap();
+    assert_eq!(
+        sql.execute("UPDATE durable_orphan_owner SET floor=1 WHERE serial=9", [])
+            .unwrap(),
+        1
+    );
+    drop(sql);
+    let before = fs::read(fixture.path()).unwrap();
+    assert!(matches!(
+        OverlayCatalogRecovery::open(&fixture.path(), ProfileConfig::default(), WORKSPACE),
+        Err(OverlayError::Invalid("orphan recovery owner"))
     ));
     assert_eq!(fs::read(fixture.path()).unwrap(), before);
 }

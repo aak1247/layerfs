@@ -171,6 +171,16 @@ impl Overlay {
     /// whole payload, retries a failure or scans a held population. The daemon
     /// continues this work during foreground service and idle periods.
     pub fn maintain(&self, after: MaintenanceCursor) -> OverlayResult<Option<MaintenanceStep>> {
+        self.maintain_checked(after, |_, _| Ok(()))
+    }
+
+    /// A non-routable recovery checks the selected original item in the same
+    /// transaction immediately before the ordinary bounded maintenance step.
+    pub(crate) fn maintain_checked(
+        &self,
+        after: MaintenanceCursor,
+        check: impl FnOnce(&Overlay, &Item) -> OverlayResult<()>,
+    ) -> OverlayResult<Option<MaintenanceStep>> {
         self.available()?;
         if !self.maintenance_ready.get() {
             return Ok(None);
@@ -202,6 +212,7 @@ impl Overlay {
                 self.maintenance_ready.set(false);
                 return Ok(None);
             };
+            check(self, &item)?;
             let (rows, bytes, done) =
                 if matches!(item.kind, FOLD | RETIRE) && self.generation_held(item.target)? {
                     self.hold_item(&item)?;

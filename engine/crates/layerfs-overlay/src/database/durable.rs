@@ -561,9 +561,28 @@ mod linux {
             && bound
             && pending_attempt
             && !pending_conflict;
+        let orphan = if settled_conflict
+            && profile.has_serial_retirement_origin()
+            && bound
+            && !pending_attempt
+            && !pending_conflict
+            && state.captured.is_none()
+            && state.consolidating.is_none()
+        {
+            super::super::profile::readback(
+                &connection,
+                &work,
+                "SELECT EXISTS(SELECT 1 FROM durable_orphan_owner) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind IN(7,8,9))",
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
         if state.closed
             || (state.consolidating.is_some() && !checkpoint)
-            || (!checkpoint && (state.captured.is_some() || held || pending || pending_attempt))
+            || (!checkpoint
+                && !orphan
+                && (state.captured.is_some() || held || pending || pending_attempt))
             || (pending_conflict && !settled_conflict)
             || (pending_conflict && settled_conflict && (!profile.has_durable_conflict() || !bound))
         {
