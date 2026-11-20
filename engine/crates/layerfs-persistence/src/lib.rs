@@ -26,6 +26,10 @@ pub use storage::merge_records::{
 pub(crate) use storage::provider as storage_provider;
 pub(crate) use storage::publication;
 pub use storage_provider::{DurableBarrierError, StorageProvider};
+#[cfg(target_os = "linux")]
+pub use store::checkpoint_upgrade::{
+    CheckpointUpgradeFailure, CheckpointUpgradeResult, PreparedCheckpointUpgrade,
+};
 pub use store::seal::SealedStore;
 
 mod metadata;

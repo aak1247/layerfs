@@ -357,19 +357,112 @@ impl super::connection::Session {
         catalog_id: layerfs_history::CatalogId,
         binding: &[u8],
     ) -> Result<(u64, CheckpointFormat), BackendError> {
-        self.run::<_,BackendError>(false,|tx| {
-   let selection=(self.layout,self.acquisition);
-   let rows=tx.query("SELECT catalog_id,catalog_incarnation,binding_key,identity_format,schema_version,schema_source,schema_definition FROM history_meta WHERE id=1",vec![])?;
-   let r=rows.first().filter(|_|rows.len()==1).ok_or(BackendError::Integrity)?;
-   let incarnation:i64=r.get(1)?;
-   let recorded_source=r.get::<String>(5)?;
-   let format=if recorded_source==format_source(selection,CheckpointFormat::Legacy) { CheckpointFormat::Legacy }
-      else if self.profile.persistence==crate::SqlitePersistenceProfile::Durable && recorded_source==format_source(selection,CheckpointFormat::Receipts) { CheckpointFormat::Receipts }
-      else { return Err(BackendError::Integrity); };
-   check(tx.connection,tx.work,selection,self.profile.persistence,format)?;
-   let recorded_definition=r.get::<String>(6)?;
-   if r.get::<Vec<u8>>(0)?!=catalog_id.as_slice() || r.get::<Vec<u8>>(2)?!=binding || incarnation<=0 || r.get::<i64>(3)?!=3 || r.get::<i64>(4)?!=self.schema_version() || recorded_definition!=definition(tx.connection,tx.work)? || recorded_definition!=expected_definition(selection,format)? {return Err(BackendError::Integrity);}
-   Ok((incarnation as u64,format))
-  })
+        self.run::<_, BackendError>(false, |tx| {
+            self.validate_transaction(tx, catalog_id, binding)
+        })
+    }
+
+    fn validate_transaction(
+        &self,
+        tx: &Transaction<'_>,
+        catalog_id: layerfs_history::CatalogId,
+        binding: &[u8],
+    ) -> Result<(u64, CheckpointFormat), BackendError> {
+        let selection = (self.layout, self.acquisition);
+        let rows=tx.query("SELECT catalog_id,catalog_incarnation,binding_key,identity_format,schema_version,schema_source,schema_definition FROM history_meta WHERE id=1",vec![])?;
+        let r = rows
+            .first()
+            .filter(|_| rows.len() == 1)
+            .ok_or(BackendError::Integrity)?;
+        let incarnation: i64 = r.get(1)?;
+        let recorded_source = r.get::<String>(5)?;
+        let format = if recorded_source == format_source(selection, CheckpointFormat::Legacy) {
+            CheckpointFormat::Legacy
+        } else if self.profile.persistence == crate::SqlitePersistenceProfile::Durable
+            && recorded_source == format_source(selection, CheckpointFormat::Receipts)
+        {
+            CheckpointFormat::Receipts
+        } else {
+            return Err(BackendError::Integrity);
+        };
+        check(
+            tx.connection,
+            tx.work,
+            selection,
+            self.profile.persistence,
+            format,
+        )?;
+        let recorded_definition = r.get::<String>(6)?;
+        if r.get::<Vec<u8>>(0)? != catalog_id.as_slice()
+            || r.get::<Vec<u8>>(2)? != binding
+            || incarnation <= 0
+            || r.get::<i64>(3)? != 3
+            || r.get::<i64>(4)? != self.schema_version()
+            || recorded_definition != definition(tx.connection, tx.work)?
+            || recorded_definition != expected_definition(selection, format)?
+        {
+            return Err(BackendError::Integrity);
+        }
+        Ok((incarnation as u64, format))
+    }
+
+    /// The caller has fenced every old Store reader, writer and consumer. The
+    /// source identity and actual SQLite definition are rechecked in the same
+    /// writer transaction as the additive receipt schema.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn upgrade_checkpoint_receipts(
+        &self,
+        catalog_id: layerfs_history::CatalogId,
+        binding: &[u8],
+        expected_incarnation: u64,
+        original: &std::fs::File,
+    ) -> Result<bool, BackendError> {
+        if self.profile.persistence != crate::SqlitePersistenceProfile::Durable
+            || expected_incarnation == 0
+        {
+            return Err(BackendError::Integrity);
+        }
+        self.run::<_, BackendError>(true, |tx| {
+            let directory = self
+                .durable_directory
+                .as_ref()
+                .ok_or(BackendError::Integrity)?;
+            directory
+                .verify_original_file(original)
+                .map_err(|_| BackendError::Integrity)?;
+            let (incarnation, format) = self.validate_transaction(tx, catalog_id, binding)?;
+            if incarnation != expected_incarnation {
+                return Err(BackendError::Integrity);
+            }
+            if format == CheckpointFormat::Receipts {
+                return Ok(false);
+            }
+            let selection = (self.layout, self.acquisition);
+            tx.bootstrap(CHECKPOINT_RECEIPTS)?;
+            let actual = definition(tx.connection, tx.work)?;
+            if actual != expected_definition(selection, CheckpointFormat::Receipts)? {
+                return Err(BackendError::Integrity);
+            }
+            tx.query(
+                "UPDATE history_meta SET schema_source=?1,schema_definition=?2 WHERE id=1",
+                vec![
+                    Param::Text(format_source(selection, CheckpointFormat::Receipts)),
+                    Param::Text(actual),
+                ],
+            )?;
+            let changes = tx.query("SELECT changes()", vec![])?;
+            if changes.len() != 1 || changes[0].get::<i64>(0)? != 1 {
+                return Err(BackendError::Integrity);
+            }
+            if self.validate_transaction(tx, catalog_id, binding)?
+                != (incarnation, CheckpointFormat::Receipts)
+            {
+                return Err(BackendError::Integrity);
+            }
+            directory
+                .verify_original_file(original)
+                .map_err(|_| BackendError::Integrity)?;
+            Ok(true)
+        })
     }
 }

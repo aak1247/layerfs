@@ -2,6 +2,8 @@
 mod support;
 
 use layerfs_history::*;
+#[cfg(target_os = "linux")]
+use layerfs_persistence::PreparedCheckpointUpgrade;
 use layerfs_persistence::{Handles, PersistenceConfig, SqliteAcquisitionSchema, SqlitePackLayout};
 use layerfs_storage::StoragePolicy;
 use support::*;
@@ -223,6 +225,266 @@ fn legacy_store_stays_legacy_and_unknown_definition_is_refused() {
         .unwrap();
     drop(sql);
     assert!(Handles::open_read_only(config(&path), BINDING, [71; 32]).is_err());
+}
+
+#[cfg(target_os = "linux")]
+fn reconstructed_legacy(path: &std::path::Path) -> BranchSnapshot {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        path.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let handles = create_durable(path);
+    let initial = make_branch(&handles.history);
+    handles
+        .history
+        .commit_branch(&request(&initial, root(1)))
+        .unwrap();
+    let before = handles
+        .history
+        .branch_snapshot(initial.branch.id)
+        .unwrap()
+        .unwrap();
+    drop(handles);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let sql = rusqlite::Connection::open(path).unwrap();
+    let current: String = sql
+        .query_row("SELECT schema_source FROM history_meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    sql.execute_batch("DROP TABLE checkpoint_receipt").unwrap();
+    sql.execute(
+        "UPDATE history_meta SET schema_source=?1,schema_definition=?2 WHERE id=1",
+        rusqlite::params![
+            current.strip_suffix(RECEIPTS).unwrap(),
+            schema_definition(&sql)
+        ],
+    )
+    .unwrap();
+    drop(sql);
+    before
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn receipt_upgrade_requires_original_file_and_preserves_history() {
+    let temp = Temp::new("checkpoint-upgrade-identity");
+    let path = temp.join("db");
+    let before = reconstructed_legacy(&path);
+    let other = temp.join("other");
+    std::fs::write(&other, b"different file").unwrap();
+    let error = PreparedCheckpointUpgrade::prepare(
+        config(&path),
+        std::fs::File::open(&other).unwrap(),
+        BINDING,
+        7,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.cause(),
+        &layerfs_storage::port::PersistenceError::Malformed
+    );
+    drop(error);
+    let original = std::fs::File::open(&path).unwrap();
+    let error = PreparedCheckpointUpgrade::prepare(config(&path), original, BINDING, 8)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.cause(),
+        &layerfs_storage::port::PersistenceError::Malformed
+    );
+    let original = error.release_original().unwrap();
+    let legacy = Handles::open_read_only(config(&path), BINDING, [71; 32]).unwrap();
+    assert_eq!(
+        legacy.history.require_checkpoint_receipts(),
+        Err(HistoryError::Unsupported("checkpoint receipt"))
+    );
+    assert_eq!(
+        legacy.history.checkpoint_receipt(attempt(1)),
+        Err(HistoryError::Unsupported("checkpoint receipt"))
+    );
+    assert_eq!(
+        legacy
+            .history
+            .branch_snapshot(before.branch.id)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    drop(legacy);
+
+    let prepared = PreparedCheckpointUpgrade::prepare(config(&path), original, BINDING, 7).unwrap();
+    let upgraded = prepared.apply().unwrap();
+    assert!(upgraded.applied);
+    let handles = Handles::open_writable(config(&path), BINDING, [71; 32]).unwrap();
+    handles.history.require_checkpoint_receipts().unwrap();
+    assert_eq!(
+        handles
+            .history
+            .branch_snapshot(before.branch.id)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let input = request(&before, root(2));
+    let outcome = handles
+        .history
+        .commit_checkpoint(attempt(1), &input)
+        .unwrap();
+    let after = handles
+        .history
+        .branch_snapshot(before.branch.id)
+        .unwrap()
+        .unwrap();
+    drop(handles);
+    let reopened = Handles::open_read_only(config(&path), BINDING, [71; 32]).unwrap();
+    let receipt = reopened
+        .history
+        .checkpoint_receipt(attempt(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.outcome, outcome);
+    assert_eq!(
+        receipt.request_digest,
+        checkpoint_request_digest(&encode_checkpoint_request(&input).unwrap())
+    );
+    assert_eq!(
+        reopened
+            .history
+            .branch_snapshot(before.branch.id)
+            .unwrap()
+            .unwrap(),
+        after
+    );
+    drop(reopened);
+    let already = PreparedCheckpointUpgrade::prepare(config(&path), upgraded.original, BINDING, 7)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert!(!already.applied);
+}
+
+#[cfg(target_os = "linux")]
+mod receipt_upgrade_fault {
+    use super::*;
+    use rusqlite::{auto_extension, ffi, Connection};
+    use std::{
+        ffi::{c_char, c_int, c_void, CStr},
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
+
+    static WATCHED: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static INSTALLED: AtomicUsize = AtomicUsize::new(0);
+    static FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn trace(_: u32, _: *mut c_void, _: *mut c_void, sql: *mut c_void) -> c_int {
+        if !sql.is_null() {
+            // SAFETY: SQLite supplies a NUL-terminated statement string for this trace event.
+            let value = unsafe { CStr::from_ptr(sql.cast::<c_char>()) }.to_bytes();
+            if value
+                .windows(b"injected receipt migration failure".len())
+                .any(|w| w == b"injected receipt migration failure")
+            {
+                FIRED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        0
+    }
+
+    fn install(connection: Connection) -> rusqlite::Result<()> {
+        let watched = WATCHED.lock().unwrap();
+        if connection.path().map(std::path::Path::new) != watched.as_deref() {
+            return Ok(());
+        }
+        // The product will set this same value during profile setup. Choosing
+        // it now prevents that setup from clearing the temporary trigger.
+        connection.execute_batch("PRAGMA temp_store=2; CREATE TEMP TRIGGER reject_receipt_metadata BEFORE UPDATE OF schema_source ON main.history_meta WHEN EXISTS(SELECT 1 FROM main.sqlite_schema WHERE name='checkpoint_receipt' AND type='table') BEGIN SELECT RAISE(ABORT,'injected receipt migration failure'); END;")?;
+        // SAFETY: the static callback outlives the underlying connection.
+        let code = unsafe {
+            ffi::sqlite3_trace_v2(
+                connection.handle(),
+                ffi::SQLITE_TRACE_STMT,
+                Some(trace),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, ffi::SQLITE_OK);
+        INSTALLED.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    unsafe extern "C" fn opened(
+        db: *mut ffi::sqlite3,
+        error: *mut *mut c_char,
+        _: *const ffi::sqlite3_api_routines,
+    ) -> c_int {
+        // SAFETY: SQLite invokes the registered callback with its own open connection.
+        unsafe { auto_extension::init_auto_extension(db, error, install) }
+    }
+
+    #[test]
+    fn receipt_ddl_rolls_back_if_metadata_update_fails() {
+        let temp = Temp::new("checkpoint-upgrade-rollback");
+        let path = temp.join("db");
+        let before = reconstructed_legacy(&path);
+        *WATCHED.lock().unwrap() = Some(path.clone());
+        // SAFETY: the callback neither opens a connection nor closes SQLite's handle.
+        unsafe { auto_extension::register_auto_extension(opened).unwrap() };
+        let original = std::fs::File::open(&path).unwrap();
+        let prepared =
+            PreparedCheckpointUpgrade::prepare(config(&path), original, BINDING, 7).unwrap();
+        assert_eq!(INSTALLED.load(Ordering::Relaxed), 1);
+        assert!(auto_extension::cancel_auto_extension(opened));
+        let error = prepared.apply().err().unwrap();
+        assert_eq!(
+            error.cause(),
+            &layerfs_storage::port::PersistenceError::Malformed
+        );
+        assert!(
+            FIRED.load(Ordering::Relaxed) > 0,
+            "the injected post-DDL trigger did not run"
+        );
+        let original = error.release_original().unwrap();
+        let sql =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let present: i64 = sql
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='checkpoint_receipt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 0);
+        drop(sql);
+        let legacy = Handles::open_read_only(config(&path), BINDING, [71; 32]).unwrap();
+        assert_eq!(
+            legacy.history.checkpoint_receipt(attempt(1)),
+            Err(HistoryError::Unsupported("checkpoint receipt"))
+        );
+        assert_eq!(
+            legacy
+                .history
+                .branch_snapshot(before.branch.id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        drop(legacy);
+        let success = PreparedCheckpointUpgrade::prepare(config(&path), original, BINDING, 7)
+            .unwrap()
+            .apply()
+            .unwrap();
+        assert!(success.applied);
+        drop(success);
+        *WATCHED.lock().unwrap() = None;
+    }
 }
 
 #[test]

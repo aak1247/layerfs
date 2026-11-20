@@ -112,6 +112,18 @@ Ordinary Overlay reopen remains conservative. Schema 44 remains readable with
 its original behavior and is not silently upgraded; its older queue items
 cannot be assigned a new origin after the fact.
 
+Persistence also provides a local `PreparedCheckpointUpgrade` for a Durable
+Store's receipt schema. It holds the caller's original open Store file and one
+private SQLite session, verifies their physical identity and the recorded
+catalog, incarnation and exact predecessor schema, then installs the receipt
+schema in one transaction. Its caller must independently authenticate the
+original Store and roster and fence every old reader, writer, mount and
+consumer; this local handle does not prove that fence. Successful callers close
+the returned original file before reopening the Store, or retain it until all
+new SQLite connections close. A failed or unwound uncertain transaction retains
+the original file and session until process exit. This primitive is not yet
+wired into catalog recovery or an automatic Store/Overlay migration.
+
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it
 when a fresh durable Workspace setup is explicitly supplied. It is not used to

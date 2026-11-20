@@ -86,4 +86,31 @@ impl DurableDirectory {
         }
         Ok(())
     }
+
+    /// Compare the caller's still-open original file with this session's
+    /// captured Store identity and the current protected directory entry.
+    pub(super) fn verify_original_file(&self, original: &File) -> io::Result<()> {
+        self.verify_private()?;
+        let metadata = original.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || (metadata.dev(), metadata.ino()) != self.database_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "original Store file identity changed",
+            ));
+        }
+        self.verify_private()
+    }
+}
+
+impl super::connection::Session {
+    pub(crate) fn verify_original_store_file(&self, original: &File) -> Result<(), BackendError> {
+        self.durable_directory
+            .as_ref()
+            .ok_or(BackendError::Integrity)?
+            .verify_original_file(original)
+            .map_err(|_| BackendError::Integrity)
+    }
 }
