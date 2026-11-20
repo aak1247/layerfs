@@ -505,6 +505,7 @@ impl Overlay {
     pub fn fold_unpublished_checkpoint(&self, recorded: RecordedCapture) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             let namespace = check_original(self, recorded)?;
+            super::durable_conflict_stage::retire_staging(self, recorded, namespace)?;
             let changed = self.execute(
                 StatementKind::Frontier,
                 "UPDATE durable_checkpoint_attempt SET phase=3,fold_completed=0,retire_completed=0 WHERE id=1 AND phase=1 AND attempt=?1 AND namespace=?2",
@@ -621,6 +622,7 @@ impl Overlay {
             .ok_or(OverlayError::Invalid("checkpoint publication size"))?;
         self.atomic_cleanup(|| {
             let namespace = check_original(self, recorded)?;
+            super::durable_conflict_stage::require_no_stage(self, recorded)?;
             let capture = recorded.capture;
             let changed = self.execute(
                 StatementKind::Frontier,

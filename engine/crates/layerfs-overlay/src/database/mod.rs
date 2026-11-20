@@ -6,6 +6,7 @@ pub(crate) mod durable_attempt;
 pub(crate) mod durable_binding;
 pub(crate) mod durable_cleanup;
 pub(crate) mod durable_conflict;
+pub(crate) mod durable_conflict_stage;
 pub(crate) mod durable_kept;
 pub(crate) mod durable_owners;
 pub(crate) mod durable_route;

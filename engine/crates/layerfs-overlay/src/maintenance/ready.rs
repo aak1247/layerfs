@@ -12,6 +12,7 @@ pub(crate) const STEPS: i64 = 5;
 pub(crate) const OPERATION_RECORD: i64 = 6;
 /// Stale reference pieces of one layer after a shrink.
 pub(crate) const STALE_PIECES: i64 = 12;
+pub(crate) const CONFLICT_PAGES: i64 = 13;
 const READY: &str = "SELECT kind,resource,target,phase,cursor,aux,name FROM cleanup_task
     INDEXED BY cleanup_task_ready WHERE ready=1 AND (kind,resource,target)>(?1,?2,?3)
     ORDER BY kind,resource,target LIMIT 1";
@@ -215,6 +216,7 @@ impl Overlay {
                         SERIAL_RETIRE => self.retire_serial(&item, PAGE)?,
                         STALE | STEPS | OPERATION_RECORD => self.clean_live_item(&item)?,
                         STALE_PIECES => self.clean_pieces(&item)?,
+                        CONFLICT_PAGES => self.clean_conflict_pages(&item)?,
                         _ => return Err(OverlayError::Invalid("maintenance kind")),
                     }
                 };

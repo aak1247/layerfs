@@ -55,6 +55,9 @@ fn ready(
     let [cleanup] = rows.as_slice() else {
         return Err(OverlayError::Invalid("checkpoint fold cleanup predecessor"));
     };
+    if !super::durable_conflict_stage::cleanup_ready(db, recorded, phase)? {
+        return Ok((false, namespace));
+    }
     if let Some(expected) = installed {
         check_installed(db, recorded, expected)?;
         let expected_reader = expected.reader.map(|reader| {

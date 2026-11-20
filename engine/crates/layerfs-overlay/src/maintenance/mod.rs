@@ -1,4 +1,5 @@
 //! Responsibility-scoped implementation modules and reexports.
+pub(crate) mod conflict;
 pub(crate) mod garbage;
 pub(crate) mod orphan;
 pub(crate) mod pieces;
