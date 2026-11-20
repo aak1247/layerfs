@@ -218,6 +218,14 @@ impl Overlay {
                         _ => return Err(OverlayError::Invalid("maintenance kind")),
                     }
                 };
+            if done {
+                crate::database::durable_attempt::maintenance_completed(
+                    self,
+                    item.kind,
+                    item.resource,
+                    item.target,
+                )?;
+            }
             Ok(Some(MaintenanceStep {
                 cursor: item.key(),
                 work: ReclaimStep {

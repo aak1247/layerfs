@@ -19,13 +19,20 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
          candidate_root BLOB, target_snapshot BLOB, \
          outcome_kind INTEGER, outcome_head BLOB, outcome_displaced BLOB, installed_snapshot BLOB, \
          reader_owner INTEGER CHECK(reader_owner>0), reader_request INTEGER, reader_floor INTEGER, reader_released INTEGER, \
-         operation_owner INTEGER CHECK(operation_owner>0), operation_released INTEGER, \
+         operation_owner INTEGER CHECK(operation_owner>0), operation_released INTEGER, operation_cleanup_completed INTEGER, \
+         fold_completed INTEGER, retire_completed INTEGER, \
          CHECK((reader_owner IS NULL AND reader_request IS NULL AND reader_floor IS NULL AND reader_released IS NULL) OR \
           (reader_owner IS NOT NULL AND reader_request IS NOT NULL AND reader_request=generation AND \
            reader_floor IS NOT NULL AND reader_floor>=0 AND reader_floor<generation AND \
            reader_released IS NOT NULL AND reader_released IN(0,1))), \
-         CHECK((operation_owner IS NULL AND operation_released IS NULL) OR \
-          (operation_owner IS NOT NULL AND operation_released IS NOT NULL AND operation_released IN(0,1) AND reader_owner IS NOT NULL)), \
+         CHECK((operation_owner IS NULL AND operation_released IS NULL AND operation_cleanup_completed IS NULL) OR \
+          (operation_owner IS NOT NULL AND operation_released IS NOT NULL AND operation_released IN(0,1) AND \
+           operation_cleanup_completed IS NOT NULL AND operation_cleanup_completed IN(0,1) AND \
+           (operation_cleanup_completed=0 OR operation_released=1) AND reader_owner IS NOT NULL)), \
+         CHECK((phase IN(1,2) AND fold_completed IS NULL AND retire_completed IS NULL) OR \
+          (phase=3 AND fold_completed IS NOT NULL AND fold_completed IN(0,1) AND retire_completed IS NOT NULL AND \
+           retire_completed IN(0,1) AND (retire_completed=0 OR fold_completed=1)) OR \
+          (phase=4 AND fold_completed IS NULL AND retire_completed IS NOT NULL AND retire_completed IN(0,1))), \
          CHECK((phase IN(1,3) AND request IS NULL AND request_digest IS NULL AND candidate_root IS NULL AND target_snapshot IS NULL \
           AND outcome_kind IS NULL AND outcome_head IS NULL AND outcome_displaced IS NULL AND installed_snapshot IS NULL) OR \
          (phase=2 AND request IS NOT NULL AND request_digest IS NOT NULL AND length(request_digest)=32 AND \
@@ -275,7 +282,7 @@ pub(crate) fn acquire_operation(
     let reader_owner = crate::db::integer(reader.owner)?;
     let changed = db.execute(
         StatementKind::Frontier,
-        "UPDATE durable_checkpoint_attempt SET operation_owner=?1,operation_released=0 \
+        "UPDATE durable_checkpoint_attempt SET operation_owner=?1,operation_released=0,operation_cleanup_completed=0 \
          WHERE id=1 AND attempt=?2 AND namespace=?3 AND phase=1 AND reader_owner=?4 \
          AND reader_request=?5 AND reader_floor=?6 AND reader_released=0 AND operation_owner IS NULL",
         &[&owner, &recorded.attempt.as_slice(), &namespace, &reader_owner, &request, &reader.installed],
@@ -402,6 +409,79 @@ pub(crate) fn pending(db: &Overlay) -> OverlayResult<bool> {
     }
 }
 
+struct MaintenanceContext {
+    phase: i64,
+    generation: i64,
+    operation: Option<i64>,
+    operation_released: Option<i64>,
+    operation_cleanup_completed: Option<i64>,
+    fold_completed: Option<i64>,
+    retire_completed: Option<i64>,
+}
+
+/// Runs inside the same atomic maintenance step that completed this exact item.
+pub(crate) fn maintenance_completed(
+    db: &Overlay,
+    kind: i64,
+    resource: i64,
+    target: i64,
+) -> OverlayResult<()> {
+    if !pending(db)? {
+        return Ok(());
+    }
+    let rows: Vec<MaintenanceContext> = db.query(
+        StatementKind::Frontier,
+        "SELECT phase,generation,operation_owner,operation_released,operation_cleanup_completed,fold_completed,retire_completed FROM durable_checkpoint_attempt WHERE id=1",
+        &[],
+        56,
+        |row| Ok(MaintenanceContext {
+            phase: row.get(0)?, generation: row.get(1)?, operation: row.get(2)?,
+            operation_released: row.get(3)?, operation_cleanup_completed: row.get(4)?,
+            fold_completed: row.get(5)?, retire_completed: row.get(6)?,
+        }),
+    )?;
+    let [context] = rows.as_slice() else {
+        return Err(OverlayError::Invalid("checkpoint maintenance state"));
+    };
+    let statement = match (kind, resource, target) {
+        (1, 0, generation) if generation == context.generation => {
+            if context.phase != 3
+                || context.fold_completed != Some(0)
+                || context.retire_completed != Some(0)
+            {
+                return Err(OverlayError::Invalid("checkpoint fold completion"));
+            }
+            "UPDATE durable_checkpoint_attempt SET fold_completed=1 WHERE id=1 AND phase=3 AND generation=?1 AND fold_completed=0"
+        }
+        (3, 0, generation) if generation == context.generation => {
+            if ![3, 4].contains(&context.phase)
+                || (context.phase == 3 && context.fold_completed != Some(1))
+                || context.retire_completed != Some(0)
+            {
+                return Err(OverlayError::Invalid("checkpoint retirement completion"));
+            }
+            "UPDATE durable_checkpoint_attempt SET retire_completed=1 WHERE id=1 AND phase IN(3,4) AND generation=?1 AND retire_completed=0"
+        }
+        (6, owner, _) if context.operation == Some(owner) => {
+            if target != 2
+                || context.operation_released != Some(1)
+                || context.operation_cleanup_completed != Some(0)
+            {
+                return Err(OverlayError::Invalid(
+                    "checkpoint operation cleanup completion",
+                ));
+            }
+            "UPDATE durable_checkpoint_attempt SET operation_cleanup_completed=1 WHERE id=1 AND operation_owner=?1 AND operation_released=1 AND operation_cleanup_completed=0"
+        }
+        _ => return Ok(()),
+    };
+    let key = if kind == 6 { resource } else { target };
+    if db.execute(StatementKind::Frontier, statement, &[&key], 8)? != 1 {
+        return Err(OverlayError::Invalid("checkpoint maintenance predecessor"));
+    }
+    Ok(())
+}
+
 impl Overlay {
     /// Schedules the original capture for folding after a verified pre-send failure.
     /// The durable attempt and exact owner identities remain until cleanup is settled.
@@ -410,7 +490,7 @@ impl Overlay {
             let namespace = check_original(self, recorded)?;
             let changed = self.execute(
                 StatementKind::Frontier,
-                "UPDATE durable_checkpoint_attempt SET phase=3 WHERE id=1 AND phase=1 AND attempt=?1 AND namespace=?2",
+                "UPDATE durable_checkpoint_attempt SET phase=3,fold_completed=0,retire_completed=0 WHERE id=1 AND phase=1 AND attempt=?1 AND namespace=?2",
                 &[&recorded.attempt.as_slice(), &namespace],
                 40,
             )?;
@@ -479,7 +559,7 @@ impl Overlay {
             let changed = self.execute(
                 StatementKind::Frontier,
                 "UPDATE durable_checkpoint_attempt SET phase=4,outcome_kind=?1,outcome_head=?2,\
-                 outcome_displaced=?3,installed_snapshot=?4 WHERE id=1 AND phase=2 AND attempt=?5 \
+                 outcome_displaced=?3,installed_snapshot=?4,retire_completed=0 WHERE id=1 AND phase=2 AND attempt=?5 \
                  AND namespace=?6 AND request_digest=?7 AND candidate_root=?8",
                 &[
                     &kind, &head, &displaced, &installed_snapshot, &recorded.attempt.as_slice(),

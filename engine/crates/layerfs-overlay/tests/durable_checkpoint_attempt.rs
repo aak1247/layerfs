@@ -608,11 +608,11 @@ fn prepublication_fold_retains_later_writes_and_original_custody() {
     assert!(db.capture().is_err());
     drop(db);
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
-    let row: (i64, i64, i64) = sql.query_row(
-        "SELECT phase,reader_released,operation_released FROM durable_checkpoint_attempt WHERE id=1", [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    let row: (i64, i64, i64, i64, i64, i64) = sql.query_row(
+        "SELECT phase,reader_released,operation_released,fold_completed,retire_completed,operation_cleanup_completed FROM durable_checkpoint_attempt WHERE id=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     ).unwrap();
-    assert_eq!(row, (3, 1, 1));
+    assert_eq!(row, (3, 1, 1, 1, 1, 1));
     drop(sql);
     assert!(
         Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).is_err()
@@ -761,6 +761,18 @@ fn known_checkpoint_install_retains_original_outcome_and_later_writes() {
             .is_err());
         db.release_captured_reader(reader).unwrap();
         db.release_operation(operation).unwrap();
+        let mut cursor = MaintenanceCursor::default();
+        for _ in 0..256 {
+            if db.maintenance_idle().unwrap() {
+                break;
+            }
+            cursor = db
+                .maintain(cursor)
+                .unwrap()
+                .expect("ready maintenance stalled")
+                .cursor;
+        }
+        assert!(db.maintenance_idle().unwrap());
         assert!(db.capture().is_err());
         drop(db);
         let sql = rusqlite::Connection::open(fixture.path()).unwrap();
@@ -775,6 +787,11 @@ fn known_checkpoint_install_retains_original_outcome_and_later_writes() {
             CheckpointOutcome::UpToDate { head } => (2, head.map(|id| id.to_vec()), None),
         };
         assert_eq!(row, (4, kind, head, displaced, installed.to_vec(), 1, 1));
+        let completed: (i64, i64) = sql.query_row(
+            "SELECT retire_completed,operation_cleanup_completed FROM durable_checkpoint_attempt WHERE id=1", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(completed, (1, 1));
         drop(sql);
         assert!(
             Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).is_err()
@@ -851,4 +868,115 @@ fn different_target_snapshot_keeps_the_pending_attempt_and_binding() {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ).unwrap();
     assert_eq!(row, (2, b"target snapshot".to_vec(), 0));
+}
+
+#[test]
+fn maintenance_completion_failure_retains_the_exact_original_item() {
+    for kind in ["fold", "retire", "operation"] {
+        let fixture = Fixture::new();
+        fixture.create().close_database().unwrap();
+        let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+        let column = match kind {
+            "fold" => "fold_completed",
+            "retire" => "retire_completed",
+            _ => "operation_cleanup_completed",
+        };
+        sql.execute_batch(&format!("CREATE TRIGGER fail_completion BEFORE UPDATE OF {column} ON durable_checkpoint_attempt WHEN NEW.{column}=1 BEGIN SELECT RAISE(ABORT, 'completion failure'); END;")).unwrap();
+        drop(sql);
+        let db =
+            Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+        let recorded = db
+            .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+            .unwrap();
+        let generation = recorded.capture().generation.number();
+        if kind == "operation" {
+            let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+            let reader = db
+                .acquire_recorded_captured_reader(recorded, request)
+                .unwrap();
+            let operation = db
+                .acquire_recorded_captured_operation(recorded, request, reader)
+                .unwrap();
+            db.release_captured_reader(reader).unwrap();
+            db.release_operation(operation).unwrap();
+        } else {
+            db.fold_unpublished_checkpoint(recorded).unwrap();
+        }
+        let mut cursor = MaintenanceCursor::default();
+        let mut failed = false;
+        for _ in 0..256 {
+            match db.maintain(cursor) {
+                Err(OverlayError::Sql(rusqlite::Error::SqliteFailure(error, Some(message)))) => {
+                    assert_eq!(
+                        error.extended_code,
+                        rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+                    );
+                    assert_eq!(message, "completion failure");
+                    failed = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected maintenance failure: {error:?}"),
+                Ok(Some(step)) => cursor = step.cursor,
+                Ok(None) => panic!("maintenance ended before the injected failure"),
+            }
+        }
+        assert!(failed);
+        drop(db);
+        let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+        let query =
+            format!("SELECT {column},operation_owner FROM durable_checkpoint_attempt WHERE id=1");
+        let task_kind = match kind {
+            "fold" => 1,
+            "retire" => 3,
+            _ => 6,
+        };
+        let (completed, owner): (i64, Option<i64>) = sql
+            .query_row(&query, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        let (resource, target) = if kind == "operation" {
+            (owner.expect("original operation owner"), 2)
+        } else {
+            (0, generation)
+        };
+        let task: i64 = sql
+            .query_row(
+                "SELECT count(*) FROM cleanup_task WHERE kind=?1 AND resource=?2 AND target=?3",
+                rusqlite::params![task_kind, resource, target],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((completed, task), (0, 1), "{kind}");
+    }
+}
+
+#[test]
+fn operation_cleanup_cannot_complete_before_owner_release() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch("CREATE TRIGGER forge_early_cleanup AFTER UPDATE OF operation_owner ON durable_checkpoint_attempt WHEN NEW.operation_owner IS NOT NULL BEGIN UPDATE durable_checkpoint_attempt SET operation_cleanup_completed=1 WHERE id=1; END;").unwrap();
+    drop(sql);
+    let db =
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, request)
+        .unwrap();
+    assert!(matches!(
+        db.acquire_recorded_captured_operation(recorded, request, reader),
+        Err(OverlayError::Sql(rusqlite::Error::SqliteFailure(error, _)))
+            if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
+    ));
+    assert!(db.retained_operation(request).unwrap().is_none());
+    assert_eq!(db.retained_captured_reader(request).unwrap(), Some(reader));
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let (owner, count): (Option<i64>, i64) = sql.query_row(
+        "SELECT operation_owner,(SELECT operation_count FROM durable_owner_counts WHERE id=1) FROM durable_checkpoint_attempt WHERE id=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!((owner, count), (None, 0));
 }
