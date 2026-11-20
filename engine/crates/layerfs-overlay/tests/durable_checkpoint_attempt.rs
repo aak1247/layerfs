@@ -344,3 +344,200 @@ fn changed_original_attempt_context_cannot_be_frozen_for_publication() {
         .unwrap();
     assert_eq!((phase, request), (1, None));
 }
+
+#[test]
+fn recorded_reader_identity_survives_before_any_operation_is_acquired() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+    assert!(db
+        .acquire_captured_reader(recorded.capture(), request)
+        .is_err());
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, request)
+        .unwrap();
+    assert!(db.acquire_captured_operation(request, reader).is_err());
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let row: (i64, i64, i64, i64, Option<i64>, Option<i64>) = sql.query_row(
+        "SELECT reader_owner,reader_request,reader_floor,reader_released,operation_owner,operation_released FROM durable_checkpoint_attempt WHERE id=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    ).unwrap();
+    assert_eq!(
+        row,
+        (
+            reader.owner_id() as i64,
+            request as i64,
+            reader.installed_floor() as i64,
+            0,
+            None,
+            None
+        )
+    );
+    drop(sql);
+    assert!(
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).is_err()
+    );
+}
+
+#[test]
+fn recorded_owner_release_keeps_exact_ids_through_existing_cleanup_transfer() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, request)
+        .unwrap();
+    let operation = db
+        .acquire_recorded_captured_operation(recorded, request, reader)
+        .unwrap();
+    assert!(db
+        .acquire_recorded_captured_reader(recorded, request)
+        .is_err());
+    db.release_captured_reader(reader).unwrap();
+    db.release_operation(operation).unwrap();
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let row: (i64, i64, i64, i64) = sql.query_row(
+        "SELECT reader_owner,reader_released,operation_owner,operation_released FROM durable_checkpoint_attempt WHERE id=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).unwrap();
+    assert_eq!(row.0, reader.owner_id() as i64);
+    assert_eq!((row.1, row.3), (1, 1));
+    assert!(row.2 > 0);
+    let cleanup: i64 = sql
+        .query_row(
+            "SELECT count(*) FROM cleanup_task WHERE kind=6 AND resource=?1",
+            [row.2],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cleanup, 1);
+    let owners: i64 = sql
+        .query_row(
+            "SELECT operation_count FROM durable_owner_counts WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owners, 0);
+}
+
+#[test]
+fn failed_recorded_acquisitions_roll_back_original_owner_maps() {
+    for operation_failure in [false, true] {
+        let fixture = Fixture::new();
+        fixture.create().close_database().unwrap();
+        let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+        let guard = if operation_failure {
+            "NEW.operation_owner IS NOT NULL AND OLD.operation_owner IS NULL"
+        } else {
+            "NEW.reader_owner IS NOT NULL AND OLD.reader_owner IS NULL"
+        };
+        sql.execute_batch(&format!("CREATE TRIGGER fail_recorded_owner BEFORE UPDATE ON durable_checkpoint_attempt WHEN {guard} BEGIN SELECT RAISE(ABORT, 'owner record failure'); END;")).unwrap();
+        drop(sql);
+        let db =
+            Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+        let recorded = db
+            .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+            .unwrap();
+        let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+        if operation_failure {
+            let reader = db
+                .acquire_recorded_captured_reader(recorded, request)
+                .unwrap();
+            assert!(db
+                .acquire_recorded_captured_operation(recorded, request, reader)
+                .is_err());
+            assert_eq!(db.retained_captured_reader(request).unwrap(), Some(reader));
+            assert!(db.retained_operation(request).unwrap().is_none());
+        } else {
+            assert!(db
+                .acquire_recorded_captured_reader(recorded, request)
+                .is_err());
+            assert!(db.retained_captured_reader(request).unwrap().is_none());
+        }
+        drop(db);
+        let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+        let (reader, operation): (Option<i64>, Option<i64>) = sql
+            .query_row(
+                "SELECT reader_owner,operation_owner FROM durable_checkpoint_attempt WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reader.is_some(), operation_failure);
+        assert_eq!(operation, None);
+        let owners: i64 = sql
+            .query_row(
+                "SELECT operation_count FROM durable_owner_counts WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owners, 0);
+    }
+}
+
+#[test]
+fn an_older_generic_reader_can_release_during_a_new_recorded_capture() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let older = db.capture().unwrap();
+    let old_request = u64::try_from(older.generation.number()).unwrap();
+    let old_reader = db.acquire_captured_reader(older, old_request).unwrap();
+    db.install_recorded(older, ROOT, SNAPSHOT).unwrap();
+    let current = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    assert_ne!(older.generation, current.capture().generation);
+    db.release_captured_reader(old_reader).unwrap();
+    assert!(db.retained_captured_reader(old_request).unwrap().is_none());
+    let request = u64::try_from(current.capture().generation.number()).unwrap();
+    let reader = db
+        .acquire_recorded_captured_reader(current, request)
+        .unwrap();
+    assert_eq!(reader.capture(), current.capture());
+}
+
+#[test]
+fn changed_operation_link_retains_the_original_owner_and_cleanup() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch("CREATE TRIGGER alter_operation_link AFTER UPDATE ON durable_checkpoint_attempt WHEN NEW.operation_owner IS NOT NULL AND OLD.operation_owner IS NULL BEGIN UPDATE durable_checkpoint_attempt SET operation_owner=NEW.operation_owner+100 WHERE id=1; END;").unwrap();
+    drop(sql);
+    let db =
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, request)
+        .unwrap();
+    let operation = db
+        .acquire_recorded_captured_operation(recorded, request, reader)
+        .unwrap();
+    db.release_captured_reader(reader).unwrap();
+    assert!(matches!(
+        db.release_operation(operation),
+        Err(OverlayError::Invalid(
+            "checkpoint operation release identity"
+        ))
+    ));
+    assert_eq!(db.retained_operation(request).unwrap(), Some(operation));
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let (released, owners, cleanup): (i64, i64, i64) = sql.query_row(
+        "SELECT operation_released,(SELECT operation_count FROM durable_owner_counts WHERE id=1),(SELECT count(*) FROM cleanup_task WHERE kind=6) FROM durable_checkpoint_attempt WHERE id=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!((released, owners, cleanup), (0, 1, 0));
+}

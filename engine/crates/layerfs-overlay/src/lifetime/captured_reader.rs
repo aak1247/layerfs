@@ -1,7 +1,7 @@
 //! Fixed captured input remains independently owned across install and failure.
 use crate::{
     db::{integer, unsigned},
-    Capture, CapturedReader, Overlay, OverlayError, OverlayResult, StatementKind,
+    Capture, CapturedReader, Overlay, OverlayError, OverlayResult, RecordedCapture, StatementKind,
 };
 impl Overlay {
     /// Acquire before construction/read passes. The exact captured root/floor
@@ -11,12 +11,31 @@ impl Overlay {
         capture: Capture,
         request: u64,
     ) -> OverlayResult<CapturedReader> {
+        self.acquire_captured_reader_inner(capture, request, None)
+    }
+    /// Acquires the one reader bound to the original durable checkpoint.
+    pub fn acquire_recorded_captured_reader(
+        &self,
+        recorded: RecordedCapture,
+        request: u64,
+    ) -> OverlayResult<CapturedReader> {
+        self.acquire_captured_reader_inner(recorded.capture(), request, Some(recorded))
+    }
+    fn acquire_captured_reader_inner(
+        &self,
+        capture: Capture,
+        request: u64,
+        recorded: Option<RecordedCapture>,
+    ) -> OverlayResult<CapturedReader> {
         let request = integer(request)?;
         if request == 0 {
             return Err(OverlayError::Invalid("zero captured request"));
         }
         self.atomic(|| {
             self.checked_capture(capture)?;
+            if recorded.is_none() && crate::database::durable_attempt::pending(self)? {
+                return Err(OverlayError::Invalid("recorded checkpoint reader required"));
+            }
             let state = self.state()?;
             if state.closed {
                 return Err(OverlayError::Closed);
@@ -26,6 +45,7 @@ impl Overlay {
                 capture,
                 owner,
                 installed: state.installed,
+                recorded_attempt: recorded.map(RecordedCapture::attempt),
             };
             self.open.borrow_mut().captured.insert(
                 owner,
@@ -34,6 +54,9 @@ impl Overlay {
                 "duplicate captured request",
             )?;
             self.captured_reference(capture.generation.0, true)?;
+            if let Some(recorded) = recorded {
+                crate::database::durable_attempt::acquire_reader(self, recorded, reader, request)?;
+            }
             Ok(reader)
         })
     }
@@ -148,6 +171,14 @@ impl Overlay {
     pub fn release_captured_reader(&self, reader: CapturedReader) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             self.check_captured_reader(reader)?;
+            let request = self
+                .open
+                .borrow()
+                .captured
+                .get(reader.owner)
+                .ok_or(OverlayError::Stale)?
+                .1;
+            crate::database::durable_attempt::release_reader(self, reader, request)?;
             let c = reader.capture;
             self.open
                 .borrow_mut()

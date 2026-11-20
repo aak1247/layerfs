@@ -1,5 +1,5 @@
 //! Engine-minted, independently releasable filesystem processing custody.
-use crate::{BaseSource, Capture};
+use crate::{BaseSource, Capture, RecordedCapture};
 
 /// One actual open descriptor. Cloning a token does not acquire another owner;
 /// use and release validate its exact nonrecycled SQL owner identity.
@@ -48,6 +48,7 @@ pub struct CapturedReader {
     pub(crate) capture: Capture,
     pub(crate) owner: u64,
     pub(crate) installed: i64,
+    pub(crate) recorded_attempt: Option<[u8; 32]>,
 }
 impl CapturedReader {
     pub const fn capture(self) -> Capture {
@@ -100,6 +101,7 @@ impl OperationPurpose {
 pub struct OperationOwner {
     pub(crate) engine: u64,
     pub(crate) owner: u64,
+    pub(crate) recorded: Option<RecordedCapture>,
 }
 impl OperationOwner {
     pub const fn engine(self) -> u64 {

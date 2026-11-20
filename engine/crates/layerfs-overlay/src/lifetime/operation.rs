@@ -1,16 +1,16 @@
 //! Engine-minted operation ownership and independent bounded operation_record custody.
 use crate::{
     contract::custody::OperationPurpose, db::integer, CapturedReader, OperationOwner, Overlay,
-    OverlayError, OverlayResult,
+    OverlayError, OverlayResult, RecordedCapture,
 };
 impl Overlay {
     /// One acquisition attempt. Query retained custody by request after a lost reply.
     pub fn acquire_operation(&self, request: u64) -> OverlayResult<OperationOwner> {
-        self.acquire_operation_for(request, OperationPurpose::Unknown, None)
+        self.acquire_operation_for(request, OperationPurpose::Unknown, None, None)
     }
     /// Records private copy scratch; it does not establish an operation outcome.
     pub fn acquire_copy_operation(&self, request: u64) -> OverlayResult<OperationOwner> {
-        self.acquire_operation_for(request, OperationPurpose::CopyScratch, None)
+        self.acquire_operation_for(request, OperationPurpose::CopyScratch, None, None)
     }
     /// Binds construction scratch to its exact live captured reader.
     pub fn acquire_captured_operation(
@@ -22,6 +22,21 @@ impl Overlay {
             request,
             OperationPurpose::CapturedConstruction,
             Some(reader),
+            None,
+        )
+    }
+    /// Acquires construction custody for the exact recorded checkpoint reader.
+    pub fn acquire_recorded_captured_operation(
+        &self,
+        recorded: RecordedCapture,
+        request: u64,
+        reader: CapturedReader,
+    ) -> OverlayResult<OperationOwner> {
+        self.acquire_operation_for(
+            request,
+            OperationPurpose::CapturedConstruction,
+            Some(reader),
+            Some(recorded),
         )
     }
     fn acquire_operation_for(
@@ -29,6 +44,7 @@ impl Overlay {
         request: u64,
         purpose: OperationPurpose,
         reader: Option<CapturedReader>,
+        recorded: Option<RecordedCapture>,
     ) -> OverlayResult<OperationOwner> {
         let request = integer(request)?;
         if request == 0 {
@@ -37,6 +53,11 @@ impl Overlay {
         self.atomic(|| {
             self.live()?;
             if let Some(reader) = reader {
+                if recorded.is_none() && crate::database::durable_attempt::pending(self)? {
+                    return Err(OverlayError::Invalid(
+                        "recorded checkpoint operation required",
+                    ));
+                }
                 self.check_captured_reader(reader)?;
                 self.checked_capture(reader.capture)?;
                 if reader.capture.generation.0 != request {
@@ -47,6 +68,7 @@ impl Overlay {
             let value = OperationOwner {
                 engine: self.identity,
                 owner,
+                recorded,
             };
             self.open.borrow_mut().operations.insert(
                 owner,
@@ -57,6 +79,11 @@ impl Overlay {
             crate::database::durable_owners::acquire_operation(
                 self, owner, request, purpose, reader,
             )?;
+            if let (Some(recorded), Some(reader)) = (recorded, reader) {
+                crate::database::durable_attempt::acquire_operation(
+                    self, recorded, reader, request, owner,
+                )?;
+            }
             Ok(value)
         })
     }
@@ -104,6 +131,7 @@ impl Overlay {
                 .get(owner.owner)
                 .ok_or(OverlayError::Stale)?
                 .1;
+            crate::database::durable_attempt::release_operation(self, owner, request)?;
             self.open
                 .borrow_mut()
                 .operations
