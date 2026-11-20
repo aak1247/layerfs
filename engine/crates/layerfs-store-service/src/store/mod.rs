@@ -6,6 +6,7 @@ pub mod checkpoint_receipt;
 pub mod commit;
 pub mod commit_merge;
 pub mod commit_types;
+mod conflict_paths;
 pub mod digests;
 pub mod durable_bind;
 pub mod hints;

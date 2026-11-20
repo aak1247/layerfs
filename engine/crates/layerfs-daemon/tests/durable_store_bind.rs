@@ -90,6 +90,172 @@ fn write(workspace: &BoundWorkspace, name: &str, bytes: &[u8]) {
     });
 }
 
+fn truncate(workspace: &BoundWorkspace, name: &str) {
+    access(workspace, |operation, view| {
+        let file = view
+            .lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new(name).unwrap(),
+            )
+            .unwrap();
+        let result = operation
+            .workspace()
+            .mutate(
+                operation.overlay(),
+                operation.ports(),
+                view,
+                Operation::SetAttributes {
+                    serial: file.serial,
+                    mode: None,
+                    mtime: None,
+                    size: Some(0),
+                },
+                Time {
+                    seconds: file.metadata.mtime_seconds,
+                    nanoseconds: file.metadata.mtime_nanoseconds,
+                },
+            )
+            .unwrap();
+        let Outcome::Applied { publication, .. } = result else {
+            panic!("truncate was not applied")
+        };
+        operation.overlay().reply_attempted(publication).unwrap();
+    });
+}
+
+#[test]
+fn recorded_conflict_keeps_markers_until_resolved_then_publishes_once() {
+    let fixture = support::Fixture::new_durable(1, "recorded-live-conflict");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("conflict-durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let one = directory.join("one.sqlite");
+    let two = directory.join("two.sqlite");
+    let id1 = WorkspaceId::from_authority([42; 32]).unwrap();
+    let id2 = WorkspaceId::from_authority([43; 32]).unwrap();
+    let owner1 = Owner::create_durable(spec(&one, initial.effective_root.to_bytes())).unwrap();
+    let mut second_spec = spec(&two, initial.effective_root.to_bytes());
+    second_spec.identity = [43; 32];
+    second_spec.namespace = 2;
+    let owner2 = Owner::create_durable(second_spec).unwrap();
+    let first = store
+        .bind_durable(
+            owner1.client(),
+            BindRequest {
+                workspace: id1,
+                branch: fixture.branch,
+            },
+            initial.clone(),
+        )
+        .unwrap()
+        .workspace;
+    let second = store
+        .bind_durable(
+            owner2.client(),
+            BindRequest {
+                workspace: id2,
+                branch: fixture.branch,
+            },
+            initial,
+        )
+        .unwrap()
+        .workspace;
+    let mut ours = support::bytes(0);
+    ours[0] = b'X';
+    let mut theirs = support::bytes(0);
+    theirs[0] = b'Y';
+    write(&first, "file-000000", &ours);
+    write(&second, "file-000000", &theirs);
+    let first_result = first.commit_captured(&CommitOptions::default()).unwrap();
+    assert!(matches!(
+        first_result.history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    let winning = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let conflicted = second.commit_captured(&CommitOptions::default()).unwrap();
+    assert!(conflicted.history.is_none());
+    let report = conflicted.merge.as_ref().unwrap();
+    let paths: Vec<_> = report
+        .conflicts
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    assert_eq!(paths, ["/file-000000"]);
+    assert_eq!(second.pending_conflicts().unwrap(), Some(paths));
+    assert_eq!(second.snapshot().unwrap(), winning);
+    assert_eq!(
+        store
+            .history()
+            .branch_snapshot(fixture.branch)
+            .unwrap()
+            .unwrap(),
+        winning
+    );
+    assert!(String::from_utf8(read(&second, "file-000000"))
+        .unwrap()
+        .contains("<<<<<<< workspace"));
+    assert_eq!(read(&first, "file-000000"), ours);
+    let refused = second
+        .commit_captured(&CommitOptions::default())
+        .unwrap_err();
+    assert!(matches!(refused.error, CommitError::Markers(_)));
+    assert!(refused.locally_settled);
+    assert_eq!(
+        store
+            .history()
+            .branch_snapshot(fixture.branch)
+            .unwrap()
+            .unwrap(),
+        winning
+    );
+    truncate(&second, "file-000000");
+    write(&second, "file-000000", b"resolved\n");
+    let resolved = second.commit_captured(&CommitOptions::default()).unwrap();
+    assert!(matches!(
+        resolved.history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    assert!(second.pending_conflicts().unwrap().is_none());
+    assert_eq!(read(&second, "file-000000"), b"resolved\n");
+    drop(first);
+    drop(second);
+    store.close_reader(id1).unwrap();
+    store.close_reader(id2).unwrap();
+    owner1.stop().unwrap();
+    owner2.stop().unwrap();
+    drop(store);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: (i64, i64) = history
+        .query_row(
+            "SELECT count(*),count(DISTINCT attempt_id) FROM checkpoint_receipt",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipts, (2, 2));
+    drop(history);
+    fixture.cleanup();
+}
+
 #[test]
 fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
     let fixture = support::Fixture::new_durable(2, "durable-bind");

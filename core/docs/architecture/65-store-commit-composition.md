@@ -35,18 +35,20 @@
 > original receipt, then pairs the Overlay and Workspace base install and
 > updates the outer binding. Original reader/operation release and exact local
 > maintenance precede settlement. The clean no-capture answer and older durable
-> formats retain their existing paths. A recorded merge conflict currently
-> returns a definite prepublication refusal and folds its capture; persisting
-> the local conflict result is still pending. Cold pending-operation and orphan
-> reconciliation remain separate work and are not implied by live settlement.
+> formats retain their existing paths. Schema 43 still refuses a recorded
+> merge conflict before publication. Schema 44 installs the checked local
+> marker root and ordered conflict paths without publishing; a later Commit
+> refuses unresolved markers and can publish after they are resolved. Cold
+> pending-operation and orphan reconciliation remain separate work and are
+> not implied by live settlement.
 > New durable overlays use schema 44, which reserves an independently checked
 > binding and paged conflict description; existing schema 43 is neither
 > rewritten nor migrated on ordinary open. A local capture can stage ordered
 > conflict bytes one bounded page at a time, excluding publication of that
 > capture. A definite prepublication failure folds the original capture and
-> reclaims only its written pages through bounded maintenance. Installing that
-> conflict and authenticated cold reconciliation remain unimplemented.
-> Unsettled conflict records block ordinary recovery.
+> reclaims only its written pages through bounded maintenance. Authenticated
+> cold reconciliation of active or unsettled conflict records remains
+> unimplemented; ordinary recovery retains and rejects those records.
 
 BoundWorkspace::commit admits one active lifecycle for that Workspace, captures
 once through the existing overlay owner, creates independently owned Storage/Save

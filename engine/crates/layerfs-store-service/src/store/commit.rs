@@ -1,5 +1,5 @@
 //! One synchronous Content/Save/history producer and exact paired local install.
-use super::checkpoint::{CommitCapture, LiveCheckpoint};
+use super::checkpoint::{CommitCapture, LiveCheckpoint, LiveConflict};
 use super::{
     bind::checked_base, BoundWorkspace, CommitError, CommitFailure, CommitOptions, CommitPhase,
     CommitSuccess, MergeReport,
@@ -19,6 +19,7 @@ use std::sync::{atomic::Ordering, Arc};
 pub(super) struct CommitRun {
     pub success: CommitSuccess,
     pub checkpoint: Option<LiveCheckpoint>,
+    pub conflict: Option<LiveConflict>,
 }
 
 /// Admission belongs to exactly one invocation. It stays held unless that
@@ -122,6 +123,8 @@ impl BoundWorkspace {
         let mut merge = None;
         let mut replaced = None;
         let mut checkpoint = None;
+        let mut conflict = None;
+        let mut installed = false;
         let result = (|| {
             let snapshot = self.snapshot().map_err(CommitError::Workspace)?;
             retained.binding = Some(snapshot.clone());
@@ -140,7 +143,7 @@ impl BoundWorkspace {
                 && state.consolidating.is_none()
                 && state.base_root == local.to_bytes()
                 && self
-                    .pending_conflicts()
+                    .pending_snapshot()
                     .map_err(CommitError::Workspace)?
                     .is_none()
             {
@@ -325,6 +328,10 @@ impl BoundWorkspace {
             let conflicted = merge
                 .as_ref()
                 .is_some_and(|report: &MergeReport| !report.conflicts.is_empty());
+            let mut lane = Some(lane);
+            if conflicted {
+                drop(lane.take());
+            }
             // A merge is published against the head it merged with; a forced
             // or unmoved Commit against the head the Workspace bound.
             let target = if merge.is_some() { &current } else { &snapshot };
@@ -399,21 +406,78 @@ impl BoundWorkspace {
                     .map_err(CommitError::Workspace)
             })?);
             let pending = if conflicted {
-                if retained.recorded.is_some() {
-                    return Err(CommitError::Context(
-                        "recorded local conflict disposition is not available",
-                    ));
-                }
                 // Nothing is published: the history binding follows the head
                 // merged with, and the merge stays the local base.
                 next = current.clone();
-                Some(super::commit_merge::PendingMerge {
+                let pending = Arc::new(super::commit_merge::PendingMerge {
                     local_root: candidate.0,
                     conflicted: merge
                         .as_ref()
                         .map(|report| report.conflicts.iter().map(|c| c.path.clone()).collect())
                         .unwrap_or_default(),
-                })
+                });
+                if let Some(recorded) = retained.recorded {
+                    let version = self
+                        .job(|client, route| {
+                            client.call(route, crate::ServiceClass::General, None, |db| {
+                                Ok(db.profile().schema_version)
+                            })
+                        })
+                        .map_err(CommitError::Owner)?;
+                    if version != 44 {
+                        return Err(CommitError::Context(
+                            "recorded local conflict disposition is not available",
+                        ));
+                    }
+                    let history = self.store.history();
+                    super::durable_bind::validate_snapshot(history, &current)
+                        .map_err(CommitError::History)?;
+                    let description =
+                        super::conflict_paths::pages(&pending.conflicted, |_, _| Ok(()))?;
+                    let target_bytes =
+                        layerfs_bridge::snapshot::encode(&current).map_err(|cause| {
+                            CommitError::Owner(crate::OwnerError::BindingCodec(cause))
+                        })?;
+                    let root = candidate.0.to_bytes();
+                    let stage = self
+                        .job(|client, route| {
+                            client.call(route, crate::ServiceClass::General, None, move |db| {
+                                db.begin_conflict_stage(
+                                    recorded,
+                                    layerfs_overlay::ConflictStageInput {
+                                        local_root: root,
+                                        target_snapshot: &target_bytes,
+                                        paths_count: description.paths,
+                                        byte_count: description.bytes,
+                                        final_digest: description.digest,
+                                    },
+                                )
+                            })
+                        })
+                        .map_err(CommitError::Owner)?;
+                    let checked =
+                        super::conflict_paths::pages(&pending.conflicted, |page, data| {
+                            self.job(|client, route| {
+                                client.call(route, crate::ServiceClass::General, None, move |db| {
+                                    db.append_conflict_page(stage, page, &data)
+                                })
+                            })
+                            .map_err(CommitError::Owner)
+                        })?;
+                    if checked != description {
+                        return Err(CommitError::Context("conflict path staging changed"));
+                    }
+                    conflict = Some(LiveConflict {
+                        stage,
+                        catalog: history.catalog_id(),
+                        incarnation: history.incarnation(),
+                        original_binding: snapshot.clone(),
+                        target: current.clone(),
+                        marker: candidate.0,
+                        paths: description,
+                    });
+                }
+                Some(pending)
             } else {
                 retained.phase = CommitPhase::Publish;
                 let intent = retained.intent.as_ref().expect("checked intent");
@@ -465,7 +529,7 @@ impl BoundWorkspace {
                     CommitOutcome::Committed { record, .. } => (Some(record.id), record.root),
                     CommitOutcome::UpToDate { head, root } => (*head, *root),
                 };
-                drop(lane);
+                drop(lane.take());
                 retained.published = Some(outcome.clone());
                 if root != candidate.0 {
                     return Err(CommitError::Context(
@@ -549,6 +613,21 @@ impl BoundWorkspace {
                         )
                     })
                     .map_err(CommitError::Owner)
+                } else if let Some(original) = &conflict {
+                    let target_snapshot = layerfs_bridge::snapshot::encode(&original.target)
+                        .map_err(|cause| {
+                            CommitError::Owner(crate::OwnerError::BindingCodec(cause))
+                        })?;
+                    self.job(|client, route| {
+                        client.install_prepared_conflict(
+                            route,
+                            self.workspace.clone(),
+                            prepared,
+                            original.stage,
+                            target_snapshot,
+                        )
+                    })
+                    .map_err(CommitError::Owner)
                 } else {
                     self.job(|client, route| {
                         client.install_prepared_recorded(
@@ -561,6 +640,7 @@ impl BoundWorkspace {
                     .map_err(CommitError::Owner)
                 }
             })?;
+            installed = true;
             *self
                 .snapshot
                 .lock()
@@ -573,6 +653,17 @@ impl BoundWorkspace {
         })();
         if let Err(error) = result {
             retained.error = error;
+            if installed {
+                retained.installed = Some(Box::new(CommitSuccess {
+                    history: retained.published.clone(),
+                    merge: merge.take(),
+                    saved: retained.saved.expect("known Save"),
+                    storage: retained.storage.expect("producer observations"),
+                    capture: retained.capture,
+                    namespace: None,
+                    replaced,
+                }));
+            }
             return Err(self.settle_failure(retained));
         }
         if let Some(storage) = producer {
@@ -589,6 +680,7 @@ impl BoundWorkspace {
                 replaced,
             },
             checkpoint,
+            conflict,
         })
     }
 

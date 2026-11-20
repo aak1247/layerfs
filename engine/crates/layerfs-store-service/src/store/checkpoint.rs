@@ -10,7 +10,8 @@ use layerfs_history::{
     CommitRequest, HistoryError,
 };
 use layerfs_overlay::{
-    Capture, CapturedReader, CheckpointCompletion, OperationOwner, RecordedCapture,
+    Capture, CapturedReader, CheckpointCompletion, ConflictCompletion, ConflictStage,
+    OperationOwner, RecordedCapture,
 };
 
 #[derive(Clone, Copy)]
@@ -45,6 +46,17 @@ pub(super) struct LiveCheckpoint {
     pub target: BranchSnapshot,
     pub installed: BranchSnapshot,
     pub outcome: CommitOutcome,
+}
+
+/// The admitted no-publication conflict, held through its original releases.
+pub(super) struct LiveConflict {
+    pub stage: ConflictStage,
+    pub catalog: CatalogId,
+    pub incarnation: u64,
+    pub original_binding: BranchSnapshot,
+    pub target: BranchSnapshot,
+    pub marker: ObjectId,
+    pub paths: super::conflict_paths::ConflictDescription,
 }
 
 impl BoundWorkspace {
@@ -128,7 +140,7 @@ impl BoundWorkspace {
             || observed.installed != checkpoint.installed
             || self.snapshot().map_err(CommitError::Workspace)? != checkpoint.installed
             || self
-                .pending_conflicts()
+                .pending_snapshot()
                 .map_err(CommitError::Workspace)?
                 .is_some()
         {
@@ -196,7 +208,89 @@ impl BoundWorkspace {
                 return Err(Box::new(failure));
             }
         }
+        if let Some(conflict) = run.conflict {
+            if let Err(error) = self.finish_live_conflict(&conflict, reader, operation) {
+                let recorded = conflict.stage.recorded();
+                let mut failure = CommitFailure::new(error, self.identity, self.route());
+                failure.binding = Some(conflict.original_binding);
+                failure.phase = CommitPhase::Install;
+                failure.capture = Some(recorded.capture());
+                failure.recorded = Some(recorded);
+                failure.installed = Some(Box::new(run.success));
+                return Err(Box::new(failure));
+            }
+        }
         Ok(run.success)
+    }
+
+    /// Verify this local projection against the same authenticated Store and
+    /// the exact staged path chain before settling its original owners.
+    fn finish_live_conflict(
+        &self,
+        conflict: &LiveConflict,
+        reader: Option<CapturedReader>,
+        operation: Option<OperationOwner>,
+    ) -> Result<(), CommitError> {
+        let history = self.store.history();
+        if history.catalog_id() != conflict.catalog || history.incarnation() != conflict.incarnation
+        {
+            return Err(CommitError::Context("conflict Store identity"));
+        }
+        super::durable_bind::validate_snapshot(history, &conflict.target)
+            .map_err(CommitError::History)?;
+        if self.snapshot().map_err(CommitError::Workspace)? != conflict.target {
+            return Err(CommitError::Context("conflict history projection"));
+        }
+        let pending = self
+            .pending_snapshot()
+            .map_err(CommitError::Workspace)?
+            .ok_or(CommitError::Context("conflict projection is absent"))?;
+        if pending.local_root != conflict.marker
+            || super::conflict_paths::pages(&pending.conflicted, |_, _| Ok(()))? != conflict.paths
+        {
+            return Err(CommitError::Context("conflict path projection"));
+        }
+        let ports = self.store.ports_for(conflict.target.scope, self.identity);
+        let checked_history = checked_base(ports.client(), &conflict.target).map_err(|error| {
+            CommitError::Content {
+                error,
+                provider: ports
+                    .failure()
+                    .unwrap_or_else(|error| Some(std::sync::Arc::new(error))),
+            }
+        })?;
+        let mut marker = conflict.target.clone();
+        marker.effective_root = conflict.marker;
+        let checked_marker =
+            checked_base(ports.client(), &marker).map_err(|error| CommitError::Content {
+                error,
+                provider: ports
+                    .failure()
+                    .unwrap_or_else(|error| Some(std::sync::Arc::new(error))),
+            })?;
+        let current = self.workspace.base().map_err(CommitError::Workspace)?;
+        if checked_history.root().root_inode() != checked_marker.root().root_inode()
+            || current.identity() != checked_marker.identity()
+            || current.root() != checked_marker.root()
+        {
+            return Err(CommitError::Context("conflict Workspace base"));
+        }
+        let target = layerfs_bridge::snapshot::encode(&conflict.target)
+            .map_err(|cause| CommitError::Owner(OwnerError::BindingCodec(cause)))?;
+        let stage = conflict.stage;
+        let root = conflict.marker.to_bytes();
+        self.job(|client, route| {
+            client.call(route, ServiceClass::General, None, move |db| {
+                db.finish_conflict_checkpoint_cleanup(ConflictCompletion {
+                    stage,
+                    marker_root: root,
+                    target_snapshot: &target,
+                    reader,
+                    operation,
+                })
+            })
+        })
+        .map_err(CommitError::Owner)
     }
 
     pub(super) fn finish_failed_checkpoint(&self, failure: &mut CommitFailure) {

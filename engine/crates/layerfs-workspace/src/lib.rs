@@ -45,7 +45,7 @@ pub use construction::{
     EditInputRefusal as ConstructionInputRefusal, IndexedEditRecords as IndexedConstructionRecords,
 };
 pub use facts::{BaseFacts, Need, VisitFacts};
-pub use install::{CheckpointInstall, PreparedBase};
+pub use install::{CheckpointInstall, ConflictInstall, PreparedBase};
 pub use job::{JobOutcome, NamespaceJob};
 pub use list::ViewListing;
 pub use mutation::plan::{MutationInputFailure, MutationPlan, MutationStage};

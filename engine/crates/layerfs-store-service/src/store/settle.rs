@@ -14,7 +14,10 @@ impl BoundWorkspace {
         command(&self.owner, self.route())
     }
     pub(super) fn settle_failure(&self, mut failure: CommitFailure) -> Box<CommitFailure> {
-        if failure.published.is_some() || failure.error.uncertain() || failure.publication_prepared
+        if failure.published.is_some()
+            || failure.installed.is_some()
+            || failure.error.uncertain()
+            || failure.publication_prepared
         {
             return Box::new(failure);
         }

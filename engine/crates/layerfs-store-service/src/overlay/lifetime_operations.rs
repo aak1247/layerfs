@@ -2,8 +2,8 @@
 use crate::overlay::owner::Readiness;
 use crate::{OwnerClient, OwnerError, ServiceClass};
 use layerfs_overlay::{
-    BaseSource, Capture, CapturedReader, CheckpointOutcome, OperationOwner, OverlayError,
-    RecordedCapture,
+    BaseSource, Capture, CapturedReader, CheckpointOutcome, ConflictStage, OperationOwner,
+    OverlayError, RecordedCapture,
 };
 use layerfs_workspace::Route;
 
@@ -229,6 +229,43 @@ impl OwnerClient {
                     cause: Box::new(cause),
                     input: Box::new(input),
                     durable_snapshot: Some(checkpoint.installed_snapshot),
+                })
+        })
+        .map(|(value, _)| value)
+    }
+
+    /// Only the bound service uses this after validating the original Store
+    /// target and the staged marker root, with its own Workspace base cell.
+    pub(crate) fn install_prepared_conflict(
+        &self,
+        route: Route,
+        workspace: std::sync::Arc<layerfs_workspace::Workspace>,
+        input: layerfs_workspace::PreparedBase,
+        stage: ConflictStage,
+        target_snapshot: Vec<u8>,
+    ) -> Result<(), OwnerError> {
+        let ready = Some(Readiness::Install(input.capture()));
+        self.call_observed(Some(route), ServiceClass::General, ready, move |db, _| {
+            if route != workspace.route() {
+                return Err(OwnerError::Install {
+                    cause: Box::new(OverlayError::Stale.into()),
+                    input: Box::new(input),
+                    durable_snapshot: Some(target_snapshot),
+                });
+            }
+            workspace
+                .install_prepared_conflict(
+                    db,
+                    input,
+                    layerfs_workspace::ConflictInstall {
+                        stage,
+                        target_snapshot: &target_snapshot,
+                    },
+                )
+                .map_err(|(cause, input)| OwnerError::Install {
+                    cause: Box::new(cause),
+                    input: Box::new(input),
+                    durable_snapshot: Some(target_snapshot),
                 })
         })
         .map(|(value, _)| value)

@@ -13,6 +13,7 @@ use layerfs_content::{
 use layerfs_history::BranchSnapshot;
 use layerfs_storage::Save;
 use layerfs_workspace::{InodeSerials, WorkspaceError};
+use std::sync::Arc;
 
 /// Serials one reservation takes while a merge needs fresh ones.
 const MERGE_SERIALS: u64 = 64;
@@ -34,12 +35,19 @@ pub struct PendingMerge {
 }
 
 impl BoundWorkspace {
+    /// Clone only the immutable handle while holding the projection lock.
+    pub(super) fn pending_snapshot(&self) -> Result<Option<Arc<PendingMerge>>, WorkspaceError> {
+        self.pending
+            .lock()
+            .map(|pending| pending.clone())
+            .map_err(|_| WorkspaceError::BindingPoisoned)
+    }
+
     /// The local base root: the pending merge's, else the history binding's.
     pub(super) fn local_root(&self, snapshot: &BranchSnapshot) -> Result<ObjectId, CommitError> {
         Ok(self
-            .pending
-            .lock()
-            .map_err(|_| CommitError::Workspace(WorkspaceError::BindingPoisoned))?
+            .pending_snapshot()
+            .map_err(CommitError::Workspace)?
             .as_ref()
             .map_or(snapshot.effective_root, |pending| pending.local_root))
     }
@@ -47,9 +55,7 @@ impl BoundWorkspace {
     /// Paths of an installed conflicted merge that is not yet committed.
     pub fn pending_conflicts(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
         Ok(self
-            .pending
-            .lock()
-            .map_err(|_| WorkspaceError::BindingPoisoned)?
+            .pending_snapshot()?
             .as_ref()
             .map(|pending| pending.conflicted.clone()))
     }
@@ -61,17 +67,12 @@ impl BoundWorkspace {
         save: &Save<'_>,
         candidate: FilesystemRootId,
     ) -> Result<(), CommitError> {
-        let conflicted = match self
-            .pending
-            .lock()
-            .map_err(|_| CommitError::Workspace(WorkspaceError::BindingPoisoned))?
-            .as_ref()
-        {
-            Some(pending) => pending.conflicted.clone(),
+        let pending = match self.pending_snapshot().map_err(CommitError::Workspace)? {
+            Some(pending) => pending,
             None => return Ok(()),
         };
         let marked = crate::telemetry::timed("markers", |timing| {
-            paths_with_markers(save, candidate, &conflicted, timing)
+            paths_with_markers(save, candidate, &pending.conflicted, timing)
         });
         let marked = marked.map_err(content)?;
         if marked.is_empty() {

@@ -1,7 +1,9 @@
 //! Prepared immutable binding and one known install attempt, preserving input.
 use crate::{BaseView, Workspace, WorkspaceError, WorkspaceResult};
 use layerfs_content::filesystem::FilesystemRootId;
-use layerfs_overlay::{Capture, CheckpointOutcome, Overlay, OverlayError, RecordedCapture};
+use layerfs_overlay::{
+    Capture, CheckpointOutcome, ConflictStage, Overlay, OverlayError, RecordedCapture,
+};
 
 /// Scope-checked next immutable root retained before the SQL install attempt.
 /// This is not proof of Save/history publication: that remains the caller's
@@ -23,10 +25,19 @@ pub struct CheckpointInstall<'a> {
     pub outcome: CheckpointOutcome,
 }
 
+/// A locally resolved merge target; the caller authenticates its Store and
+/// checked marker root before asking the Workspace to switch its base.
+#[derive(Clone, Copy)]
+pub struct ConflictInstall<'a> {
+    pub stage: ConflictStage,
+    pub target_snapshot: &'a [u8],
+}
+
 enum Install<'a> {
     Plain,
     Snapshot(&'a [u8]),
     Checkpoint(CheckpointInstall<'a>),
+    Conflict(ConflictInstall<'a>),
 }
 impl PreparedBase {
     pub const fn capture(&self) -> Capture {
@@ -93,6 +104,15 @@ impl Workspace {
     ) -> Result<(), (WorkspaceError, PreparedBase)> {
         self.install_with_binding(overlay, prepared, Install::Checkpoint(input))
     }
+    /// Pairs the exact staged local conflict with this Workspace base cell.
+    pub fn install_prepared_conflict(
+        &self,
+        overlay: &Overlay,
+        prepared: PreparedBase,
+        input: ConflictInstall<'_>,
+    ) -> Result<(), (WorkspaceError, PreparedBase)> {
+        self.install_with_binding(overlay, prepared, Install::Conflict(input))
+    }
     fn install_with_binding(
         &self,
         overlay: &Overlay,
@@ -101,6 +121,7 @@ impl Workspace {
     ) -> Result<(), (WorkspaceError, PreparedBase)> {
         if prepared.capture.engine() != self.route().engine()
             || matches!(&install, Install::Checkpoint(input) if input.recorded.capture() != prepared.capture)
+            || matches!(&install, Install::Conflict(input) if input.stage.recorded().capture() != prepared.capture)
         {
             return Err((OverlayError::Stale.into(), prepared));
         }
@@ -131,6 +152,9 @@ impl Workspace {
                 input.installed_snapshot,
                 input.outcome,
             ),
+            Install::Conflict(input) => {
+                overlay.install_recorded_conflict(input.stage, root, input.target_snapshot)
+            }
         };
         if let Err(error) = installed {
             return Err((error.into(), prepared));
