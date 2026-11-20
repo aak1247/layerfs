@@ -133,18 +133,33 @@ fn recorded_install_keeps_workspace_base_paired_with_original_overlay() {
     let client = owner.client();
     let route = original.route();
     let target_bytes = snapshot::encode(&target).unwrap();
-    let saved_target = target_bytes.clone();
     let catalog = store.history().catalog_id();
     let incarnation = store.history().incarnation();
+    assert!(client
+        .capture_checkpoint(
+            route,
+            [99; 32],
+            catalog.to_bytes(),
+            incarnation,
+            target_bytes.clone()
+        )
+        .is_err());
+    assert!(client.state(route).unwrap().captured.is_none());
     let recorded = client
-        .call(route, ServiceClass::General, None, move |db| {
-            db.capture_recorded(
-                identity.to_bytes(),
-                catalog.to_bytes(),
-                incarnation,
-                &saved_target,
-            )
-        })
+        .capture_checkpoint(
+            route,
+            identity.to_bytes(),
+            catalog.to_bytes(),
+            incarnation,
+            target_bytes.clone(),
+        )
+        .unwrap();
+    let generation = u64::try_from(recorded.capture().generation.number()).unwrap();
+    let reader = client
+        .acquire_recorded_captured_reader(route, recorded, generation)
+        .unwrap();
+    let owner_token = client
+        .acquire_recorded_captured_operation(route, recorded, generation, reader)
         .unwrap();
     let mut later = support::bytes(0);
     later[0] = b'L';
@@ -189,19 +204,16 @@ fn recorded_install_keeps_workspace_base_paired_with_original_overlay() {
     };
     let request_bytes = encode_checkpoint_request(&request).unwrap();
     let digest = checkpoint_request_digest(&request_bytes);
-    let request_copy = request_bytes.clone();
-    let target_copy = target_bytes.clone();
     let candidate_root = request.candidate_root.to_bytes();
     client
-        .call(route, ServiceClass::General, None, move |db| {
-            db.prepare_checkpoint_publication(
-                recorded,
-                &request_copy,
-                digest,
-                candidate_root,
-                &target_copy,
-            )
-        })
+        .prepare_checkpoint_publication(
+            route,
+            recorded,
+            request_bytes.clone(),
+            digest,
+            candidate_root,
+            target_bytes.clone(),
+        )
         .unwrap();
     let attempt = CheckpointAttemptId::from_bytes(recorded.attempt());
     let outcome = store
@@ -312,6 +324,8 @@ fn recorded_install_keeps_workspace_base_paired_with_original_overlay() {
     assert_eq!(client.durable_snapshot().unwrap(), observed.installed);
     assert_eq!(original.snapshot().unwrap(), target); // The Commit driver owns this later update.
     assert_eq!(read(&original), later);
+    client.release_captured_reader(route, reader).unwrap();
+    client.release_operation(route, owner_token).unwrap();
 
     other.close().unwrap();
     drop(other);

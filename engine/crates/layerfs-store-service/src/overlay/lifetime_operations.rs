@@ -1,8 +1,11 @@
 //! Direct connection operations, each one counted short job on the calling thread.
 use crate::overlay::owner::Readiness;
 use crate::{OwnerClient, OwnerError, ServiceClass};
-use layerfs_overlay::{BaseSource, Capture, CapturedReader, OperationOwner, OverlayError};
+use layerfs_overlay::{
+    BaseSource, Capture, CapturedReader, OperationOwner, OverlayError, RecordedCapture,
+};
 use layerfs_workspace::Route;
+
 impl OwnerClient {
     pub fn acquire_operation(
         &self,
@@ -45,6 +48,29 @@ impl OwnerClient {
     ) -> Result<layerfs_overlay::CapturedReader, OwnerError> {
         self.call(route, ServiceClass::General, None, move |db| {
             db.acquire_captured_reader(capture, request)
+        })
+    }
+    /// Acquires construction's one reader for the exact recorded capture.
+    pub fn acquire_recorded_captured_reader(
+        &self,
+        route: Route,
+        recorded: RecordedCapture,
+        request: u64,
+    ) -> Result<CapturedReader, OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.acquire_recorded_captured_reader(recorded, request)
+        })
+    }
+    /// Acquires construction's one operation for that exact live reader.
+    pub fn acquire_recorded_captured_operation(
+        &self,
+        route: Route,
+        recorded: RecordedCapture,
+        request: u64,
+        reader: CapturedReader,
+    ) -> Result<OperationOwner, OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.acquire_recorded_captured_operation(recorded, request, reader)
         })
     }
     pub fn release_captured_reader(
@@ -99,6 +125,43 @@ impl OwnerClient {
             Some(Readiness::Capture),
             move |db| db.capture(),
         )
+    }
+    /// Captures once with its frozen original Store and Workspace context.
+    /// The caller must authenticate that context against the bound Store.
+    pub fn capture_checkpoint(
+        &self,
+        route: Route,
+        workspace: [u8; 32],
+        catalog: [u8; 32],
+        incarnation: u64,
+        snapshot: Vec<u8>,
+    ) -> Result<RecordedCapture, OwnerError> {
+        self.call(
+            route,
+            ServiceClass::General,
+            Some(Readiness::Capture),
+            move |db| db.capture_recorded(workspace, catalog, incarnation, &snapshot),
+        )
+    }
+    /// Freezes one publication before the caller's single Store attempt.
+    pub fn prepare_checkpoint_publication(
+        &self,
+        route: Route,
+        recorded: RecordedCapture,
+        request: Vec<u8>,
+        request_digest: [u8; 32],
+        candidate: [u8; 32],
+        target_snapshot: Vec<u8>,
+    ) -> Result<(), OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.prepare_checkpoint_publication(
+                recorded,
+                &request,
+                request_digest,
+                candidate,
+                &target_snapshot,
+            )
+        })
     }
     pub fn resolve_failed(&self, route: Route, capture: Capture) -> Result<(), OwnerError> {
         self.call(route, ServiceClass::General, None, move |db| {
