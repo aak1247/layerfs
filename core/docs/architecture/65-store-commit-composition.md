@@ -24,6 +24,11 @@
 > identities, before returning a request for comparison with an original Store
 > receipt. Decoding does not publish, replay or authorize recovery; the
 > authenticated Store/Workspace reconciliation path remains separate work.
+> A Store-side observation can compare the request and original target against
+> its own exact receipt and derive the installed snapshot without reading the
+> current Branch head as the result. It checks durable Store identity and
+> history structure; the caller still owns Workspace fencing and content-root
+> validation. A missing receipt alone does not establish nonpublication.
 
 BoundWorkspace::commit admits one active lifecycle for that Workspace, captures
 once through the existing overlay owner, creates independently owned Storage/Save

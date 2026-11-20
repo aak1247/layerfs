@@ -97,7 +97,7 @@ impl Store {
     }
 }
 
-fn validate_snapshot(
+pub(super) fn validate_snapshot(
     history: &dyn HistoryCatalog,
     snapshot: &BranchSnapshot,
 ) -> Result<(), HistoryError> {
