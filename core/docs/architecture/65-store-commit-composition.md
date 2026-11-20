@@ -29,14 +29,16 @@
 > current Branch head as the result. It checks durable Store identity and
 > history structure; the caller still owns Workspace fencing and content-root
 > validation. A missing receipt alone does not establish nonpublication.
-> The Workspace's checkpoint install uses the existing prepared-base lock:
-> its exact recorded capture and the locally validated outcome install in the
-> Overlay before the in-memory base is replaced. This does not by itself update
-> the outer BoundWorkspace snapshot or complete the admitted Commit.
-> The Owner port uses the existing capture readiness and route checks for the
-> recorded capture, its construction owners, and publication intent. The
-> paired install remains a Workspace-level primitive pending integration into
-> the admitted Store Commit.
+> A live schema-43 durable Workspace selects this path only after the actual
+> durable Store confirms receipt support. Its admitted Commit records capture,
+> construction owners and the final request, publishes once, reads that Store's
+> original receipt, then pairs the Overlay and Workspace base install and
+> updates the outer binding. Original reader/operation release and exact local
+> maintenance precede settlement. The clean no-capture answer and older durable
+> formats retain their existing paths. A schema-43 merge conflict currently
+> returns a definite prepublication refusal and folds its capture; persisting
+> the local conflict result is still pending. Cold pending-operation and orphan
+> reconciliation remain separate work and are not implied by live settlement.
 
 BoundWorkspace::commit admits one active lifecycle for that Workspace, captures
 once through the existing overlay owner, creates independently owned Storage/Save

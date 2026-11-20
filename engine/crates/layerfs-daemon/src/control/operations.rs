@@ -240,8 +240,12 @@ impl Service {
         let result = run(&workspace);
         // An install that replaced what the Workspace showed is invalidated
         // in the kernel before the answer.
-        let invalidated = match &result {
-            Ok(CommitSuccess {
+        let installed = match &result {
+            Ok(commit) => Some(commit),
+            Err(failed) => failed.installed.as_deref(),
+        };
+        let invalidated = match installed {
+            Some(CommitSuccess {
                 replaced: Some((shown, installed)),
                 ..
             }) => self.invalidate(token, &workspace, *shown, *installed),
@@ -275,10 +279,13 @@ impl Service {
                     };
                 }
                 Err(failed) => {
+                    if failed.installed.is_some() {
+                        binding.snapshot = workspace.snapshot().map_err(Failure::Workspace)?;
+                    }
                     binding.published = failed.published.clone();
                     binding.activity = if failed.locally_settled && !unreleased {
                         Activity::Idle
-                    } else if failed.published.is_some() {
+                    } else if failed.published.is_some() || failed.installed.is_some() {
                         Activity::LocalFailure
                     } else {
                         Activity::Uncertain
@@ -307,6 +314,23 @@ impl Service {
                     });
                 }
                 Ok(success)
+            }
+            Err(mut failed) if failed.installed.is_some() => {
+                let commit = *failed.installed.take().expect("checked installed Commit");
+                let mut success = Success::reply(committed(&commit));
+                success.commit = Some(commit);
+                let original_failure = Failure::Commit(failed);
+                let cause = match update.and(invalidated) {
+                    Ok(()) => original_failure,
+                    Err(cause) => Failure::AfterFailure {
+                        cause: Box::new(cause),
+                        original: Box::new(original_failure),
+                    },
+                };
+                Err(Failure::After {
+                    cause: Box::new(cause),
+                    original: Box::new(success),
+                })
             }
             Err(failed) => match (&failed.error, failed.locally_settled, update) {
                 // A definite refusal for unresolved markers is this Commit's

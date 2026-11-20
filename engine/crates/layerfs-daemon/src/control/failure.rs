@@ -48,7 +48,6 @@ impl Failure {
                 cause.to_string(),
                 None,
             ),
-            #[cfg(target_os = "linux")]
             Self::AfterFailure { cause, .. } => {
                 let mut refusal = cause.wire();
                 refusal.code = ControlCode::Unknown;

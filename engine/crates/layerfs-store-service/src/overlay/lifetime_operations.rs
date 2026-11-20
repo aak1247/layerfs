@@ -2,9 +2,19 @@
 use crate::overlay::owner::Readiness;
 use crate::{OwnerClient, OwnerError, ServiceClass};
 use layerfs_overlay::{
-    BaseSource, Capture, CapturedReader, OperationOwner, OverlayError, RecordedCapture,
+    BaseSource, Capture, CapturedReader, CheckpointOutcome, OperationOwner, OverlayError,
+    RecordedCapture,
 };
 use layerfs_workspace::Route;
+
+/// Private input assembled only by the admitted, receipt-verified Commit.
+pub(crate) struct CheckpointInstallInput {
+    pub recorded: RecordedCapture,
+    pub request_digest: [u8; 32],
+    pub target_snapshot: Vec<u8>,
+    pub installed_snapshot: Vec<u8>,
+    pub outcome: CheckpointOutcome,
+}
 
 impl OwnerClient {
     pub fn acquire_operation(
@@ -190,6 +200,40 @@ impl OwnerClient {
     ) -> Result<(), OwnerError> {
         self.install_prepared_recorded(route, workspace, input, None)
     }
+    pub(crate) fn install_prepared_checkpoint(
+        &self,
+        route: Route,
+        workspace: std::sync::Arc<layerfs_workspace::Workspace>,
+        input: layerfs_workspace::PreparedBase,
+        checkpoint: CheckpointInstallInput,
+    ) -> Result<(), OwnerError> {
+        let ready = Some(Readiness::Install(input.capture()));
+        self.call_observed(Some(route), ServiceClass::General, ready, move |db, _| {
+            if route != workspace.route() {
+                return Err(OwnerError::Install {
+                    cause: Box::new(OverlayError::Stale.into()),
+                    input: Box::new(input),
+                    durable_snapshot: Some(checkpoint.installed_snapshot),
+                });
+            }
+            let evidence = layerfs_workspace::CheckpointInstall {
+                recorded: checkpoint.recorded,
+                request_digest: checkpoint.request_digest,
+                target_snapshot: &checkpoint.target_snapshot,
+                installed_snapshot: &checkpoint.installed_snapshot,
+                outcome: checkpoint.outcome,
+            };
+            workspace
+                .install_prepared_checkpoint(db, input, evidence)
+                .map_err(|(cause, input)| OwnerError::Install {
+                    cause: Box::new(cause),
+                    input: Box::new(input),
+                    durable_snapshot: Some(checkpoint.installed_snapshot),
+                })
+        })
+        .map(|(value, _)| value)
+    }
+
     pub(crate) fn install_prepared_recorded(
         &self,
         route: Route,

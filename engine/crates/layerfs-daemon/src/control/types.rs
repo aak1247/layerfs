@@ -59,7 +59,6 @@ pub enum Failure {
     #[cfg(target_os = "linux")]
     DurableRoot(std::sync::Arc<std::io::Error>),
     /// Both a failed control attempt and its subsequent check failure are retained.
-    #[cfg(target_os = "linux")]
     AfterFailure {
         cause: Box<Failure>,
         original: Box<Failure>,

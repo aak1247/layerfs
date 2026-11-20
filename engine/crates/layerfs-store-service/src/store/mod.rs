@@ -1,6 +1,7 @@
 //! In-process Store ports shared by one daemon's Workspaces.
 pub mod bind;
 pub mod captured;
+mod checkpoint;
 pub mod checkpoint_receipt;
 pub mod commit;
 pub mod commit_merge;

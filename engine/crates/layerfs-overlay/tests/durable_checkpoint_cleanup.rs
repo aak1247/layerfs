@@ -2,8 +2,8 @@
 #![cfg(target_os = "linux")]
 
 use layerfs_overlay::{
-    Changes, CheckpointOutcome, Inode, InodeKind, MaintenanceCursor, Overlay, OverlayError,
-    PayloadWrite, ProfileConfig,
+    Changes, CheckpointCompletion, CheckpointOutcome, Inode, InodeKind, MaintenanceCursor, Overlay,
+    OverlayError, PayloadWrite, ProfileConfig,
 };
 use std::{
     fs,
@@ -118,6 +118,79 @@ fn read(db: &Overlay, serial: u64, expected: &[u8], nanos: u32) {
         expected
     );
     db.release_base_source(source).unwrap();
+}
+
+#[test]
+fn installed_attempt_finishes_only_with_its_original_evidence_and_released_owners() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request_id = u64::try_from(recorded.capture().generation.number()).unwrap();
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, request_id)
+        .unwrap();
+    let operation = db
+        .acquire_recorded_captured_operation(recorded, request_id, reader)
+        .unwrap();
+    write(&db, 61, b"later", 987_654_321);
+    let request = b"LFCP\x01original request";
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"layerfs/checkpoint-request/v1\0");
+    hash.update(request);
+    let digest = *hash.finalize().as_bytes();
+    let candidate = [18; 32];
+    let target = b"original target";
+    let installed = b"authenticated installed snapshot";
+    let outcome = CheckpointOutcome::UpToDate { head: None };
+    db.prepare_checkpoint_publication(recorded, request, digest, candidate, target)
+        .unwrap();
+    db.install_recorded_checkpoint(recorded, digest, candidate, target, installed, outcome)
+        .unwrap();
+    let evidence = CheckpointCompletion {
+        recorded,
+        request,
+        request_digest: digest,
+        candidate_root: candidate,
+        target_snapshot: target,
+        installed_snapshot: installed,
+        outcome,
+        reader: Some(reader),
+        operation: Some(operation),
+    };
+    assert!(!db.installed_checkpoint_cleanup_ready(evidence).unwrap());
+    assert!(db
+        .finish_installed_checkpoint_cleanup(CheckpointCompletion {
+            target_snapshot: b"different target",
+            ..evidence
+        })
+        .is_err());
+    assert!(db
+        .finish_installed_checkpoint_cleanup(CheckpointCompletion {
+            reader: None,
+            ..evidence
+        })
+        .is_err());
+    assert_eq!(
+        db.retained_captured_reader(request_id).unwrap(),
+        Some(reader)
+    );
+    assert_eq!(db.retained_operation(request_id).unwrap(), Some(operation));
+    db.release_captured_reader(reader).unwrap();
+    db.release_operation(operation).unwrap();
+    drain(&db);
+    assert!(db.installed_checkpoint_cleanup_ready(evidence).unwrap());
+    db.finish_installed_checkpoint_cleanup(evidence).unwrap();
+    assert!(db.finish_installed_checkpoint_cleanup(evidence).is_err());
+    assert_eq!(
+        db.durable_binding().unwrap().as_deref(),
+        Some(installed.as_slice())
+    );
+    read(&db, 61, b"later", 987_654_321);
+    db.close_database().unwrap();
+    let db = fixture.reopen();
+    read(&db, 61, b"later", 987_654_321);
 }
 
 #[test]

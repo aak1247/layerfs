@@ -1,5 +1,8 @@
 //! Completion of the original, definitely unpublished checkpoint's local work.
-use crate::{Overlay, OverlayError, OverlayResult, RecordedCapture, StatementKind};
+use crate::{
+    CheckpointCompletion, CheckpointOutcome, Overlay, OverlayError, OverlayResult, RecordedCapture,
+    StatementKind,
+};
 
 struct Cleanup {
     reader: Option<i64>,
@@ -13,17 +16,27 @@ struct Cleanup {
     retire_completed: Option<i64>,
 }
 
-fn ready(db: &Overlay, recorded: RecordedCapture) -> OverlayResult<(bool, i64)> {
+fn ready(
+    db: &Overlay,
+    recorded: RecordedCapture,
+    installed: Option<CheckpointCompletion<'_>>,
+) -> OverlayResult<(bool, i64)> {
     let state = db.live()?;
     let namespace = super::durable_attempt::check_context(db, recorded, false)?;
     let generation = recorded.capture.generation.0;
+    let phase = if installed.is_some() { 4_i64 } else { 3_i64 };
     let rows: Vec<Cleanup> = db.query(
         StatementKind::Frontier,
         "SELECT reader_owner,reader_request,reader_floor,reader_released,operation_owner,\
          operation_released,operation_cleanup_completed,fold_completed,retire_completed \
          FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 \
-         AND generation=?3 AND phase=3",
-        &[&recorded.attempt.as_slice(), &namespace, &generation],
+         AND generation=?3 AND phase=?4",
+        &[
+            &recorded.attempt.as_slice(),
+            &namespace,
+            &generation,
+            &phase,
+        ],
         72,
         |row| {
             Ok(Cleanup {
@@ -42,6 +55,45 @@ fn ready(db: &Overlay, recorded: RecordedCapture) -> OverlayResult<(bool, i64)> 
     let [cleanup] = rows.as_slice() else {
         return Err(OverlayError::Invalid("checkpoint fold cleanup predecessor"));
     };
+    if let Some(expected) = installed {
+        check_installed(db, recorded, expected)?;
+        let expected_reader = expected.reader.map(|reader| {
+            (
+                reader.owner,
+                reader.capture,
+                reader.installed,
+                reader.recorded_attempt,
+            )
+        });
+        let stored_reader = match (cleanup.reader, cleanup.reader_request, cleanup.reader_floor) {
+            (None, None, None) => None,
+            (Some(owner), Some(request), Some(floor)) if request == generation => Some((
+                u64::try_from(owner)
+                    .map_err(|_| OverlayError::Invalid("checkpoint reader owner"))?,
+                recorded.capture,
+                floor,
+                Some(recorded.attempt),
+            )),
+            _ => return Err(OverlayError::Invalid("checkpoint reader cleanup identity")),
+        };
+        let expected_operation = expected
+            .operation
+            .map(|owner| (owner.owner, owner.engine, owner.recorded));
+        let stored_operation = cleanup
+            .operation
+            .map(|owner| {
+                u64::try_from(owner)
+                    .map(|owner| (owner, recorded.capture.engine, Some(recorded)))
+                    .map_err(|_| OverlayError::Invalid("checkpoint operation owner"))
+            })
+            .transpose()?;
+        if expected.recorded != recorded
+            || expected_reader != stored_reader
+            || expected_operation != stored_operation
+        {
+            return Err(OverlayError::Invalid("checkpoint cleanup original owners"));
+        }
+    }
     if state.captured_revision.is_some() {
         return Err(OverlayError::Invalid("checkpoint fold cleanup state"));
     }
@@ -53,7 +105,13 @@ fn ready(db: &Overlay, recorded: RecordedCapture) -> OverlayResult<(bool, i64)> 
     ) {
         (None, None, None, None) => {}
         (Some(owner), Some(request), Some(floor), Some(released))
-            if owner > 0 && request == generation && floor == state.installed =>
+            if owner > 0
+                && request == generation
+                && if phase == 3 {
+                    floor == state.installed
+                } else {
+                    floor >= 0 && floor < generation
+                } =>
         {
             let owner = u64::try_from(owner)
                 .map_err(|_| OverlayError::Invalid("checkpoint reader owner"))?;
@@ -151,7 +209,8 @@ fn ready(db: &Overlay, recorded: RecordedCapture) -> OverlayResult<(bool, i64)> 
             ))
         }
     }
-    if cleanup.fold_completed != Some(1)
+    if (phase == 3 && cleanup.fold_completed != Some(1))
+        || (phase == 4 && cleanup.fold_completed.is_some())
         || cleanup.retire_completed != Some(1)
         || state.consolidating.is_some()
         || db.generation_held(generation)?
@@ -171,6 +230,75 @@ fn ready(db: &Overlay, recorded: RecordedCapture) -> OverlayResult<(bool, i64)> 
     }
 }
 
+fn check_installed(
+    db: &Overlay,
+    recorded: RecordedCapture,
+    expected: CheckpointCompletion<'_>,
+) -> OverlayResult<()> {
+    type Installed = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let rows: Vec<Installed> = db.query(
+        StatementKind::Frontier,
+        "SELECT request,request_digest,candidate_root,target_snapshot,installed_snapshot,\
+         outcome_kind,outcome_head,outcome_displaced FROM durable_checkpoint_attempt \
+         WHERE id=1 AND phase=4 AND attempt=?1",
+        &[&recorded.attempt.as_slice()],
+        144,
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let [(request, digest, candidate, target, snapshot, kind, head, displaced)] = rows.as_slice()
+    else {
+        return Err(OverlayError::Invalid(
+            "checkpoint installed cleanup predecessor",
+        ));
+    };
+    let (expected_kind, expected_head, expected_displaced) = match expected.outcome {
+        CheckpointOutcome::Committed { head, displaced } => (
+            1_i64,
+            Some(head.to_vec()),
+            displaced.map(|value| value.to_vec()),
+        ),
+        CheckpointOutcome::UpToDate { head } => (2_i64, head.map(|value| value.to_vec()), None),
+    };
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"layerfs/checkpoint-request/v1\0");
+    hash.update(request);
+    if request.as_slice() != expected.request
+        || digest.as_slice() != expected.request_digest
+        || *hash.finalize().as_bytes() != expected.request_digest
+        || candidate.as_slice() != expected.candidate_root
+        || target.as_slice() != expected.target_snapshot
+        || snapshot.as_slice() != expected.installed_snapshot
+        || *kind != expected_kind
+        || *head != expected_head
+        || *displaced != expected_displaced
+    {
+        return Err(OverlayError::Invalid(
+            "checkpoint installed cleanup identity",
+        ));
+    }
+    Ok(())
+}
+
 impl Overlay {
     /// Observes only the original folded checkpoint's local cleanup; it does
     /// not drive maintenance or authenticate any external Store publication.
@@ -178,14 +306,14 @@ impl Overlay {
         &self,
         recorded: RecordedCapture,
     ) -> OverlayResult<bool> {
-        ready(self, recorded).map(|(ready, _)| ready)
+        ready(self, recorded, None).map(|(ready, _)| ready)
     }
 
     /// Rechecks and finishes the original definitely unpublished attempt once.
     /// Its caller must already have established that no publication was sent.
     pub fn finish_folded_checkpoint_cleanup(&self, recorded: RecordedCapture) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
-            let (complete, namespace) = ready(self, recorded)?;
+            let (complete, namespace) = ready(self, recorded, None)?;
             if !complete {
                 return Err(OverlayError::Invalid("checkpoint fold cleanup pending"));
             }
@@ -197,6 +325,40 @@ impl Overlay {
             )?;
             if changed != 1 {
                 return Err(OverlayError::Invalid("checkpoint fold cleanup predecessor"));
+            }
+            Ok(())
+        })
+    }
+
+    /// Observes cleanup of a known installed checkpoint. The caller must
+    /// independently authenticate its Store receipt and bound Workspace.
+    pub fn installed_checkpoint_cleanup_ready(
+        &self,
+        expected: CheckpointCompletion<'_>,
+    ) -> OverlayResult<bool> {
+        ready(self, expected.recorded, Some(expected)).map(|(ready, _)| ready)
+    }
+
+    /// Finishes the exact installed checkpoint after its authenticated
+    /// receipt, original owners and local maintenance have been established.
+    pub fn finish_installed_checkpoint_cleanup(
+        &self,
+        expected: CheckpointCompletion<'_>,
+    ) -> OverlayResult<()> {
+        self.atomic_cleanup(|| {
+            let recorded = expected.recorded;
+            let (complete, namespace) = ready(self, recorded, Some(expected))?;
+            if !complete {
+                return Err(OverlayError::Invalid("checkpoint installed cleanup pending"));
+            }
+            let changed = self.execute(
+                StatementKind::Frontier,
+                "DELETE FROM durable_checkpoint_attempt WHERE id=1 AND phase=4 AND attempt=?1 AND namespace=?2 AND generation=?3",
+                &[&recorded.attempt.as_slice(), &namespace, &recorded.capture.generation.0],
+                48,
+            )?;
+            if changed != 1 {
+                return Err(OverlayError::Invalid("checkpoint installed cleanup predecessor"));
             }
             Ok(())
         })

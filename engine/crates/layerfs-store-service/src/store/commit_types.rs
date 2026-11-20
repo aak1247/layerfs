@@ -9,7 +9,7 @@ use layerfs_content::{
 use layerfs_history::{
     BranchSnapshot, CommitId, CommitOutcome, CommitRequest, HistoryError, WorkspaceId,
 };
-use layerfs_overlay::{Capture, CapturedReader, OperationOwner};
+use layerfs_overlay::{Capture, CapturedReader, OperationOwner, RecordedCapture};
 use layerfs_storage::{Diagnostics, StorageError, WriteOutcome};
 use layerfs_workspace::Route;
 use layerfs_workspace::{
@@ -143,11 +143,18 @@ pub struct CommitFailure {
     pub error: CommitError,
     pub intent: Option<CommitRequest>,
     pub capture: Option<Capture>,
+    /// Original durable attempt, when this Commit selected recorded custody.
+    pub recorded: Option<RecordedCapture>,
+    /// Publication preparation was attempted; its result may be unknown.
+    pub publication_prepared: bool,
     pub prepared: Option<PreparedBase>,
     pub saved: Option<WriteOutcome>,
     pub storage: Option<Diagnostics>,
     /// Some means publication is known even if local install failed.
     pub published: Option<CommitOutcome>,
+    /// The original successful local install, when only its later settlement
+    /// failed. Its replacement and Workspace projection remain authoritative.
+    pub installed: Option<Box<CommitSuccess>>,
     pub local_error: Option<OwnerError>,
     /// False means capture/unknown custody remains; another Commit is refused.
     pub locally_settled: bool,
@@ -164,10 +171,13 @@ impl CommitFailure {
             error,
             intent: None,
             capture: None,
+            recorded: None,
+            publication_prepared: false,
             prepared: None,
             saved: None,
             storage: None,
             published: None,
+            installed: None,
             local_error: None,
             locally_settled: false,
             namespace: None,

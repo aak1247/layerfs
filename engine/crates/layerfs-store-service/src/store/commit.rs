@@ -1,16 +1,25 @@
 //! One synchronous Content/Save/history producer and exact paired local install.
+use super::checkpoint::{CommitCapture, LiveCheckpoint};
 use super::{
     bind::checked_base, BoundWorkspace, CommitError, CommitFailure, CommitOptions, CommitPhase,
     CommitSuccess, MergeReport,
 };
 use crate::telemetry::phase;
 use layerfs_content::filesystem::FilesystemRootId;
-use layerfs_history::{BranchSnapshot, CommitMeta, CommitOutcome, CommitRequest, CommitVia};
+use layerfs_history::{
+    checkpoint_request_digest, encode_checkpoint_request, BranchSnapshot, CheckpointAttemptId,
+    CommitMeta, CommitOutcome, CommitRequest, CommitVia,
+};
 use layerfs_overlay::Capture;
 use layerfs_storage::Save;
 use layerfs_telemetry::timer::{Active, TimingScope};
 use layerfs_workspace::WorkspaceError;
 use std::sync::{atomic::Ordering, Arc};
+
+pub(super) struct CommitRun {
+    pub success: CommitSuccess,
+    pub checkpoint: Option<LiveCheckpoint>,
+}
 
 /// Admission belongs to exactly one invocation. It stays held unless that
 /// invocation establishes a safe disposition, including its captured releases.
@@ -45,13 +54,20 @@ impl BoundWorkspace {
         let mut admission = self.admit_commit()?;
         let result = crate::telemetry::timed("commit", |timing| {
             self.commit_admitted(
-                construct,
+                |save, capture, snapshot| construct(save, capture.capture(), snapshot),
                 || (),
                 &CommitOptions::default(),
                 CommitVia::Workspace,
                 timing,
             )
         });
+        let result = match result {
+            Ok(run) => self.finish_commit_run(run, None, None),
+            Err(mut failure) => {
+                self.finish_failed_checkpoint(&mut failure);
+                Err(failure)
+            }
+        };
         admission.released = match &result {
             Ok(_) => true,
             Err(failure) => failure.locally_settled,
@@ -88,14 +104,14 @@ impl BoundWorkspace {
         &self,
         construct: impl FnOnce(
             &Save<'_>,
-            Capture,
+            CommitCapture,
             &BranchSnapshot,
         ) -> Result<FilesystemRootId, CommitError>,
         published: impl FnOnce(),
         options: &CommitOptions,
         via: CommitVia,
         timing: &TimingScope<'_, Active>,
-    ) -> Result<CommitSuccess, Box<CommitFailure>> {
+    ) -> Result<CommitRun, Box<CommitFailure>> {
         let force = options.force;
         let mut retained = CommitFailure::new(
             CommitError::Context("incomplete Commit"),
@@ -105,6 +121,7 @@ impl BoundWorkspace {
         let mut producer = None;
         let mut merge = None;
         let mut replaced = None;
+        let mut checkpoint = None;
         let result = (|| {
             let snapshot = self.snapshot().map_err(CommitError::Workspace)?;
             retained.binding = Some(snapshot.clone());
@@ -147,11 +164,10 @@ impl BoundWorkspace {
                 }
             }
             retained.phase = CommitPhase::Capture;
-            let capture = phase(timing, "capture", || {
-                self.job(|job_client: &crate::OwnerClient, job_route| job_client.capture(job_route))
-                    .map_err(CommitError::Owner)
-            })?;
+            let selected = phase(timing, "capture", || self.capture_commit(&snapshot))?;
+            let capture = selected.capture();
             retained.capture = Some(capture);
+            retained.recorded = selected.recorded();
             if capture.base_root != local.to_bytes() || original_base.identity().0 != local {
                 return Err(CommitError::Context(
                     "capture differs from bound history root",
@@ -168,19 +184,20 @@ impl BoundWorkspace {
                     storage.begin_save().map_err(CommitError::Storage)
                 })?;
                 retained.phase = CommitPhase::Construct;
-                let candidate =
-                    match phase(timing, "construct", || construct(&save, capture, &snapshot)) {
-                        Ok(root) => root,
-                        Err(original) => {
-                            return Err(match save.take_failure() {
-                                Some(storage) => CommitError::Construction {
-                                    original: Box::new(original),
-                                    storage,
-                                },
-                                None => original,
-                            })
-                        }
-                    };
+                let candidate = match phase(timing, "construct", || {
+                    construct(&save, selected, &snapshot)
+                }) {
+                    Ok(root) => root,
+                    Err(original) => {
+                        return Err(match save.take_failure() {
+                            Some(storage) => CommitError::Construction {
+                                original: Box::new(original),
+                                storage,
+                            },
+                            None => original,
+                        })
+                    }
+                };
                 // Two-stage merge (#355). The head is read and merged with
                 // before the publication lane, so the merge's records and its
                 // whole build stay outside it. In the lane the head is read
@@ -382,6 +399,11 @@ impl BoundWorkspace {
                     .map_err(CommitError::Workspace)
             })?);
             let pending = if conflicted {
+                if retained.recorded.is_some() {
+                    return Err(CommitError::Context(
+                        "recorded local conflict disposition is not available",
+                    ));
+                }
                 // Nothing is published: the history binding follows the head
                 // merged with, and the merge stays the local base.
                 next = current.clone();
@@ -395,26 +417,98 @@ impl BoundWorkspace {
             } else {
                 retained.phase = CommitPhase::Publish;
                 let intent = retained.intent.as_ref().expect("checked intent");
-                let outcome = phase(timing, "publish", || {
-                    self.store
+                let frozen = if let Some(recorded) = retained.recorded {
+                    let request =
+                        encode_checkpoint_request(intent).map_err(CommitError::History)?;
+                    let digest = checkpoint_request_digest(&request);
+                    let target_bytes =
+                        layerfs_bridge::snapshot::encode(target).map_err(|cause| {
+                            CommitError::Owner(crate::OwnerError::BindingCodec(cause))
+                        })?;
+                    let prepared = self.job(|client, route| {
+                        client.prepare_checkpoint_publication(
+                            route,
+                            recorded,
+                            request.clone(),
+                            digest,
+                            candidate.0.to_bytes(),
+                            target_bytes,
+                        )
+                    });
+                    match prepared {
+                        Ok(()) => retained.publication_prepared = true,
+                        Err(error) => {
+                            retained.publication_prepared = super::owner_uncertain(&error);
+                            return Err(CommitError::Owner(error));
+                        }
+                    }
+                    Some((recorded, request, digest))
+                } else {
+                    None
+                };
+                let outcome = phase(timing, "publish", || match &frozen {
+                    Some((recorded, _, _)) => self
+                        .store
+                        .history
+                        .commit_checkpoint(
+                            CheckpointAttemptId::from_bytes(recorded.attempt()),
+                            intent,
+                        )
+                        .map_err(CommitError::History),
+                    None => self
+                        .store
                         .history
                         .commit_branch(intent)
-                        .map_err(CommitError::History)
+                        .map_err(CommitError::History),
                 })?;
                 let (head, root) = match &outcome {
                     CommitOutcome::Committed { record, .. } => (Some(record.id), record.root),
                     CommitOutcome::UpToDate { head, root } => (*head, *root),
                 };
                 drop(lane);
-                retained.published = Some(outcome);
+                retained.published = Some(outcome.clone());
                 if root != candidate.0 {
                     return Err(CommitError::Context(
                         "publication differs from saved candidate",
                     ));
                 }
-                published();
                 next.branch.head_commit = head;
                 next.head_root = head.map(|_| root);
+                if let Some((recorded, request_bytes, digest)) = frozen {
+                    let catalog = self.store.history.catalog_id();
+                    let incarnation = self.store.history.incarnation();
+                    let observed = self
+                        .store
+                        .observe_original_checkpoint(super::OriginalCheckpoint {
+                            catalog,
+                            incarnation,
+                            attempt: CheckpointAttemptId::from_bytes(recorded.attempt()),
+                            request: &request_bytes,
+                            request_digest: digest,
+                            candidate_root: candidate.0,
+                            target,
+                        })
+                        .map_err(CommitError::History)?
+                        .ok_or(CommitError::Context("checkpoint receipt is absent"))?;
+                    if observed.outcome != outcome || observed.installed != next {
+                        return Err(CommitError::Context(
+                            "checkpoint receipt differs from result",
+                        ));
+                    }
+                    checkpoint = Some(LiveCheckpoint {
+                        recorded,
+                        catalog,
+                        incarnation,
+                        request: intent.clone(),
+                        request_bytes,
+                        digest,
+                        original_binding: snapshot.clone(),
+                        target: target.clone(),
+                        installed: observed.installed,
+                        outcome,
+                    });
+                }
+                published();
                 None
             };
             retained.phase = CommitPhase::Install;
@@ -434,15 +528,38 @@ impl BoundWorkspace {
                 };
             let prepared = retained.prepared.take().expect("prepared install");
             phase(timing, "install", || {
-                self.job(|job_client: &crate::OwnerClient, route| {
-                    job_client.install_prepared_recorded(
-                        route,
-                        self.workspace.clone(),
-                        prepared,
-                        durable_snapshot,
-                    )
-                })
-                .map_err(CommitError::Owner)
+                if let Some(original) = &checkpoint {
+                    let target_snapshot = layerfs_bridge::snapshot::encode(&original.target)
+                        .map_err(|cause| {
+                            CommitError::Owner(crate::OwnerError::BindingCodec(cause))
+                        })?;
+                    let input = crate::overlay::lifetime_operations::CheckpointInstallInput {
+                        recorded: original.recorded,
+                        request_digest: original.digest,
+                        target_snapshot,
+                        installed_snapshot: durable_snapshot.expect("recorded durable snapshot"),
+                        outcome: checkpoint_outcome(&original.outcome),
+                    };
+                    self.job(|client, route| {
+                        client.install_prepared_checkpoint(
+                            route,
+                            self.workspace.clone(),
+                            prepared,
+                            input,
+                        )
+                    })
+                    .map_err(CommitError::Owner)
+                } else {
+                    self.job(|client, route| {
+                        client.install_prepared_recorded(
+                            route,
+                            self.workspace.clone(),
+                            prepared,
+                            durable_snapshot,
+                        )
+                    })
+                    .map_err(CommitError::Owner)
+                }
             })?;
             *self
                 .snapshot
@@ -461,14 +578,17 @@ impl BoundWorkspace {
         if let Some(storage) = producer {
             self.producer.keep(storage);
         }
-        Ok(CommitSuccess {
-            history: retained.published,
-            merge,
-            saved: retained.saved.expect("known Save"),
-            storage: retained.storage.expect("producer observations"),
-            capture: retained.capture,
-            namespace: None,
-            replaced,
+        Ok(CommitRun {
+            success: CommitSuccess {
+                history: retained.published,
+                merge,
+                saved: retained.saved.expect("known Save"),
+                storage: retained.storage.expect("producer observations"),
+                capture: retained.capture,
+                namespace: None,
+                replaced,
+            },
+            checkpoint,
         })
     }
 
@@ -505,5 +625,19 @@ impl BoundWorkspace {
                 provider: None,
             }),
         }
+    }
+}
+
+pub(super) fn checkpoint_outcome(outcome: &CommitOutcome) -> layerfs_overlay::CheckpointOutcome {
+    match outcome {
+        CommitOutcome::Committed { record, displaced } => {
+            layerfs_overlay::CheckpointOutcome::Committed {
+                head: record.id.to_bytes(),
+                displaced: displaced.map(|value| value.to_bytes()),
+            }
+        }
+        CommitOutcome::UpToDate { head, .. } => layerfs_overlay::CheckpointOutcome::UpToDate {
+            head: head.map(|value| value.to_bytes()),
+        },
     }
 }

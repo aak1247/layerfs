@@ -1,6 +1,7 @@
 //! The product Commit constructor: one captured namespace attempt inside the
 //! unchanged driver. Its reader and operation owner are released only after
 //! the driver's outcome is known; unresolved custody stays with the failure.
+use super::checkpoint::CommitCapture;
 use super::{
     BoundWorkspace, CapturedConstruction, CommitError, CommitFailure, CommitOptions, CommitSuccess,
     PortError, ReleasedOwner, StoreOperation,
@@ -10,7 +11,6 @@ use layerfs_content::{
     filesystem::FilesystemRootId, ContentError, ContentResult, FilesystemResult, FinalizedConsumer,
     FinalizedObject,
 };
-use layerfs_overlay::Capture;
 use layerfs_storage::{Save, SaveSink};
 use layerfs_workspace::{
     CapturedNamespace, CapturedNamespaceAttempt, ConstructedObjects, WorkspaceError,
@@ -81,13 +81,20 @@ impl BoundWorkspace {
         });
         let mut held = held.into_inner();
         match result {
-            Ok(mut success) => {
+            Ok(mut run) => {
+                let reader = held.as_ref().and_then(|held| held.reader);
+                let operation = held.as_ref().and_then(|held| held.operation);
                 if let Some(held) = &mut held {
                     self.release_captured(held);
                 }
-                admission.released = held.as_ref().is_none_or(|held| !held.retained());
-                success.namespace = held;
-                Ok(success)
+                let released = held.as_ref().is_none_or(|held| !held.retained());
+                run.success.namespace = held;
+                if !released {
+                    return Ok(run.success);
+                }
+                let result = self.finish_commit_run(run, reader, operation);
+                admission.released = result.is_ok();
+                result
             }
             Err(mut failure) => {
                 // Only a definite, locally resolved nonpublication ends the
@@ -97,8 +104,12 @@ impl BoundWorkspace {
                     // past the releases.
                     self.release_captured(held);
                 }
-                admission.released =
-                    failure.locally_settled && held.as_ref().is_none_or(|held| !held.retained());
+                if held.as_ref().is_some_and(CapturedConstruction::retained) {
+                    failure.locally_settled = false;
+                } else {
+                    self.finish_failed_checkpoint(&mut failure);
+                }
+                admission.released = failure.locally_settled;
                 failure.namespace = held;
                 Err(failure)
             }
@@ -109,11 +120,12 @@ impl BoundWorkspace {
     fn construct_captured(
         &self,
         save: &Save<'_>,
-        capture: Capture,
+        selected: CommitCapture,
         held: &mut CapturedConstruction,
         constructed: Option<&mut ConstructedObjects>,
     ) -> Result<FilesystemRootId, CommitError> {
         let operation = self.operation().map_err(CommitError::Workspace)?;
+        let capture = selected.capture();
         // Only Commit acquires these owners, one capture at a time, so the
         // capture's own generation is unique among their live requests.
         let request = u64::try_from(capture.generation.number())
@@ -121,15 +133,26 @@ impl BoundWorkspace {
             .filter(|number| *number != 0)
             .ok_or(CommitError::Context("capture generation as request"))?;
         let reader = self
-            .job(|job_client: &crate::OwnerClient, route| {
-                job_client.acquire_captured_reader(route, capture, request)
+            .job(|job_client: &crate::OwnerClient, route| match selected {
+                CommitCapture::Legacy(capture) => {
+                    job_client.acquire_captured_reader(route, capture, request)
+                }
+                CommitCapture::Recorded(recorded) => {
+                    job_client.acquire_recorded_captured_reader(route, recorded, request)
+                }
             })
             .map_err(CommitError::Owner)?;
         held.reader = Some(reader);
         let owner = self
-            .job(|job_client: &crate::OwnerClient, job_route| {
-                job_client.acquire_captured_operation(job_route, request, reader)
-            })
+            .job(
+                |job_client: &crate::OwnerClient, job_route| match selected {
+                    CommitCapture::Legacy(_) => {
+                        job_client.acquire_captured_operation(job_route, request, reader)
+                    }
+                    CommitCapture::Recorded(recorded) => job_client
+                        .acquire_recorded_captured_operation(job_route, recorded, request, reader),
+                },
+            )
             .map_err(CommitError::Owner)?;
         held.operation = Some(owner);
         let policy = self.store.policy().construction();

@@ -4,13 +4,15 @@
 #[path = "support/installed_store.rs"]
 mod support;
 
+use layerfs_bridge::control::{Activity, CommitControl, Reply, Request};
 use layerfs_content::filesystem::PathName;
 use layerfs_daemon::{
     bootstrap::open_store,
-    store::{BindRequest, BoundWorkspace, CommitOptions},
+    control::{Failure, Service},
+    store::{BindRequest, BoundWorkspace, CommitError, CommitOptions},
     Owner, OwnerConfig, OwnerError,
 };
-use layerfs_history::WorkspaceId;
+use layerfs_history::{CommitOutcome, HistoryError, WorkspaceId};
 use layerfs_overlay::{OverlayError, ProfileConfig};
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
@@ -90,7 +92,7 @@ fn write(workspace: &BoundWorkspace, name: &str, bytes: &[u8]) {
 
 #[test]
 fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
-    let fixture = support::Fixture::new(2, "durable-bind");
+    let fixture = support::Fixture::new_durable(2, "durable-bind");
     assert_eq!(fixture.count, 2);
     let store = open_store(
         fixture.config.clone(),
@@ -242,6 +244,374 @@ fn recovery_rebinds_recorded_base_and_merges_a_moved_branch() {
     drop(final_binding);
     last.stop().unwrap();
     drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn recorded_live_commits_publish_once_and_finish_original_custody() {
+    let fixture = support::Fixture::new_durable(1, "recorded-live-commit");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let identity = WorkspaceId::from_authority([42; 32]).unwrap();
+    let owner = Owner::create_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: identity,
+                branch: fixture.branch,
+            },
+            initial,
+        )
+        .unwrap()
+        .workspace;
+    for byte in [b'X', b'Y'] {
+        let mut content = support::bytes(0);
+        content[0] = byte;
+        write(&workspace, "file-000000", &content);
+        let result = workspace
+            .commit_captured(&CommitOptions::default())
+            .unwrap();
+        assert!(matches!(
+            result.history,
+            Some(CommitOutcome::Committed { .. })
+        ));
+        let namespace = result.namespace.as_ref().unwrap();
+        assert!(!namespace.retained());
+        let snapshot = workspace.snapshot().unwrap();
+        assert_eq!(owner.client().durable_snapshot().unwrap(), snapshot);
+        assert_eq!(read(&workspace, "file-000000"), content);
+    }
+    let unchanged = workspace
+        .commit_captured(&CommitOptions::default())
+        .unwrap();
+    assert!(matches!(
+        unchanged.history,
+        Some(CommitOutcome::UpToDate { .. })
+    ));
+    assert!(unchanged.capture.is_none());
+    drop(workspace);
+    store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+    drop(store);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: (i64, i64) = history
+        .query_row(
+            "SELECT count(*),count(DISTINCT attempt_id) FROM checkpoint_receipt",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipts, (2, 2));
+    drop(history);
+    let overlay = rusqlite::Connection::open(path).unwrap();
+    let pending: i64 = overlay
+        .query_row(
+            "SELECT count(*) FROM durable_checkpoint_attempt",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0);
+    drop(overlay);
+    fixture.cleanup();
+}
+
+#[test]
+fn recorded_capture_rejects_store_without_receipts_before_any_capture() {
+    let fixture = support::Fixture::new(1, "recorded-unsupported-store");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let identity = WorkspaceId::from_authority([42; 32]).unwrap();
+    let owner = Owner::create_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: identity,
+                branch: fixture.branch,
+            },
+            initial.clone(),
+        )
+        .unwrap()
+        .workspace;
+    let mut content = support::bytes(0);
+    content[0] = b'X';
+    write(&workspace, "file-000000", &content);
+    let before = owner.client().state(workspace.route()).unwrap();
+    let failure = workspace
+        .commit_captured(&CommitOptions::default())
+        .unwrap_err();
+    assert!(matches!(
+        failure.error,
+        CommitError::History(HistoryError::Unsupported(_))
+    ));
+    assert!(failure.capture.is_none());
+    assert!(failure.recorded.is_none());
+    assert_eq!(owner.client().state(workspace.route()).unwrap(), before);
+    assert_eq!(workspace.snapshot().unwrap(), initial);
+    assert_eq!(read(&workspace, "file-000000"), content);
+    drop(workspace);
+    store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn installed_merge_with_failed_settlement_keeps_original_control_projection() {
+    let fixture = support::Fixture::new_durable(2, "recorded-settlement-refusal");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let identity = WorkspaceId::from_authority([42; 32]).unwrap();
+    let request = BindRequest {
+        workspace: identity,
+        branch: fixture.branch,
+    };
+    let owner = Owner::create_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    let original = store
+        .bind_durable(owner.client(), request.clone(), initial.clone())
+        .unwrap()
+        .workspace;
+    drop(original);
+    store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+    let overlay = rusqlite::Connection::open(&path).unwrap();
+    overlay
+        .execute_batch(
+            "CREATE TRIGGER fail_checkpoint_finish BEFORE DELETE ON durable_checkpoint_attempt \
+         BEGIN SELECT RAISE(ABORT, 'injected finish failure'); END;",
+        )
+        .unwrap();
+    drop(overlay);
+    let (owner, recorded) =
+        Owner::recover_recorded(&path, ProfileConfig::default(), [42; 32], 2).unwrap();
+    let original = store
+        .bind_durable(owner.client(), request, recorded)
+        .unwrap()
+        .workspace;
+    let mut ours = support::bytes(0);
+    ours[0] = b'X';
+    write(&original, "file-000000", &ours);
+
+    let other_owner = Owner::start(
+        &fixture.directory.join("other.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig::default(),
+    )
+    .unwrap();
+    let other = store
+        .bind(
+            other_owner.client(),
+            BindRequest {
+                workspace: WorkspaceId::from_authority([43; 32]).unwrap(),
+                branch: fixture.branch,
+            },
+        )
+        .unwrap()
+        .workspace;
+    let mut theirs = support::bytes(1);
+    theirs[0] = b'Y';
+    write(&other, "file-000001", &theirs);
+    other.commit_captured(&CommitOptions::default()).unwrap();
+    other.close().unwrap();
+    drop(other);
+    other_owner.stop().unwrap();
+
+    let service = Service::new(store.clone(), &owner);
+    let token = service.register_durable(original).unwrap();
+    let command = Request::Commit(CommitControl {
+        token,
+        force: false,
+        message: None,
+    });
+    let failure = service.execute_control(&command).unwrap_err();
+    let Failure::After { cause, original } = failure else {
+        panic!("expected known local install and settlement refusal")
+    };
+    let Failure::Commit(failed) = *cause else {
+        panic!("expected original Commit settlement failure")
+    };
+    let CommitError::Owner(OwnerError::Attempted(attempted)) = &failed.error else {
+        panic!("expected attempted owner failure: {:?}", failed.error)
+    };
+    let OwnerError::Overlay(OverlayError::Sql(rusqlite::Error::SqliteFailure(
+        error,
+        Some(message),
+    ))) = attempted.cause.as_ref()
+    else {
+        panic!(
+            "expected injected SQLite trigger failure: {:?}",
+            attempted.cause
+        )
+    };
+    assert_eq!(
+        error.extended_code,
+        rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+    );
+    assert_eq!(message, "injected finish failure");
+    let commit = original.commit.expect("original installed Commit");
+    assert!(commit.replaced.is_some());
+    assert!(matches!(
+        commit.history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    let status = service.execute_control(&Request::Status(token)).unwrap();
+    let Reply::Status(status) = status.reply else {
+        panic!("expected status")
+    };
+    assert_eq!(status.activity, Activity::LocalFailure);
+    assert_eq!(
+        status.binding,
+        store
+            .history()
+            .branch_snapshot(fixture.branch)
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(status.binding, owner.client().durable_snapshot().unwrap());
+    assert!(status.published.is_some());
+    assert!(service.execute_control(&command).is_err());
+    drop(service);
+    store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+    drop(store);
+    let overlay = rusqlite::Connection::open(path).unwrap();
+    let phase: i64 = overlay
+        .query_row("SELECT phase FROM durable_checkpoint_attempt", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(phase, 4);
+    drop(overlay);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: i64 = history
+        .query_row("SELECT count(*) FROM checkpoint_receipt", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 1);
+    drop(history);
+    fixture.cleanup();
+}
+
+#[test]
+fn recorded_construction_failure_folds_before_next_new_commit() {
+    let fixture = support::Fixture::new_durable(1, "recorded-prepublication-failure");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let identity = WorkspaceId::from_authority([42; 32]).unwrap();
+    let owner = Owner::create_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: identity,
+                branch: fixture.branch,
+            },
+            initial.clone(),
+        )
+        .unwrap()
+        .workspace;
+    let mut content = support::bytes(0);
+    content[0] = b'X';
+    write(&workspace, "file-000000", &content);
+    let failed = workspace
+        .commit(|_, _, _| Err(CommitError::Context("original construction refusal")))
+        .unwrap_err();
+    assert!(matches!(
+        failed.error,
+        CommitError::Context("original construction refusal")
+    ));
+    assert!(failed.recorded.is_some());
+    assert!(!failed.publication_prepared);
+    assert!(failed.published.is_none());
+    assert!(failed.locally_settled);
+    assert_eq!(workspace.snapshot().unwrap(), initial);
+    assert_eq!(read(&workspace, "file-000000"), content);
+    assert!(matches!(
+        workspace
+            .commit_captured(&CommitOptions::default())
+            .unwrap()
+            .history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    drop(workspace);
+    store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+    drop(store);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: i64 = history
+        .query_row("SELECT count(*) FROM checkpoint_receipt", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 1);
+    drop(history);
     fixture.cleanup();
 }
 

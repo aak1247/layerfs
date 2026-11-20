@@ -14,7 +14,8 @@ impl BoundWorkspace {
         command(&self.owner, self.route())
     }
     pub(super) fn settle_failure(&self, mut failure: CommitFailure) -> Box<CommitFailure> {
-        if failure.published.is_some() || failure.error.uncertain() {
+        if failure.published.is_some() || failure.error.uncertain() || failure.publication_prepared
+        {
             return Box::new(failure);
         }
         let Some(capture) = failure.capture else {
@@ -22,7 +23,13 @@ impl BoundWorkspace {
             return Box::new(failure);
         };
         match self.job(|job_client: &crate::OwnerClient, job_route| {
-            job_client.resolve_failed(job_route, capture)
+            if let Some(recorded) = failure.recorded {
+                job_client.call(job_route, crate::ServiceClass::General, None, move |db| {
+                    db.fold_unpublished_checkpoint(recorded)
+                })
+            } else {
+                job_client.resolve_failed(job_route, capture)
+            }
         }) {
             Ok(()) => failure.locally_settled = true,
             Err(error) => failure.local_error = Some(error),
