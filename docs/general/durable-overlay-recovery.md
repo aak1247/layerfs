@@ -23,7 +23,7 @@ engine instead of allowing it to resume.
 lock. The caller supplies the stable identity, the expected base root and a
 daemon-local namespace. Recovery refuses a different stored root, and makes a
 fresh random internal route incarnation so a route from the old owner cannot
-select the recovered connection. Schema 41 and 42 files also persist a
+select the recovered connection. Schema 41 and newer files also persist a
 per-Workspace high-water mark before an owner or recovered token is returned.
 Recovery requires a strictly greater namespace and records it durably before
 exposing the new owner; gaps are allowed and a failed or unknown attempt must
@@ -45,7 +45,7 @@ replace the original view: a later explicit Commit uses the existing merge
 path. The caller must keep the owner private during binding and authenticate
 its Workspace, Store and requested Branch; the snapshot is not authorization.
 
-New durable overlay files use schema 42 and persist their encoded snapshot.
+Schema 42 durable overlay files persist their encoded snapshot.
 For a known published Commit, its new snapshot and the overlay's installed
 base advance in the same SQLite transaction. An install without a known
 receipt marks the binding unresolved in that transaction; recovery refuses it
@@ -56,14 +56,27 @@ independently prove a fresh namespace for schema 39 or 40. Schema 39 also
 requires the caller's independently retained snapshot. Old inode reservation
 windows are not reused; future allocations require the same durable Store
 authority and scope.
-`Owner::recover_recorded` reads the snapshot and root from schema 40, 41 or 42 without
+`Owner::recover_recorded` reads an ordinary ready snapshot and root from schema 40 through 44 without
 requiring an external root, but still requires the independently known file
 path and Workspace identity. The resulting snapshot must pass Store binding
 and the caller's authorization and old-owner fencing checks.
 `Owner::recover_recorded_next` also selects a namespace greater than the
-schema-41/42 high-water mark while holding the original file lease. Its caller
+schema-41-and-newer high-water mark while holding the original file lease. Its caller
 supplies a minimum and must serialize it with all other live Workspace routes;
 legacy schemas lack this evidence and are refused by that method.
+
+New durable overlays use schema 44. An explicitly fenced `Service::recover_catalog`
+can reopen a settled active local conflict while retaining the original Overlay
+lease and namespace. It checks the original roster record, Store catalog and
+incarnation, historical Branch snapshot, marker root and complete ordered path
+page chain before selecting a newer namespace and binding the same Workspace.
+This recovers the pending conflict for an explicit resolution; it does not resend
+the earlier Commit. Ordinary Overlay and Owner recovery continue to reject the
+active conflict, and pending captures, publications and orphan custody remain
+unreconciled. The caller still proves the original processes, mounts and
+consumers have stopped. Active-conflict FUSE synchronization remains unavailable
+until its bound Store and Overlay barriers are integrated. These component tests
+do not establish crash, FUSE or Sandbox recovery.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

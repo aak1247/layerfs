@@ -46,9 +46,13 @@
 > rewritten nor migrated on ordinary open. A local capture can stage ordered
 > conflict bytes one bounded page at a time, excluding publication of that
 > capture. A definite prepublication failure folds the original capture and
-> reclaims only its written pages through bounded maintenance. Authenticated
-> cold reconciliation of active or unsettled conflict records remains
-> unimplemented; ordinary recovery retains and rejects those records.
+> reclaims only its written pages through bounded maintenance. After the caller
+> fences the original writers and consumers, catalog recovery can reopen a
+> settled active conflict under its original lease, authenticate its Store and
+> historical target, and verify its ordered path pages before advancing the
+> namespace. Ordinary recovery still refuses conflicts. Pending capture,
+> publication and orphan reconciliation remain unimplemented; those original
+> records remain retained, and an unknown call is never resent.
 
 BoundWorkspace::commit admits one active lifecycle for that Workspace, captures
 once through the existing overlay owner, creates independently owned Storage/Save

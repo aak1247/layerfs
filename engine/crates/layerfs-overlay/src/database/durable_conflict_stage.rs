@@ -34,6 +34,11 @@ pub(crate) struct ActiveConflict {
     pub root: Vec<u8>,
     pub target: Vec<u8>,
     pub digest: [u8; 32],
+    pub namespace: i64,
+    pub paths: i64,
+    pub bytes: i64,
+    pub pages: i64,
+    pub final_digest: Vec<u8>,
 }
 
 fn descriptor(generation: i64, plan: &Plan) -> OverlayResult<[u8; 32]> {
@@ -154,6 +159,11 @@ pub(crate) fn active_conflict(db: &Overlay) -> OverlayResult<Option<ActiveConfli
         root: plan.root,
         target: plan.target,
         digest: actual,
+        namespace: plan.namespace,
+        paths: plan.paths,
+        bytes: plan.bytes,
+        pages: plan.pages,
+        final_digest: plan.final_digest,
     }))
 }
 

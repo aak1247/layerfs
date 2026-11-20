@@ -10,14 +10,107 @@ use layerfs_daemon::{
     bootstrap::open_store,
     control::{CatalogRecoveryCause, Service},
     durable_roster::{Authority, Roster, RosterError, WorkspaceRecord},
-    store::BindRequest,
+    store::{BindError, BindRequest, CatalogPreparationFailure},
     Owner, OwnerConfig, OwnerError,
 };
-use layerfs_history::{BranchId, WorkspaceId};
-use layerfs_overlay::{Overlay, ProfileConfig};
+use layerfs_history::{BranchId, HistoryError, WorkspaceId};
+use layerfs_overlay::{Overlay, OverlayCatalogRecovery, OverlayError, ProfileConfig};
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
 use std::{fs, os::unix::fs::PermissionsExt};
+
+#[test]
+fn unfinished_recorded_capture_keeps_original_namespace_and_attempt() {
+    let fixture = support::Fixture::new_durable(1, "catalog-unfinished-capture");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        1,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let snapshot = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let catalog = fixture.directory.join("unfinished-catalog");
+    let overlays = fixture.directory.join("unfinished-overlays");
+    for path in [&catalog, &overlays] {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let workspace = WorkspaceId::from_authority([80; 32]).unwrap();
+    let record = WorkspaceRecord {
+        workspace,
+        branch: fixture.branch,
+    };
+    let mut roster = Roster::create(
+        &catalog,
+        Authority::for_catalog([8; 32], store.history()).unwrap(),
+    )
+    .unwrap();
+    roster.record(record).unwrap();
+    let path = overlays.join(record.overlay_name());
+    let db =
+        Overlay::create_durable(&path, ProfileConfig::default(), workspace.to_bytes()).unwrap();
+    let root = snapshot.effective_root.to_bytes();
+    let binding = layerfs_bridge::snapshot::encode(&snapshot).unwrap();
+    db.open_workspace(root).unwrap();
+    db.initialize_durable_binding(root, &binding).unwrap();
+    db.initialize_durable_namespace(1).unwrap();
+    let recorded = db
+        .capture_recorded(
+            workspace.to_bytes(),
+            store.history().catalog_id().to_bytes(),
+            store.history().incarnation(),
+            &binding,
+        )
+        .unwrap();
+    let attempt = recorded.attempt();
+    let generation = recorded.capture().generation.number();
+    drop(db);
+
+    let owner = Owner::start(
+        &fixture.directory.join("unfinished-template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 1 },
+    )
+    .unwrap();
+    let service = Service::new(store.clone(), &owner);
+    let failure = service
+        .recover_catalog(
+            &mut roster,
+            &owner,
+            &overlays,
+            [8; 32],
+            ProfileConfig::default(),
+            2,
+        )
+        .unwrap_err();
+    assert!(failure.completed.is_empty());
+    assert!(matches!(failure.cause, CatalogRecoveryCause::Open {
+        record: failed_record,
+        cause: OwnerError::Overlay(OverlayError::Invalid("durable overlay requires reconciliation")),
+    } if failed_record == record));
+    assert_eq!(service.workspaces(), Some(0));
+    let check =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let current:(i64,i64,i64,Vec<u8>) = check.query_row(
+        "SELECT r.high_namespace,a.phase,a.generation,a.attempt FROM durable_route r,durable_checkpoint_attempt a WHERE r.id=1",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(current, (1, 1, generation, attempt.to_vec()));
+    drop(check);
+    drop(service);
+    owner.stop().unwrap();
+    drop(roster);
+    drop(store);
+    fixture.cleanup();
+}
 
 #[test]
 fn acknowledged_close_is_excluded_and_pending_close_blocks_recovery() {
@@ -549,7 +642,7 @@ fn one_catalog_recovers_sixty_four_independent_workspace_bindings() {
 }
 
 #[test]
-fn branch_mismatch_returns_the_recovered_owner_and_snapshot() {
+fn branch_mismatch_retains_original_lease_without_advancing_namespace() {
     let fixture = support::Fixture::new(1, "catalog-recovery-branch-mismatch");
     let store = open_store(
         fixture.config.clone(),
@@ -620,22 +713,34 @@ fn branch_mismatch_returns_the_recovered_owner_and_snapshot() {
         )
         .unwrap_err();
     assert!(failed.completed.is_empty());
-    let CatalogRecoveryCause::Unadmitted {
+    let CatalogRecoveryCause::Prepare {
         record: failed_record,
-        reason,
         failure,
-        snapshot: returned,
     } = failed.cause
     else {
-        panic!("expected original owner custody");
+        panic!("expected original local custody");
     };
     assert_eq!(failed_record, record);
-    assert_eq!(reason, "recorded Branch mismatch");
-    assert_eq!(*returned, snapshot);
-    assert_eq!(failure.owner.client().bound_route().unwrap().namespace(), 2);
+    assert!(matches!(
+        failure.as_ref(),
+        CatalogPreparationFailure::Retained {
+            cause: BindError::History(HistoryError::Integrity("catalog recovery identity")),
+            ..
+        }
+    ));
     assert!(Owner::recover_recorded_next(&path, ProfileConfig::default(), [81; 32], 3).is_err());
     assert_eq!(service.workspaces(), Some(0));
-    failure.owner.stop().unwrap();
+    drop(failure);
+    let local = OverlayCatalogRecovery::open(&path, ProfileConfig::default(), [81; 32]).unwrap();
+    let OverlayCatalogRecovery::Ready(local) = local else {
+        panic!("expected ready binding")
+    };
+    assert_eq!(local.observed().previous_namespace, 1);
+    assert_eq!(
+        local.observed().snapshot,
+        layerfs_bridge::snapshot::encode(&snapshot).unwrap()
+    );
+    drop(local);
     drop(service);
     owner.stop().unwrap();
     drop(discovery);

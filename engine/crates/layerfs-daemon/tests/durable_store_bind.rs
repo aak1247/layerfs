@@ -4,16 +4,22 @@
 #[path = "support/installed_store.rs"]
 mod support;
 
-use layerfs_bridge::control::{Activity, CommitControl, Reply, Request};
+use layerfs_bridge::control::{
+    Activity, CommitControl, Reply, Request, UnmountControl, WorkspaceToken,
+};
 use layerfs_content::filesystem::PathName;
 use layerfs_daemon::{
     bootstrap::open_store,
     control::{Failure, Service},
+    durable_roster::{Authority, Roster, WorkspaceRecord},
     store::{BindRequest, BoundWorkspace, CommitError, CommitOptions},
     Owner, OwnerConfig, OwnerError,
 };
 use layerfs_history::{CommitOutcome, HistoryError, WorkspaceId};
-use layerfs_overlay::{OverlayError, ProfileConfig};
+use layerfs_overlay::{
+    conflict_page_digest, ConflictCompletion, ConflictStageInput, MaintenanceCursor, Overlay,
+    OverlayError, ProfileConfig, CONFLICT_PAGE_BYTES,
+};
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
 use layerfs_workspace::{Operation, Outcome, Position, Time};
@@ -33,14 +39,397 @@ fn access<T>(
     action: impl FnOnce(&layerfs_daemon::store::StoreOperation, &layerfs_workspace::SourceView) -> T,
 ) -> T {
     let operation = workspace.operation().unwrap();
+    access_operation(&operation, action)
+}
+fn access_operation<T>(
+    operation: &layerfs_daemon::store::StoreOperation,
+    action: impl FnOnce(&layerfs_daemon::store::StoreOperation, &layerfs_workspace::SourceView) -> T,
+) -> T {
     let overlay = operation.overlay();
-    let route = workspace.route();
+    let route = operation.workspace().route();
     let source = overlay.acquire_base_source(route, 7).unwrap();
     let view = operation.workspace().view_for_source(source).unwrap();
-    let result = action(&operation, &view);
+    let result = action(operation, &view);
     drop(view);
     overlay.release_base_source(route, source).unwrap();
     result
+}
+
+#[test]
+fn settled_conflict_recovers_original_catalog_workspace_and_resolves_once() {
+    let fixture = support::Fixture::new_durable(1, "recorded-cold-conflict");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let catalog = fixture.directory.join("cold-conflict-catalog");
+    let overlays = fixture.directory.join("cold-conflict-overlays");
+    for path in [&catalog, &overlays] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let id1 = WorkspaceId::from_authority([42; 32]).unwrap();
+    let id2 = WorkspaceId::from_authority([43; 32]).unwrap();
+    let record = WorkspaceRecord {
+        workspace: id2,
+        branch: fixture.branch,
+    };
+    let authority = Authority::for_catalog([8; 32], store.history()).unwrap();
+    let mut roster = Roster::create(&catalog, authority).unwrap();
+    roster.record(record).unwrap();
+    let first_path = fixture.directory.join("cold-conflict-first.sqlite");
+    let second_path = overlays.join(record.overlay_name());
+    let owner1 =
+        Owner::create_durable(spec(&first_path, initial.effective_root.to_bytes())).unwrap();
+    let mut second_spec = spec(&second_path, initial.effective_root.to_bytes());
+    second_spec.identity = [43; 32];
+    second_spec.namespace = 2;
+    let owner2 = Owner::create_durable(second_spec).unwrap();
+    let first = store
+        .bind_durable(
+            owner1.client(),
+            BindRequest {
+                workspace: id1,
+                branch: fixture.branch,
+            },
+            initial.clone(),
+        )
+        .unwrap()
+        .workspace;
+    let second = store
+        .bind_durable(
+            owner2.client(),
+            BindRequest {
+                workspace: id2,
+                branch: fixture.branch,
+            },
+            initial,
+        )
+        .unwrap()
+        .workspace;
+    let mut ours = support::bytes(0);
+    ours[0] = b'X';
+    let mut theirs = support::bytes(0);
+    theirs[0] = b'Y';
+    write(&first, "file-000000", &ours);
+    write(&second, "file-000000", &theirs);
+    first.commit_captured(&CommitOptions::default()).unwrap();
+    let winning = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let conflict = second.commit_captured(&CommitOptions::default()).unwrap();
+    assert!(conflict.history.is_none());
+    assert_eq!(
+        second.pending_conflicts().unwrap(),
+        Some(vec!["/file-000000".into()])
+    );
+    let marker = read(&second, "file-000000");
+    assert!(String::from_utf8(marker.clone())
+        .unwrap()
+        .contains("<<<<<<< workspace"));
+    drop(first);
+    drop(second);
+    store.close_reader(id1).unwrap();
+    store.close_reader(id2).unwrap();
+    owner1.stop().unwrap();
+    owner2.stop().unwrap();
+
+    let recovered_owner = Owner::start(
+        &fixture.directory.join("cold-conflict-template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let service = Service::new(store.clone(), &recovered_owner);
+    let recovered = service
+        .recover_catalog(
+            &mut roster,
+            &recovered_owner,
+            &overlays,
+            [8; 32],
+            ProfileConfig::default(),
+            3,
+        )
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    let token = recovered[0];
+    assert_eq!(token.workspace, id2);
+    assert!(token.namespace > 2);
+    assert!(service
+        .operation(WorkspaceToken {
+            workspace: id2,
+            namespace: 2
+        })
+        .is_err());
+    let operation = service.operation(token).unwrap();
+    let readback = access_operation(&operation, |operation, view| {
+        let file = view
+            .lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000000").unwrap(),
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        view.read(operation.overlay(), file.serial, 0, 1024, &mut bytes)
+            .unwrap();
+        bytes
+    });
+    assert_eq!(readback, marker);
+    let dirty = service
+        .unmount_recorded(
+            &mut roster,
+            UnmountControl {
+                token,
+                discard: false,
+            },
+        )
+        .unwrap()
+        .reply;
+    assert!(
+        matches!(dirty, Reply::Dirty(report) if report.pending_merge && report.paths.contains(&"/file-000000".to_string()))
+    );
+    let refused = service
+        .execute_control(&Request::Commit(CommitControl {
+            token,
+            force: false,
+            message: None,
+        }))
+        .unwrap()
+        .reply;
+    assert!(
+        matches!(refused, Reply::Conflict(report) if report.markers && report.conflicts.iter().any(|c| c.path == "/file-000000"))
+    );
+    assert_eq!(
+        store
+            .history()
+            .branch_snapshot(fixture.branch)
+            .unwrap()
+            .unwrap(),
+        winning
+    );
+    access_operation(&operation, |operation, view| {
+        let file = view
+            .lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000000").unwrap(),
+            )
+            .unwrap();
+        let now = Time {
+            seconds: file.metadata.mtime_seconds,
+            nanoseconds: file.metadata.mtime_nanoseconds,
+        };
+        for change in [
+            Operation::SetAttributes {
+                serial: file.serial,
+                mode: None,
+                mtime: None,
+                size: Some(0),
+            },
+            Operation::Write {
+                serial: file.serial,
+                position: Position::At(0),
+                data: b"resolved\n".as_slice().into(),
+            },
+        ] {
+            let Outcome::Applied { publication, .. } = operation
+                .workspace()
+                .mutate(operation.overlay(), operation.ports(), view, change, now)
+                .unwrap()
+            else {
+                panic!("resolution was not applied")
+            };
+            operation.overlay().reply_attempted(publication).unwrap();
+        }
+    });
+    drop(operation);
+    let published = service
+        .execute_control(&Request::Commit(CommitControl {
+            token,
+            force: false,
+            message: None,
+        }))
+        .unwrap()
+        .reply;
+    assert!(matches!(
+        published,
+        Reply::Committed(_) | Reply::MergeCommitted(_)
+    ));
+    drop(service);
+    store.close_reader(id2).unwrap();
+    recovered_owner.stop().unwrap();
+    drop(roster);
+    drop(store);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: (i64, i64) = history
+        .query_row(
+            "SELECT count(*),count(DISTINCT attempt_id) FROM checkpoint_receipt",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipts, (2, 2));
+    drop(history);
+    fixture.cleanup();
+}
+
+#[test]
+fn catalog_conflict_paths_preserve_cross_page_utf8_order_and_duplicates() {
+    let fixture = support::Fixture::new_durable(1, "catalog-conflict-pages");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let snapshot = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let id = WorkspaceId::from_authority([44; 32]).unwrap();
+    let record = WorkspaceRecord {
+        workspace: id,
+        branch: fixture.branch,
+    };
+    let catalog = fixture.directory.join("pages-catalog");
+    let overlays = fixture.directory.join("pages-overlays");
+    for path in [&catalog, &overlays] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut roster = Roster::create(
+        &catalog,
+        Authority::for_catalog([8; 32], store.history()).unwrap(),
+    )
+    .unwrap();
+    roster.record(record).unwrap();
+    let path = overlays.join(record.overlay_name());
+    let db = Overlay::create_durable(&path, ProfileConfig::default(), id.to_bytes()).unwrap();
+    let root = snapshot.effective_root.to_bytes();
+    let original = layerfs_bridge::snapshot::encode(&snapshot).unwrap();
+    db.open_workspace(root).unwrap();
+    db.initialize_durable_binding(root, &original).unwrap();
+    db.initialize_durable_namespace(1).unwrap();
+    let recorded = db
+        .capture_recorded(
+            id.to_bytes(),
+            store.history().catalog_id().to_bytes(),
+            store.history().incarnation(),
+            &original,
+        )
+        .unwrap();
+    // The first length prefix and a UTF-8 code point each cross a page boundary.
+    let first = format!("/{}", "a".repeat(CONFLICT_PAGE_BYTES - 18));
+    let second = format!("{}中", "b".repeat(CONFLICT_PAGE_BYTES - 5));
+    let paths = vec![first.clone(), second, first];
+    let mut bytes = b"LFCM\x01".to_vec();
+    for value in &paths {
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    assert_eq!(
+        (5 + 8 + paths[0].len()) % CONFLICT_PAGE_BYTES,
+        CONFLICT_PAGE_BYTES - 4
+    );
+    assert_eq!(
+        (5 + 8 + paths[0].len() + 8 + paths[1].len() - "中".len()) % CONFLICT_PAGE_BYTES,
+        CONFLICT_PAGE_BYTES - 1
+    );
+    let mut digest = [0; 32];
+    for (number, page) in bytes.chunks(CONFLICT_PAGE_BYTES).enumerate() {
+        digest = conflict_page_digest(digest, number as u64, page).unwrap();
+    }
+    let stage = db
+        .begin_conflict_stage(
+            recorded,
+            ConflictStageInput {
+                local_root: root,
+                target_snapshot: &original,
+                paths_count: paths.len() as u64,
+                byte_count: bytes.len() as u64,
+                final_digest: digest,
+            },
+        )
+        .unwrap();
+    for (number, page) in bytes.chunks(CONFLICT_PAGE_BYTES).enumerate() {
+        db.append_conflict_page(stage, number as u64, page).unwrap();
+    }
+    db.install_recorded_conflict(stage, root, &original)
+        .unwrap();
+    let completion = ConflictCompletion {
+        stage,
+        marker_root: root,
+        target_snapshot: &original,
+        reader: None,
+        operation: None,
+    };
+    let mut cursor = MaintenanceCursor::default();
+    for _ in 0..512 {
+        if db.maintenance_idle().unwrap() {
+            break;
+        }
+        cursor = db
+            .maintain(cursor)
+            .unwrap()
+            .expect("maintenance stalled")
+            .cursor;
+    }
+    assert!(db.maintenance_idle().unwrap());
+    assert!(db.conflict_checkpoint_cleanup_ready(completion).unwrap());
+    db.finish_conflict_checkpoint_cleanup(completion).unwrap();
+    drop(db);
+
+    let mut records = Vec::new();
+    roster.visit(|entry| records.push(entry)).unwrap();
+    assert_eq!(records, [record]);
+    let request = BindRequest {
+        workspace: id,
+        branch: fixture.branch,
+    };
+    let prepared = store
+        .prepare_catalog_recovery(&path, ProfileConfig::default(), request.clone())
+        .unwrap();
+    records.clear();
+    roster.visit(|entry| records.push(entry)).unwrap();
+    assert_eq!(records, [record]);
+    let (recovered, proof) = prepared.activate(2).unwrap();
+    let owner = Owner::start(
+        &fixture.directory.join("pages-template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 1 },
+    )
+    .unwrap();
+    let client = owner.adopt_durable(recovered).unwrap();
+    let bound = store
+        .bind_catalog_recovery(client, request, proof)
+        .unwrap()
+        .workspace;
+    assert_eq!(bound.identity(), id);
+    assert!(bound.route().namespace() > 1);
+    assert_eq!(bound.pending_conflicts().unwrap(), Some(paths));
+    drop(bound);
+    store.close_reader(id).unwrap();
+    owner.stop().unwrap();
+    drop(roster);
+    drop(store);
+    fixture.cleanup();
 }
 fn read(workspace: &BoundWorkspace, name: &str) -> Vec<u8> {
     access(workspace, |operation, view| {

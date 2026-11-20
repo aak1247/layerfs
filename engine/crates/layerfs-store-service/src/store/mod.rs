@@ -1,6 +1,7 @@
 //! In-process Store ports shared by one daemon's Workspaces.
 pub mod bind;
 pub mod captured;
+mod catalog_recovery;
 mod checkpoint;
 pub mod checkpoint_receipt;
 pub mod commit;
@@ -25,6 +26,10 @@ pub use commit_merge::{Stale, StaleError, LANE_MERGE_PATHS};
 pub use hints::record_new_bindings;
 pub use hints::CatalogHints;
 
+pub use catalog_recovery::{
+    CatalogActivationFailure, CatalogPreparationFailure, PreparedCatalogRecovery,
+    RecoveredCatalogBinding, RetainedCatalogPreparation, RetainedCatalogRecovery,
+};
 pub use checkpoint_receipt::{check_checkpoint_outcome, CheckpointObservation, OriginalCheckpoint};
 pub use commit_types::{
     CapturedConstruction, CommitError, CommitFailure, CommitOptions, CommitPhase, CommitSuccess,

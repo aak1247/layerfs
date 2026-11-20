@@ -351,7 +351,14 @@ impl Owner {
 }
 
 fn admission(spec: &DurableWorkspace<'_>) -> Result<[u8; 32], OwnerError> {
-    if spec.namespace <= 0 || spec.identity == [0; 32] {
+    catalog_incarnation(spec.namespace, spec.identity)
+}
+
+pub(crate) fn catalog_incarnation(
+    namespace: i64,
+    identity: [u8; 32],
+) -> Result<[u8; 32], OwnerError> {
+    if namespace <= 0 || identity == [0; 32] {
         return Err(OwnerError::InvalidAdmission);
     }
     // A new process can reuse an engine number, so use a fresh unpredictable
@@ -380,15 +387,32 @@ impl OwnerClient {
     /// Reads the saved snapshot without selecting a current Branch head.
     pub fn durable_snapshot(&self) -> Result<layerfs_history::BranchSnapshot, OwnerError> {
         let route = self.bound_route()?;
-        let (bytes, root) = self.call(route, crate::ServiceClass::General, None, |db| {
-            Ok((db.durable_binding()?, db.state()?.base_root))
-        })?;
+        let (bytes, root, conflict) =
+            self.call(route, crate::ServiceClass::General, None, |db| {
+                Ok((
+                    db.durable_binding()?,
+                    db.state()?.base_root,
+                    db.settled_conflict()?,
+                ))
+            })?;
         let bytes = bytes.ok_or(OwnerError::Overlay(OverlayError::Invalid(
             "durable binding is absent",
         )))?;
         let snapshot =
             layerfs_bridge::snapshot::decode(&bytes).map_err(OwnerError::BindingCodec)?;
-        if snapshot.effective_root.to_bytes() != root {
+        let valid = match conflict {
+            None => snapshot.effective_root.to_bytes() == root,
+            Some(conflict) => {
+                conflict.workspace
+                    == self
+                        .durable_identity()?
+                        .ok_or(OwnerError::InvalidAdmission)?
+                    && conflict.previous_namespace == route.namespace()
+                    && conflict.marker_root == root
+                    && conflict.target_snapshot == bytes
+            }
+        };
+        if !valid {
             return Err(OwnerError::Overlay(OverlayError::Invalid(
                 "durable binding root",
             )));
@@ -457,6 +481,41 @@ fn bind(
     // This fresh Shared has no published readers or disposable Backing fd.
     shared.route.set(route).map_err(|_| OwnerError::Stopped)?;
     shared.state.lock().map_err(|_| OwnerError::Stopped)?.db = Some(Box::new(db));
+    Ok(Owner {
+        client: OwnerClient {
+            context: Context::Workspace(shared),
+        },
+        profile,
+    })
+}
+
+/// Only StoreService calls this after the same leased catalog observation was
+/// checked against its actual Store. Preserve the original database on error.
+pub(crate) fn bind_catalog_overlay(
+    db: Overlay,
+    namespace: i64,
+    identity: [u8; 32],
+    incarnation: [u8; 32],
+) -> Result<Owner, (OwnerError, Overlay)> {
+    if namespace <= 0 || identity == [0; 32] || incarnation == [0; 32] {
+        return Err((OwnerError::InvalidAdmission, db));
+    }
+    let route = match Route::new(namespace, db.engine(), incarnation) {
+        Ok(route) => route,
+        Err(error) => return Err((OwnerError::Overlay(error), db)),
+    };
+    let profile = db.profile().clone();
+    let shared = Arc::new(Shared::durable(namespace, identity, false));
+    if shared.route.set(route).is_err() {
+        return Err((OwnerError::Stopped, db));
+    }
+    {
+        let mut state = match shared.state.lock() {
+            Ok(value) => value,
+            Err(_) => return Err((OwnerError::Stopped, db)),
+        };
+        state.db = Some(Box::new(db));
+    }
     Ok(Owner {
         client: OwnerClient {
             context: Context::Workspace(shared),

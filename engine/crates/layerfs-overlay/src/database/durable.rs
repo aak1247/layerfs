@@ -388,6 +388,23 @@ mod linux {
         config: ProfileConfig,
         identity: [u8; 32],
     ) -> OverlayResult<Overlay> {
+        recover_with(path, config, identity, false)
+    }
+
+    pub(crate) fn recover_for_catalog(
+        path: &Path,
+        config: ProfileConfig,
+        identity: [u8; 32],
+    ) -> OverlayResult<Overlay> {
+        recover_with(path, config, identity, true)
+    }
+
+    fn recover_with(
+        path: &Path,
+        config: ProfileConfig,
+        identity: [u8; 32],
+        settled_conflict: bool,
+    ) -> OverlayResult<Overlay> {
         let path = validate(path, config, &identity)?;
         let mut lease = Lease::acquire(&path, &identity, false)?;
         let file = OpenOptions::new()
@@ -541,7 +558,8 @@ mod linux {
             || held
             || pending
             || pending_attempt
-            || pending_conflict
+            || (pending_conflict && !settled_conflict)
+            || (pending_conflict && settled_conflict && (profile.schema_version != 44 || !bound))
         {
             return Err(OverlayError::Invalid(
                 "durable overlay requires reconciliation",
@@ -591,6 +609,17 @@ mod linux {
         }
         if db.profile.has_classified_custody() {
             super::super::durable_kept::restore(&db, state.active.0, bound, kept_count)?;
+        }
+        if settled_conflict && pending_conflict {
+            if super::super::durable_conflict_stage::active_conflict(&db)?.is_none() {
+                return Err(OverlayError::Invalid("settled conflict binding is absent"));
+            }
+            let extra:Vec<(bool,bool)>=db.query(StatementKind::Startup,
+                "SELECT EXISTS(SELECT 1 FROM durable_conflict_plan WHERE state<>1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13)",
+                &[],16,|row|Ok((row.get(0)?,row.get(1)?)))?;
+            if extra.as_slice() != [(false, false)] {
+                return Err(OverlayError::Invalid("settled conflict has pending work"));
+            }
         }
         Ok(db)
     }
@@ -675,7 +704,7 @@ impl Lease {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{create, recover};
+pub(crate) use linux::{create, recover, recover_for_catalog};
 
 #[cfg(not(target_os = "linux"))]
 pub(super) fn create(_: &Path, _: ProfileConfig, _: [u8; 32]) -> OverlayResult<Overlay> {
@@ -684,5 +713,14 @@ pub(super) fn create(_: &Path, _: ProfileConfig, _: [u8; 32]) -> OverlayResult<O
 
 #[cfg(not(target_os = "linux"))]
 pub(super) fn recover(_: &Path, _: ProfileConfig, _: [u8; 32]) -> OverlayResult<Overlay> {
+    Err(OverlayError::UnsupportedPlatform)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn recover_for_catalog(
+    _: &Path,
+    _: ProfileConfig,
+    _: [u8; 32],
+) -> OverlayResult<Overlay> {
     Err(OverlayError::UnsupportedPlatform)
 }

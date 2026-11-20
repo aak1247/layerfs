@@ -10,7 +10,10 @@ use crate::{
 use layerfs_bridge::control::WorkspaceToken;
 use layerfs_history::BranchSnapshot;
 use layerfs_overlay::ProfileConfig;
-use layerfs_store_service::DurableAdmissionFailure;
+use layerfs_store_service::{
+    store::{CatalogActivationFailure, CatalogPreparationFailure, RetainedCatalogPreparation},
+    DurableAdmissionFailure,
+};
 use std::{fmt, path::Path};
 
 /// The exact operation that stopped this original recovery attempt.
@@ -32,6 +35,19 @@ pub enum CatalogRecoveryCause {
     Open {
         record: WorkspaceRecord,
         cause: OwnerError,
+    },
+    Prepare {
+        record: WorkspaceRecord,
+        failure: Box<CatalogPreparationFailure>,
+    },
+    PreparedDiscovery {
+        record: WorkspaceRecord,
+        cause: RosterError,
+        retained: RetainedCatalogPreparation,
+    },
+    Activate {
+        record: WorkspaceRecord,
+        failure: Box<CatalogActivationFailure>,
     },
     Unadmitted {
         record: WorkspaceRecord,
@@ -134,20 +150,54 @@ impl Service {
         let mut next = minimum_namespace.max(floor);
         for record in records {
             let path = overlay_directory.join(record.overlay_name());
-            let (recovered, snapshot) = match Owner::recover_recorded_next(
-                &path,
-                profile,
-                record.workspace.to_bytes(),
-                next,
-            ) {
-                Ok(recovered) => recovered,
-                Err(cause) => {
+            let request = BindRequest {
+                workspace: record.workspace,
+                branch: record.branch,
+            };
+            let prepared =
+                match self
+                    .store
+                    .prepare_catalog_recovery(&path, profile, request.clone())
+                {
+                    Ok(value) => value,
+                    Err(failure) => match *failure {
+                        CatalogPreparationFailure::Open(cause) => {
+                            return Err(failed(
+                                CatalogRecoveryCause::Open { record, cause },
+                                completed,
+                            ))
+                        }
+                        other => {
+                            return Err(failed(
+                                CatalogRecoveryCause::Prepare {
+                                    record,
+                                    failure: Box::new(other),
+                                },
+                                completed,
+                            ))
+                        }
+                    },
+                };
+            if let Err(cause) = catalog.check_live() {
+                return Err(failed(
+                    CatalogRecoveryCause::PreparedDiscovery {
+                        record,
+                        cause,
+                        retained: prepared.retain(),
+                    },
+                    completed,
+                ));
+            }
+            let (recovered, proof) = match prepared.activate(next) {
+                Ok(value) => value,
+                Err(failure) => {
                     return Err(failed(
-                        CatalogRecoveryCause::Open { record, cause },
+                        CatalogRecoveryCause::Activate { record, failure },
                         completed,
                     ))
                 }
             };
+            let snapshot = proof.snapshot().clone();
             let route = match recovered.client().bound_route() {
                 Ok(route) => route,
                 Err(cause) => {
@@ -207,14 +257,7 @@ impl Service {
                     completed,
                 ));
             }
-            let binding = match self.store.bind_durable(
-                client,
-                BindRequest {
-                    workspace: record.workspace,
-                    branch: record.branch,
-                },
-                snapshot,
-            ) {
+            let binding = match self.store.bind_catalog_recovery(client, request, proof) {
                 Ok(bound) => bound.workspace,
                 Err(failure) => {
                     return Err(failed(
