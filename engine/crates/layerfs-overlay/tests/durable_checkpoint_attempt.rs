@@ -2,7 +2,8 @@
 #![cfg(target_os = "linux")]
 
 use layerfs_overlay::{
-    Changes, CleanupState, Inode, InodeKind, Overlay, OverlayError, ProfileConfig,
+    Changes, CleanupState, Inode, InodeKind, MaintenanceCursor, Overlay, OverlayError,
+    ProfileConfig,
 };
 use std::{
     fs,
@@ -246,6 +247,7 @@ fn publication_intent_is_frozen_once_for_the_original_capture() {
     ));
     assert!(db.install_recorded(capture, candidate, target).is_err());
     assert!(db.resolve_failed_capture(capture).is_err());
+    assert!(db.fold_unpublished_checkpoint(recorded).is_err());
     drop(db);
 
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
@@ -540,4 +542,140 @@ fn changed_operation_link_retains_the_original_owner_and_cleanup() {
         [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ).unwrap();
     assert_eq!((released, owners, cleanup), (0, 1, 0));
+}
+
+#[test]
+fn prepublication_fold_retains_later_writes_and_original_custody() {
+    let fixture = Fixture::new();
+    let db = fixture.create();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, request)
+        .unwrap();
+    let operation = db
+        .acquire_recorded_captured_operation(recorded, request, reader)
+        .unwrap();
+    let source = db.acquire_base_source(99).unwrap();
+    let publication = db
+        .apply(
+            source,
+            &Changes {
+                inodes: vec![Inode {
+                    serial: 61,
+                    kind: InodeKind::File,
+                    mode: 0o600,
+                    mtime_seconds: 20,
+                    mtime_nanoseconds: 987_654_321,
+                    nlink: 1,
+                    size: 0,
+                    inherited_cutoff: 0,
+                    born: 0,
+                    entries: 0,
+                    subdirs: 0,
+                }],
+                ..Changes::default()
+            },
+        )
+        .unwrap();
+    db.reply_attempted(publication).unwrap();
+    db.release_base_source(source).unwrap();
+    db.fold_unpublished_checkpoint(recorded).unwrap();
+    assert!(db.capture().is_err());
+    assert!(db.fold_unpublished_checkpoint(recorded).is_err());
+    db.release_captured_reader(reader).unwrap();
+    db.release_operation(operation).unwrap();
+    let mut cursor = MaintenanceCursor::default();
+    for _ in 0..256 {
+        if db.maintenance_idle().unwrap() {
+            break;
+        }
+        cursor = db
+            .maintain(cursor)
+            .unwrap()
+            .expect("ready maintenance stalled")
+            .cursor;
+    }
+    assert!(db.maintenance_idle().unwrap());
+    let inodes = db.active_inodes(0).unwrap();
+    assert_eq!(
+        inodes.iter().map(|inode| inode.serial).collect::<Vec<_>>(),
+        vec![60, 61]
+    );
+    assert_eq!(inodes[1].mtime_nanoseconds, 987_654_321);
+    assert!(db.capture().is_err());
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let row: (i64, i64, i64) = sql.query_row(
+        "SELECT phase,reader_released,operation_released FROM durable_checkpoint_attempt WHERE id=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(row, (3, 1, 1));
+    drop(sql);
+    assert!(
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).is_err()
+    );
+}
+
+#[test]
+fn failed_fold_schedule_rolls_back_phase_and_original_capture() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch("CREATE TRIGGER fail_checkpoint_fold BEFORE INSERT ON cleanup_task WHEN NEW.kind=1 BEGIN SELECT RAISE(ABORT, 'fold failure'); END;").unwrap();
+    drop(sql);
+    let db =
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let before = db.state().unwrap();
+    assert!(db.fold_unpublished_checkpoint(recorded).is_err());
+    assert_eq!(db.state().unwrap(), before);
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let (phase, folds): (i64, i64) = sql.query_row(
+        "SELECT phase,(SELECT count(*) FROM cleanup_task WHERE kind=1) FROM durable_checkpoint_attempt WHERE id=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!((phase, folds), (1, 0));
+}
+
+#[test]
+fn changed_reader_floor_cannot_release_during_scheduled_fold() {
+    let fixture = Fixture::new();
+    fixture.create().close_database().unwrap();
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    sql.execute_batch("CREATE TRIGGER alter_fold_floor AFTER UPDATE OF phase ON durable_checkpoint_attempt WHEN NEW.phase=3 BEGIN UPDATE durable_checkpoint_attempt SET reader_floor=0 WHERE id=1; END;").unwrap();
+    drop(sql);
+    let db =
+        Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
+    let earlier = db.capture().unwrap();
+    db.install_recorded(earlier, ROOT, SNAPSHOT).unwrap();
+    let recorded = db
+        .capture_recorded(WORKSPACE, CATALOG, 12, SNAPSHOT)
+        .unwrap();
+    let request = u64::try_from(recorded.capture().generation.number()).unwrap();
+    let reader = db
+        .acquire_recorded_captured_reader(recorded, request)
+        .unwrap();
+    assert_eq!(reader.installed_floor(), 1);
+    db.fold_unpublished_checkpoint(recorded).unwrap();
+    assert!(matches!(
+        db.release_captured_reader(reader),
+        Err(OverlayError::Invalid("checkpoint fold state"))
+    ));
+    assert_eq!(db.retained_captured_reader(request).unwrap(), Some(reader));
+    drop(db);
+    let sql = rusqlite::Connection::open(fixture.path()).unwrap();
+    let row: (i64, i64, i64) = sql
+        .query_row(
+            "SELECT phase,reader_floor,reader_released FROM durable_checkpoint_attempt WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (3, 0, 0));
 }

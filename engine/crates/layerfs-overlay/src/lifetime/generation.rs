@@ -133,6 +133,11 @@ impl Overlay {
         })
     }
     fn capture_inner(&self) -> OverlayResult<Capture> {
+        if crate::database::durable_attempt::pending(self)? {
+            return Err(OverlayError::Invalid(
+                "recorded capture requires disposition",
+            ));
+        }
         let state = self.live()?;
         if state.captured.is_some() {
             return Err(OverlayError::CaptureInFlight);
