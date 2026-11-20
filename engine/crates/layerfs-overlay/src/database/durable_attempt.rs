@@ -3,6 +3,7 @@ use crate::{
     Capture, CapturedReader, CheckpointOutcome, OperationOwner, Overlay, OverlayError,
     OverlayResult, RecordedCapture, StatementKind,
 };
+type PublicationRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 #[cfg(target_os = "linux")]
 pub(super) const CHECKPOINT_SCHEMA: &str = "CREATE TABLE durable_checkpoint_attempt(\
@@ -298,11 +299,11 @@ pub(super) fn check_context(
     let pending = original
         .pending_digest
         .as_deref()
-        .map(|v| <&[u8; 32]>::try_from(v))
+        .map(<&[u8; 32]>::try_from)
         .transpose()
         .map_err(|_| OverlayError::Invalid("checkpoint pending identity"))?;
     let active = super::durable_conflict_stage::active_conflict(db)?;
-    if matches!(original.phase, 1 | 2 | 3) {
+    if matches!(original.phase, 1..=3) {
         if active.as_ref().map(|c| c.digest).as_ref() != pending
             || active.as_ref().is_some_and(|c| {
                 c.workspace != original.workspace
@@ -644,7 +645,7 @@ impl Overlay {
             if !self.install_ready(recorded.capture)? {
                 return Err(OverlayError::BaseSourcesPending);
             }
-            let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = self.query(
+            let rows: Vec<PublicationRow> = self.query(
                 StatementKind::Frontier,
                 "SELECT request,request_digest,candidate_root,target_snapshot FROM durable_checkpoint_attempt \
                  WHERE id=1 AND phase=2 AND attempt=?1 AND namespace=?2",

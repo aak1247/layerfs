@@ -118,12 +118,10 @@ impl Overlay {
         {
             return Err(OverlayError::Invalid("conflict cleanup predecessor"));
         }
-        if item.phase == 0 {
-            if self.execute(StatementKind::Frontier,
+        if item.phase == 0 && self.execute(StatementKind::Frontier,
                 "UPDATE durable_checkpoint_attempt SET conflict_cleanup_completed=1 WHERE id=1 AND attempt=?1 AND generation=?2 AND phase=3 AND conflict_generation=?2 AND conflict_cleanup_completed=0",
                 &[&attempt,&generation],40)?!=1 {
                 return Err(OverlayError::Invalid("conflict cleanup owner"));
-            }
         }
         self.finish_item(item)?;
         Ok((0, 0, true))

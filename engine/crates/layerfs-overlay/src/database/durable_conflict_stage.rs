@@ -3,6 +3,9 @@ use crate::{
     conflict_page_digest, ConflictStage, ConflictStageInput, Overlay, OverlayError, OverlayResult,
     RecordedCapture, StatementKind, CONFLICT_PAGE_BYTES,
 };
+type BindingRow = (Vec<u8>, Vec<u8>, bool, Option<i64>, Option<Vec<u8>>);
+type SuccessorRow = (Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>, Vec<u8>, i64);
+type StagingRow = (Option<i64>, Option<i64>, bool, bool, bool);
 
 struct Plan {
     attempt: Vec<u8>,
@@ -97,7 +100,7 @@ pub(crate) fn active_conflict(db: &Overlay) -> OverlayResult<Option<ActiveConfli
     if db.profile.schema_version != 44 {
         return Ok(None);
     }
-    let binding: Vec<(Vec<u8>, Vec<u8>, bool, Option<i64>, Option<Vec<u8>>)> = db.query(
+    let binding: Vec<BindingRow> = db.query(
         StatementKind::Frontier,
         "SELECT root,snapshot,recoverable,conflict_generation,conflict_digest FROM durable_binding WHERE id=1",
         &[], 128, |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
@@ -193,7 +196,7 @@ pub(crate) fn check_retired_active(
     let namespace = db
         .durable_namespace()?
         .ok_or(OverlayError::Invalid("conflict namespace"))?;
-    let successor: Vec<(Vec<u8>,i64,Option<Vec<u8>>,Vec<u8>,Vec<u8>,i64)> = db.query(
+    let successor: Vec<SuccessorRow> = db.query(
         StatementKind::Reclaim,
         "SELECT attempt,phase,original_pending_digest,workspace,catalog,incarnation FROM durable_checkpoint_attempt WHERE id=1 AND generation=?1",
         &[&next_generation],
@@ -238,7 +241,7 @@ pub(crate) fn require_no_stage(db: &Overlay, recorded: RecordedCapture) -> Overl
     if db.profile.schema_version != 44 {
         return Ok(());
     }
-    let rows: Vec<(Option<i64>, Option<i64>, bool, bool, bool)> = db.query(
+    let rows: Vec<StagingRow> = db.query(
         StatementKind::Frontier,
         "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND phase=1",
         &[&recorded.capture.generation.0, &recorded.attempt.as_slice()], 24,
@@ -260,7 +263,7 @@ pub(crate) fn cleanup_ready(
         return Ok(true);
     }
     let generation = recorded.capture.generation.0;
-    let rows:Vec<(Option<i64>,Option<i64>,bool,bool,bool)>=db.query(StatementKind::Reclaim,
+    let rows:Vec<StagingRow>=db.query(StatementKind::Reclaim,
         "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND phase=?3",
         &[&generation,&recorded.attempt.as_slice(),&phase],40,
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
@@ -469,7 +472,7 @@ pub(crate) fn retire_staging(
         return Ok(());
     }
     let generation = recorded.capture.generation.0;
-    let rows:Vec<(Option<i64>,Option<i64>,bool,bool,bool)>=db.query(StatementKind::Frontier,
+    let rows:Vec<StagingRow>=db.query(StatementKind::Frontier,
         "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND namespace=?3 AND phase=1",
         &[&generation,&recorded.attempt.as_slice(),&namespace],40,|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     match rows.as_slice() {
