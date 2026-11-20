@@ -5,7 +5,7 @@ use crate::{
 
 impl Overlay {
     pub(crate) fn clean_conflict_pages(&self, item: &Item) -> OverlayResult<(u64, u64, bool)> {
-        if self.profile().schema_version != 44
+        if !self.profile().has_durable_conflict()
             || item.resource != 0
             || item.target <= 0
             || item.cursor < 0

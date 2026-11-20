@@ -254,7 +254,7 @@ fn legacy_schema_40_keeps_its_binding_without_a_namespace_conversion() {
 fn namespace_requires_initialization_and_strictly_increases() {
     let fixture = Fixture::new();
     let db = create(&fixture.path());
-    assert_eq!(db.profile().schema_version, 44);
+    assert_eq!(db.profile().schema_version, 45);
     assert_eq!(db.durable_namespace().unwrap(), None);
     assert!(db.advance_durable_namespace(1).is_err());
     db.initialize_durable_namespace(7).unwrap();

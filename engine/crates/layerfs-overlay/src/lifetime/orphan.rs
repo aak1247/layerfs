@@ -1,11 +1,7 @@
 //! Independent mutable orphan domain and its exact immutable inheritance root.
 use crate::{
-    db::integer,
-    inode,
-    layers::Layer,
-    maintenance::{ORPHAN, SERIAL_RETIRE},
-    sql, FileRead, Inode, LocalRead, Overlay, OverlayError, OverlayResult, StatementKind,
-    WorkspaceState,
+    db::integer, inode, layers::Layer, maintenance::ORPHAN, sql, FileRead, Inode, LocalRead,
+    Overlay, OverlayError, OverlayResult, StatementKind, WorkspaceState,
 };
 pub(crate) const DOMAIN: i64 = -1;
 #[derive(Clone, Copy)]
@@ -13,6 +9,16 @@ pub(crate) struct Orphan {
     pub root: [u8; 32],
     pub top: i64,
     pub floor: i64,
+}
+
+/// The exact predecessor of an orphan's lower-layer release.
+#[derive(Clone, Copy)]
+pub(crate) struct ReleasedLayer {
+    pub generation: i64,
+    pub before: Orphan,
+    pub after: i64,
+    pub active: i64,
+    pub revision: i64,
 }
 impl Orphan {
     /// Whether the orphan still reads generation `gen` of its serial.
@@ -71,7 +77,7 @@ impl Overlay {
         let (holders, users) = (refs.total(), refs.opens + refs.readers);
         if holders == 0 {
             // Nothing holds the file: its active layer retires directly.
-            return self.enqueue(SERIAL_RETIRE, serial, state.active.0);
+            return crate::database::durable_serial_retirement::last_unlink(self, serial, state);
         }
         // The orphan holds its lower layers, whose retirement is queued by
         // the step that releases each of them.
@@ -131,7 +137,8 @@ impl Overlay {
         serial: i64,
         gen: i64,
         next: i64,
-    ) -> OverlayResult<()> {
+    ) -> OverlayResult<ReleasedLayer> {
+        let workspace = self.state()?;
         let mut state = self.open.borrow_mut();
         state.waits.remove((gen, serial));
         let mut orphan = state
@@ -140,12 +147,19 @@ impl Overlay {
             .get(&serial)
             .copied()
             .ok_or(OverlayError::Stale)?;
-        let previous = orphan.top;
+        let before = orphan;
+        let previous = before.top;
         orphan.top = next;
         state.orphans.put(serial, orphan);
         drop(state);
         crate::database::durable_owners::advance_orphan(self, serial, previous, next)?;
-        Ok(())
+        Ok(ReleasedLayer {
+            generation: gen,
+            before,
+            after: next,
+            active: workspace.active.0,
+            revision: workspace.revision,
+        })
     }
     /// One current descriptor-read window. Its independent reader/source
     /// reference survives descriptor close and protects base demand outside SQL.

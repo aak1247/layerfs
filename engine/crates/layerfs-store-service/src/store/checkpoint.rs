@@ -71,14 +71,17 @@ impl BoundWorkspace {
             if identity != self.identity.to_bytes() {
                 return Err(CommitError::Context("checkpoint Workspace identity"));
             }
-            let version = self
+            let (recorded, version) = self
                 .job(|client, route| {
                     client.call(route, ServiceClass::General, None, |db| {
-                        Ok(db.profile().schema_version)
+                        Ok((
+                            db.profile().has_recorded_checkpoints(),
+                            db.profile().schema_version,
+                        ))
                     })
                 })
                 .map_err(CommitError::Owner)?;
-            if matches!(version, 43 | 44) {
+            if recorded {
                 if !self.store.has_durable_writer() {
                     return Err(CommitError::History(HistoryError::Unsupported(
                         "checkpoint receipt requires durable Store",

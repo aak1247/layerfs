@@ -124,7 +124,7 @@ pub(crate) fn record(
         snapshot,
         pending.as_ref(),
     );
-    let statement = if db.profile.schema_version == 44 {
+    let statement = if db.profile.has_durable_conflict() {
         "INSERT INTO durable_checkpoint_attempt(id,attempt,workspace,catalog,incarnation,namespace,generation,revision,base_root,snapshot,original_pending_digest,phase) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)"
     } else {
         "INSERT INTO durable_checkpoint_attempt(id,attempt,workspace,catalog,incarnation,namespace,generation,revision,base_root,snapshot,phase) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,1)"
@@ -145,7 +145,7 @@ pub(crate) fn record(
         &base_bytes,
         &snapshot,
     ];
-    if db.profile.schema_version == 44 {
+    if db.profile.has_durable_conflict() {
         args.push(&pending_bytes);
     }
     db.execute(
@@ -218,7 +218,7 @@ pub(super) fn check_context(
         .durable_namespace()?
         .filter(|value| *value > 0)
         .ok_or(OverlayError::Invalid("recorded capture namespace"))?;
-    let sql = if db.profile.schema_version == 44 {
+    let sql = if db.profile.has_durable_conflict() {
         "SELECT workspace,catalog,incarnation,snapshot,phase,reader_floor,candidate_root,installed_snapshot,original_pending_digest FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND generation=?3 AND revision=?4 AND base_root=?5"
     } else {
         "SELECT workspace,catalog,incarnation,snapshot,phase,reader_floor,candidate_root,installed_snapshot,NULL FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND generation=?3 AND revision=?4 AND base_root=?5"
@@ -253,7 +253,7 @@ pub(super) fn check_context(
     };
     if (starting && original.phase != 1)
         || (!starting && ![1, 2, 3, 4, 5, 6].contains(&original.phase))
-        || (matches!(original.phase, 5 | 6) && db.profile.schema_version != 44)
+        || (matches!(original.phase, 5 | 6) && !db.profile.has_durable_conflict())
     {
         return Err(OverlayError::Invalid("checkpoint publication predecessor"));
     }

@@ -318,6 +318,9 @@ pub(super) fn verify_schema(db: &Overlay) -> OverlayResult<()> {
             return Err(OverlayError::Invalid("durable conflict schema identity"));
         }
     }
+    if db.profile.has_serial_retirement_origin() {
+        super::durable_serial_retirement::verify_schema(db)?;
+    }
     Ok(())
 }
 

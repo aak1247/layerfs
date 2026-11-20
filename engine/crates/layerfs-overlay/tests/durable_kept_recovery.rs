@@ -84,7 +84,7 @@ fn settle_maintenance(db: &Overlay) {
 
 fn with_kept(fixture: &Fixture) -> Overlay {
     let db = Overlay::create_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
-    assert_eq!(db.profile().schema_version, 44);
+    assert_eq!(db.profile().schema_version, 45);
     db.open_workspace(ROOT).unwrap();
     db.initialize_durable_binding(ROOT, b"original snapshot")
         .unwrap();

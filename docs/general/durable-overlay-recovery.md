@@ -65,7 +65,7 @@ schema-41-and-newer high-water mark while holding the original file lease. Its c
 supplies a minimum and must serialize it with all other live Workspace routes;
 legacy schemas lack this evidence and are refused by that method.
 
-New durable overlays use schema 44. An explicitly fenced `Service::recover_catalog`
+New durable overlays use schema 45. An explicitly fenced `Service::recover_catalog`
 can reopen a settled active local conflict while retaining the original Overlay
 lease and namespace. It checks the original roster record, Store catalog and
 incarnation, historical Branch snapshot, marker root and complete ordered path
@@ -77,7 +77,7 @@ consumers have stopped. Nonprivileged request-adapter tests exercise the bound
 Store and Overlay barriers for a live conflict and a separately reconstructed
 cold conflict; a physical FUSE mount and Sandbox recovery remain unverified.
 
-The catalog opening path can also reconcile a schema-44 recorded checkpoint
+The catalog opening path can also reconcile a schema-44 or schema-45 recorded checkpoint
 under its original lease when its capture and classified reader and operation
 ownership match exactly and no conflict or other unknown custody is present.
 It authenticates the original Store, Workspace, Branch and frozen request; an
@@ -91,6 +91,15 @@ attempt and verifies its recorded phase. Nonprivileged tests cover actual Store
 receipts and definite nonpublication after an injected release failure, using
 the same Store handle and original Workspace; a physical crash, FUSE mount,
 orphan custody and full Store restart remain to be verified.
+
+Schema 45 additionally records the original last-unlink or orphan-layer release
+identity in the serial-retirement queue item in the same transaction as that
+event. Its Workspace, namespace, generation, original root and layer frontier
+are immutable while the item remains queued. An absent namespace remains an
+unqualified local fact. This record does not by itself authorize recovery:
+ordinary reopen still retains and refuses orphan custody and serial-retirement
+work. Schema 44 remains readable with its original behavior and is not silently
+upgraded; its older queue items cannot be assigned a new origin after the fact.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

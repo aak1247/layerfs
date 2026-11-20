@@ -92,7 +92,7 @@ impl Overlay {
     }
 
     fn require_recorded_ready_details(&self) -> OverlayResult<()> {
-        if self.profile.schema_version == 44 {
+        if self.profile.has_durable_conflict() {
             super::durable_conflict::verify_schema(self)?;
             let pending = self.query(
                 StatementKind::Frontier,
@@ -121,7 +121,7 @@ impl Overlay {
         expected: &ConflictSyncIdentity<'_>,
     ) -> OverlayResult<()> {
         self.require_bound_ready()?;
-        if self.profile.schema_version != 44 {
+        if !self.profile.has_durable_conflict() {
             return Err(OverlayError::Invalid(
                 "durable conflict synchronization identity",
             ));

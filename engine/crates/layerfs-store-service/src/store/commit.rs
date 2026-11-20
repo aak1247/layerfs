@@ -417,14 +417,14 @@ impl BoundWorkspace {
                         .unwrap_or_default(),
                 };
                 if let Some(recorded) = retained.recorded {
-                    let version = self
+                    let conflict_format = self
                         .job(|client, route| {
                             client.call(route, crate::ServiceClass::General, None, |db| {
-                                Ok(db.profile().schema_version)
+                                Ok(db.profile().has_durable_conflict())
                             })
                         })
                         .map_err(CommitError::Owner)?;
-                    if version != 44 {
+                    if !conflict_format {
                         return Err(CommitError::Context(
                             "recorded local conflict disposition is not available",
                         ));

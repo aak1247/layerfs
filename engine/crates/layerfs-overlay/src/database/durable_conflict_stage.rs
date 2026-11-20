@@ -97,7 +97,7 @@ fn read_plan(db: &Overlay, generation: i64) -> OverlayResult<Plan> {
 /// Staging made each page immutable and proved the complete chain; cold bind
 /// must independently read and validate that chain before exposing a view.
 pub(crate) fn active_conflict(db: &Overlay) -> OverlayResult<Option<ActiveConflict>> {
-    if db.profile.schema_version != 44 {
+    if !db.profile.has_durable_conflict() {
         return Ok(None);
     }
     let binding: Vec<BindingRow> = db.query(
@@ -229,7 +229,7 @@ pub(crate) fn check_retired_active(
 }
 
 fn require_format(db: &Overlay) -> OverlayResult<()> {
-    if db.durable.is_none() || db.profile.schema_version != 44 {
+    if db.durable.is_none() || !db.profile.has_durable_conflict() {
         return Err(OverlayError::Invalid("conflict staging format"));
     }
     Ok(())
@@ -245,7 +245,7 @@ pub(crate) fn require_no_stage(
     if !matches!(phase, 1 | 2) {
         return Err(OverlayError::Invalid("checkpoint staging phase"));
     }
-    if db.profile.schema_version != 44 {
+    if !db.profile.has_durable_conflict() {
         return Ok(());
     }
     let rows: Vec<StagingRow> = db.query(
@@ -266,7 +266,7 @@ pub(crate) fn cleanup_ready(
     recorded: RecordedCapture,
     phase: i64,
 ) -> OverlayResult<bool> {
-    if db.profile.schema_version != 44 {
+    if !db.profile.has_durable_conflict() {
         return Ok(true);
     }
     let generation = recorded.capture.generation.0;
@@ -475,7 +475,7 @@ pub(crate) fn retire_staging(
     recorded: RecordedCapture,
     namespace: i64,
 ) -> OverlayResult<()> {
-    if db.profile.schema_version != 44 {
+    if !db.profile.has_durable_conflict() {
         return Ok(());
     }
     let generation = recorded.capture.generation.0;

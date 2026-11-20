@@ -66,10 +66,10 @@ fn drain(db: &Overlay) {
 }
 
 #[test]
-fn schema44_records_clean_checkpoint_and_reopens_without_conflict() {
+fn current_schema_records_clean_checkpoint_and_reopens_without_conflict() {
     let fixture = Fixture::new();
     let db = fixture.create();
-    assert_eq!(db.profile().schema_version, 44);
+    assert_eq!(db.profile().schema_version, 45);
     let capture = db
         .capture_recorded(WORKSPACE, [0; 32], 1, SNAPSHOT)
         .unwrap();
@@ -80,7 +80,7 @@ fn schema44_records_clean_checkpoint_and_reopens_without_conflict() {
     db.close_database().unwrap();
     let db =
         Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
-    assert_eq!(db.profile().schema_version, 44);
+    assert_eq!(db.profile().schema_version, 45);
     assert_eq!(db.durable_binding().unwrap().as_deref(), Some(SNAPSHOT));
     db.close_database().unwrap();
 }

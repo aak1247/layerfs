@@ -33,7 +33,7 @@ impl Fixture {
     }
     fn create(&self, namespace: bool) -> Overlay {
         let db = Overlay::create_durable(&self.path(), ProfileConfig::default(), IDENTITY).unwrap();
-        assert_eq!(db.profile().schema_version, 44);
+        assert_eq!(db.profile().schema_version, 45);
         db.open_workspace(ROOT).unwrap();
         db.initialize_durable_binding(ROOT, b"original snapshot")
             .unwrap();

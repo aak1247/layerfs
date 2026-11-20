@@ -1,7 +1,7 @@
 //! Bounded orphan migration and last-owner deletion, independent of Commit count.
 use crate::{
     db::integer,
-    lifetime::orphan::{Orphan, DOMAIN},
+    lifetime::orphan::{Orphan, ReleasedLayer, DOMAIN},
     maintenance::{Item, Page, ORPHAN, PAGE, SERIAL_RETIRE},
     sql, Overlay, OverlayResult, StatementKind,
 };
@@ -45,7 +45,7 @@ pub(crate) struct Step {
     /// Payload cells of the page this step spent.
     cells: usize,
     next: Next,
-    released: Option<i64>,
+    released: Option<ReleasedLayer>,
 }
 fn step(rows: u64, bytes: u64, next: Next) -> Step {
     Step {
@@ -96,7 +96,7 @@ impl Overlay {
         };
         // Each call of the orphan's step releases at most one layer.
         let mut own = Next::Ready;
-        let mut layers = [(0, Next::Done, Retiring::default()); RELEASE_CALLS];
+        let mut layers = [(None, Next::Done, Retiring::default()); RELEASE_CALLS];
         let mut released = 0;
         'rounds: loop {
             let mut unfinished = false;
@@ -107,21 +107,22 @@ impl Overlay {
                 calls += 1;
                 let step = self.reclaim_orphan(serial, &mut orphan, page)?;
                 charge(&mut page, &step);
-                if let Some(gen) = step.released {
-                    layers[released] = (gen, Next::Ready, Retiring::default());
+                if let Some(layer) = step.released {
+                    layers[released] = (Some(layer), Next::Ready, Retiring::default());
                     released += 1;
                 }
                 own = step.next;
                 unfinished |= !matches!(own, Next::Done);
             }
             // Layers are released newest first and retired oldest first.
-            for (gen, next, known) in layers[..released].iter_mut().rev() {
+            for (layer, next, known) in layers[..released].iter_mut().rev() {
                 if matches!(next, Next::Ready) {
                     if spent(calls, page) {
                         break 'rounds;
                     }
                     calls += 1;
-                    let step = self.retire_layer(serial, *gen, Some(orphan), page, known)?;
+                    let gen = layer.ok_or(crate::OverlayError::Stale)?.generation;
+                    let step = self.retire_layer(serial, gen, Some(orphan), page, known)?;
                     charge(&mut page, &step);
                     *next = step.next;
                     unfinished |= !matches!(next, Next::Done);
@@ -140,15 +141,16 @@ impl Overlay {
             self.wake_orphan(serial)?;
             left = true;
         }
-        for (gen, next, _) in &layers[..released] {
+        for (layer, next, _) in &layers[..released] {
+            let layer = layer.ok_or(crate::OverlayError::Stale)?;
             match next {
                 Next::Done => {}
                 Next::Held => {
-                    self.enqueue(SERIAL_RETIRE, serial, *gen)?;
-                    self.hold_item(&item(SERIAL_RETIRE, *gen))?;
+                    crate::database::durable_serial_retirement::released(self, serial, layer)?;
+                    self.hold_item(&item(SERIAL_RETIRE, layer.generation))?;
                 }
                 _ => {
-                    self.queue_retirement(serial, *gen)?;
+                    self.queue_retirement(serial, layer)?;
                     left = true;
                 }
             }
@@ -162,12 +164,22 @@ impl Overlay {
     /// The queue item's part of a step: the released layer's retirement
     /// queued, the item advanced, parked or finished.
     fn settle_item(&self, item: &Item, step: Step) -> OverlayResult<(u64, u64, bool)> {
-        if let Some(gen) = step.released {
-            self.queue_retirement(item.resource, gen)?;
+        if let Some(layer) = step.released {
+            self.queue_retirement(item.resource, layer)?;
         }
         match step.next {
             Next::Ready => {}
-            Next::From(phase, aux) => self.advance_item(item, phase, 0, aux, &[])?,
+            Next::From(phase, aux) => self.advance_item(
+                item,
+                phase,
+                0,
+                aux,
+                if item.kind == SERIAL_RETIRE {
+                    &item.name
+                } else {
+                    &[]
+                },
+            )?,
             Next::Held => self.hold_item(item)?,
             Next::Done => self.finish_item(item)?,
         }
@@ -176,12 +188,12 @@ impl Overlay {
     /// A generation cursor that already skipped this independent source
     /// does not restart: the layer an orphan released is retired by its own
     /// ready item.
-    fn queue_retirement(&self, serial: i64, gen: i64) -> OverlayResult<()> {
-        self.enqueue(SERIAL_RETIRE, serial, gen)?;
+    fn queue_retirement(&self, serial: i64, layer: ReleasedLayer) -> OverlayResult<()> {
+        crate::database::durable_serial_retirement::released(self, serial, layer)?;
         self.execute(
             StatementKind::Reclaim,
             "UPDATE cleanup_task SET ready=1 WHERE kind=?1 AND resource=?2 AND target=?3",
-            &[&SERIAL_RETIRE, &serial, &gen],
+            &[&SERIAL_RETIRE, &serial, &layer.generation],
             32,
         )?;
         Ok(())
@@ -254,9 +266,13 @@ impl Overlay {
                 }
                 self.execute(StatementKind::Inode,"UPDATE fs_inode SET inherited_cutoff=min(inherited_cutoff,?2) WHERE inode=?1 AND generation=-1",
                     &[&serial,&integer(lower.cutoff)?],24)?;
-                self.release_orphan_layer(serial, lower.gen, (lower.gen - 1).max(orphan.floor))?;
+                let released = self.release_orphan_layer(
+                    serial,
+                    lower.gen,
+                    (lower.gen - 1).max(orphan.floor),
+                )?;
                 return Ok(Step {
-                    released: Some(lower.gen),
+                    released: Some(released),
                     ..step(1, 0, Next::From(0, -1))
                 });
             }
@@ -292,10 +308,10 @@ impl Overlay {
                 .copied();
             if let Some(lower) = lower {
                 let next = (lower.gen - 1).max(orphan.floor);
-                self.release_orphan_layer(serial, lower.gen, next)?;
+                let released = self.release_orphan_layer(serial, lower.gen, next)?;
                 orphan.top = next;
                 return Ok(Step {
-                    released: Some(lower.gen),
+                    released: Some(released),
                     ..step(0, 0, Next::Ready)
                 });
             }

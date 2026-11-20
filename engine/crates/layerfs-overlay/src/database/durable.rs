@@ -349,7 +349,8 @@ mod linux {
             crate::database::durable_owners::initialize(&db)?;
             crate::database::durable_attempt::initialize(&db)?;
             crate::database::durable_conflict::initialize(&db)?;
-            db.execute(StatementKind::Startup, "PRAGMA user_version=44", &[], 0)?;
+            crate::database::durable_serial_retirement::initialize(&db)?;
+            db.execute(StatementKind::Startup, "PRAGMA user_version=45", &[], 0)?;
             db.execute(
                 StatementKind::Startup,
                 "PRAGMA application_id=1279676211",
@@ -364,7 +365,7 @@ mod linux {
             )?;
             Ok(())
         })?;
-        db.profile.schema_version = 44;
+        db.profile.schema_version = 45;
         let sync = db.allocation.sync_durable_file().and_then(|_| {
             File::open(
                 path.parent()
@@ -452,7 +453,7 @@ mod linux {
             super::super::profile::readback(&connection, &work, "PRAGMA user_version", |r| {
                 r.get(0)
             })?;
-        if ![39, 40, 41, 42, 43, 44].contains(&profile.schema_version) {
+        if ![39, 40, 41, 42, 43, 44, 45].contains(&profile.schema_version) {
             return Err(OverlayError::Invalid("durable overlay schema version"));
         }
         let integrity: String =
@@ -539,7 +540,7 @@ mod linux {
         // Conflict pages are not yet admitted by ordinary recovery. Until the
         // exact descriptor and local binding can be authenticated, retain all
         // such original state rather than interpreting it as idle work.
-        let pending_conflict = if profile.schema_version == 44 {
+        let pending_conflict = if profile.has_durable_conflict() {
             super::super::profile::readback(
                 &connection,
                 &work,
@@ -552,11 +553,11 @@ mod linux {
         } else {
             false
         };
-        // Catalog preparation may inspect one still-captured schema-44
+        // Catalog preparation may inspect one still-captured recorded
         // checkpoint under this same lease. Its private constructor must
         // authenticate every deferred owner and task before returning it.
         let checkpoint = settled_conflict
-            && profile.schema_version == 44
+            && profile.has_durable_conflict()
             && bound
             && pending_attempt
             && !pending_conflict;
@@ -564,7 +565,7 @@ mod linux {
             || (state.consolidating.is_some() && !checkpoint)
             || (!checkpoint && (state.captured.is_some() || held || pending || pending_attempt))
             || (pending_conflict && !settled_conflict)
-            || (pending_conflict && settled_conflict && (profile.schema_version != 44 || !bound))
+            || (pending_conflict && settled_conflict && (!profile.has_durable_conflict() || !bound))
         {
             return Err(OverlayError::Invalid(
                 "durable overlay requires reconciliation",
@@ -609,7 +610,7 @@ mod linux {
             allocation,
             durable: Some(lease),
         };
-        if db.profile.schema_version == 44 {
+        if db.profile.has_durable_conflict() {
             super::super::durable_conflict::verify_schema(&db)?;
         }
         if db.profile.has_classified_custody() {
