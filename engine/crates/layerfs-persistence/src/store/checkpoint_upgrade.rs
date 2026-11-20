@@ -14,6 +14,20 @@ pub struct StorePhysicalIdentity {
 }
 
 impl crate::StorageProvider {
+    /// Compare this Durable writer's captured directory and Store identity
+    /// with an original file descriptor. This does not establish a consumer
+    /// fence or authorize a schema transition. A regular descriptor must not
+    /// close while same-process SQLite connections remain open.
+    #[cfg(target_os = "linux")]
+    pub fn verify_original_file(&self, original: &File) -> Result<(), PersistenceError> {
+        if !self.session.writable {
+            return Err(PersistenceError::Malformed);
+        }
+        self.session
+            .verify_original_store_file(original)
+            .map_err(Into::into)
+    }
+
     /// Compare a specially opened read-only Durable session with the caller's
     /// still-held original file and the captured private directory identity.
     /// Ordinary read-only sessions cannot establish this observation later.

@@ -61,7 +61,7 @@ impl Fixture {
         Self(dir)
     }
     fn config(&self) -> PersistenceConfig {
-        PersistenceConfig::sqlite(&self.0.join("store-private/store.sqlite"))
+        PersistenceConfig::sqlite(self.0.join("store-private/store.sqlite"))
             .with_sqlite_profile(SqlitePersistenceProfile::Durable)
             .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables)
     }
@@ -922,7 +922,7 @@ mod interrupted_catalog {
     }
     fn config(root: &Path) -> CatalogTransitionConfig {
         CatalogTransitionConfig {
-            store: PersistenceConfig::sqlite(&root.join("store-private/store.sqlite"))
+            store: PersistenceConfig::sqlite(root.join("store-private/store.sqlite"))
                 .with_sqlite_profile(SqlitePersistenceProfile::Durable)
                 .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables),
             binding: BINDING.to_vec(),
@@ -1109,5 +1109,378 @@ mod interrupted_catalog {
                 .unwrap(),
             0
         );
+    }
+}
+
+mod shared_store_recovery {
+    use super::*;
+    use layerfs_daemon::control::RecoverControlConfig;
+    use layerfs_history::{
+        BranchId, ForkRequest, ForkSource, HistoryError, HistoryName, WorkspaceId,
+    };
+    use nix::fcntl::OFlag;
+    use std::{
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const CHILD: &str = "LAYERFS_TEST_SHARED_STORE_WRITER";
+    type SchemaRow = (String, String, String, Option<String>);
+
+    fn store_config(root: &Path) -> PersistenceConfig {
+        PersistenceConfig::sqlite(root.join("store-private/store.sqlite"))
+            .with_sqlite_profile(SqlitePersistenceProfile::Durable)
+            .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables)
+    }
+    fn marker(path: &Path) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.write_all(b"done\n").unwrap();
+        file.sync_all().unwrap();
+    }
+    fn wait_marker(path: &Path, mut child: Option<&mut Child>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            if let Some(child) = child.as_deref_mut() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "other Store writer exited early"
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bounded Store writer handoff expired"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn schema(path: &Path) -> Vec<SchemaRow> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut query = db
+            .prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")
+            .unwrap();
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+    fn other_writer(root: &Path) {
+        let store = open_store(
+            store_config(root),
+            BINDING,
+            CURSOR,
+            2,
+            2 * 1024 * 1024,
+            ReservationBlocks::default(),
+        )
+        .unwrap();
+        let original = BranchId::from_authority([24; 16]);
+        let before = store.history().branch_snapshot(original).unwrap().unwrap();
+        assert!(matches!(
+            store.history().require_checkpoint_receipts(),
+            Err(HistoryError::Unsupported("checkpoint receipt"))
+        ));
+        marker(&root.join("other-writer-ready"));
+        wait_marker(&root.join("other-writer-continue"), None);
+        let after = store.history().branch_snapshot(original).unwrap().unwrap();
+        assert_ne!(after.branch.head_commit, before.branch.head_commit);
+        let branch = BranchId::from_authority([77; 16]);
+        let fork = store
+            .history()
+            .fork(&ForkRequest {
+                stack: after.branch.stack,
+                branch,
+                name: HistoryName::new("other-pool").unwrap(),
+                source: ForkSource::Commit {
+                    branch: original,
+                    commit: after.branch.head_commit.unwrap(),
+                },
+            })
+            .unwrap();
+        assert_eq!(fork.branch.id, branch);
+        assert!(matches!(
+            store.history().require_checkpoint_receipts(),
+            Err(HistoryError::Unsupported("checkpoint receipt"))
+        ));
+        marker(&root.join("other-writer-continued"));
+        wait_marker(&root.join("other-writer-stop"), None);
+        drop(store);
+    }
+
+    #[test]
+    fn ordinary_recovery_preserves_format_while_another_store_writer_continues() {
+        if let Some(root) = std::env::var_os(CHILD) {
+            other_writer(Path::new(&root));
+            return;
+        }
+        let fixture = Fixture::new();
+        let store_path = fixture.0.join("store-private/store.sqlite");
+        let overlay_path = fixture
+            .0
+            .join("overlays")
+            .join(format!("workspace-{}.sqlite", "2a".repeat(32)));
+        let store_before = fs::metadata(&store_path).unwrap();
+        let overlay_before = fs::metadata(&overlay_path).unwrap();
+        let store_schema = schema(&store_path);
+        let overlay_schema = schema(&overlay_path);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("shared_store_recovery::ordinary_recovery_preserves_format_while_another_store_writer_continues")
+            .arg("--exact").arg("--nocapture").env(CHILD, &fixture.0)
+            .stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap();
+        wait_marker(&fixture.0.join("other-writer-ready"), Some(&mut child));
+        assert_eq!(schema(&store_path), store_schema);
+
+        // The ordinary descriptor proves read access and closes before this
+        // process opens SQLite. O_PATH remains safe to close while SQLite lives.
+        let original = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(&store_path)
+            .unwrap();
+        let anchor = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(&store_path)
+            .unwrap();
+        assert_eq!(
+            (
+                original.metadata().unwrap().dev(),
+                original.metadata().unwrap().ino()
+            ),
+            (
+                anchor.metadata().unwrap().dev(),
+                anchor.metadata().unwrap().ino()
+            )
+        );
+        drop(original);
+        let wrong = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(fixture.0.join("template.sqlite"))
+            .unwrap();
+        let refused = layerfs_daemon::bootstrap::open_existing_store_observed(
+            store_config(&fixture.0),
+            &wrong,
+            BINDING,
+            CURSOR,
+            2,
+            2 * 1024 * 1024,
+            ReservationBlocks::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(refused, StorageError::Io(ref error)
+            if error.get_ref().and_then(|inner| inner.downcast_ref::<layerfs_storage::port::PersistenceError>())
+                == Some(&layerfs_storage::port::PersistenceError::Malformed)));
+        drop(wrong);
+        let opened = layerfs_daemon::bootstrap::open_existing_store_observed(
+            store_config(&fixture.0),
+            &anchor,
+            BINDING,
+            CURSOR,
+            2,
+            2 * 1024 * 1024,
+            ReservationBlocks::default(),
+        )
+        .unwrap();
+        opened.store.verify_original_file(&anchor).unwrap();
+        assert!(matches!(
+            opened.store.history().require_checkpoint_receipts(),
+            Err(HistoryError::Unsupported("checkpoint receipt"))
+        ));
+        let owner = Owner::start(
+            &fixture.0.join("ordinary-template.sqlite"),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 2 },
+        )
+        .unwrap();
+        let mut service = Service::new(opened.store.clone(), &owner);
+        let tokens = service
+            .recover_durable_control(
+                &owner,
+                RecoverControlConfig {
+                    catalog_directory: fixture.0.join("catalog"),
+                    overlay_directory: fixture.0.join("overlays"),
+                    sandbox: [8; 32],
+                    profile: ProfileConfig::default(),
+                    minimum_namespace: 1,
+                    store_device: store_before.dev(),
+                },
+            )
+            .unwrap();
+        assert_eq!(tokens.len(), 1);
+        let token = tokens[0];
+        assert_eq!(
+            token.workspace,
+            WorkspaceId::from_authority([42; 32]).unwrap()
+        );
+        assert_eq!(token.namespace, 2);
+        opened.store.verify_original_file(&anchor).unwrap();
+        drop(anchor);
+        let operation = service.operation(token).unwrap();
+        assert_eq!(
+            read_operation(&operation, "file-000001"),
+            b"Domplete installed file 000001\n"
+        );
+        drop(operation);
+        let reply = service
+            .execute_control(&Request::Commit(CommitControl {
+                token,
+                force: false,
+                message: None,
+            }))
+            .unwrap()
+            .reply;
+        assert!(matches!(
+            reply,
+            Reply::Committed(_) | Reply::MergeCommitted(_)
+        ));
+
+        let empty_catalog = fixture.0.join("empty-catalog");
+        let empty_overlays = fixture.0.join("empty-overlays");
+        for path in [&empty_catalog, &empty_overlays] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let authority = Authority::for_catalog([9; 32], opened.store.history()).unwrap();
+        drop(Roster::create(&empty_catalog, authority).unwrap());
+        let empty_owner = Owner::start(
+            &fixture.0.join("empty-ordinary-template.sqlite"),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 2 },
+        )
+        .unwrap();
+        let mut empty = Service::new(opened.store.clone(), &empty_owner);
+        let none = empty
+            .recover_durable_control(
+                &empty_owner,
+                RecoverControlConfig {
+                    catalog_directory: empty_catalog,
+                    overlay_directory: empty_overlays,
+                    sandbox: [9; 32],
+                    profile: ProfileConfig::default(),
+                    minimum_namespace: 1,
+                    store_device: store_before.dev(),
+                },
+            )
+            .unwrap();
+        assert!(none.is_empty());
+        marker(&fixture.0.join("other-writer-continue"));
+        wait_marker(&fixture.0.join("other-writer-continued"), Some(&mut child));
+        assert!(opened
+            .store
+            .history()
+            .branch_snapshot(BranchId::from_authority([77; 16]))
+            .unwrap()
+            .is_some());
+        drop(empty);
+        empty_owner.stop().unwrap();
+        drop(service);
+        opened.store.close_reader(token.workspace).unwrap();
+        owner.stop().unwrap();
+        drop(opened);
+        assert_eq!(schema(&store_path), store_schema);
+        assert_eq!(schema(&overlay_path), overlay_schema);
+        assert_eq!(fs::metadata(&store_path).unwrap().ino(), store_before.ino());
+        assert_eq!(
+            fs::metadata(&overlay_path).unwrap().ino(),
+            overlay_before.ino()
+        );
+        let store =
+            Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(store.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='checkpoint_receipt'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        drop(store);
+        let overlay =
+            Connection::open_with_flags(&overlay_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            overlay
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            41
+        );
+        assert_eq!(
+            overlay
+                .query_row("SELECT high_namespace FROM durable_route", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(overlay);
+        marker(&fixture.0.join("other-writer-stop"));
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn o_path_anchor_does_not_release_original_process_locks() {
+        use nix::fcntl::{fcntl, FcntlArg};
+        let lock = nix::libc::flock {
+            l_type: nix::libc::F_WRLCK as _,
+            l_whence: nix::libc::SEEK_SET as _,
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        if let Some(path) = std::env::var_os("LAYERFS_TEST_LOCK_PROBE") {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let outcome = fcntl(&file, FcntlArg::F_SETLK(&lock));
+            match std::env::var("LAYERFS_TEST_LOCK_EXPECT").unwrap().as_str() {
+                "held" => assert!(matches!(
+                    outcome,
+                    Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EACCES)
+                )),
+                "released" => assert!(outcome.is_ok()),
+                _ => panic!("unexpected lock probe"),
+            }
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("layerfs-o-path-lock-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("store.sqlite");
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        fcntl(&holder, FcntlArg::F_SETLK(&lock)).unwrap();
+        let anchor = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(&path)
+            .unwrap();
+        drop(anchor);
+        let probe =
+            |expect: &str| {
+                let status=Command::new(std::env::current_exe().unwrap())
+                .arg("shared_store_recovery::o_path_anchor_does_not_release_original_process_locks")
+                .arg("--exact").arg("--nocapture")
+                .env("LAYERFS_TEST_LOCK_PROBE",&path).env("LAYERFS_TEST_LOCK_EXPECT",expect)
+                .status().unwrap();
+                assert!(status.success());
+            };
+        probe("held");
+        let ordinary = fs::File::open(&path).unwrap();
+        drop(ordinary);
+        probe("released");
+        drop(holder);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 }

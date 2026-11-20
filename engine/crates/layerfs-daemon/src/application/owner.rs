@@ -54,9 +54,20 @@ impl Application {
     pub(super) fn start(
         setup: DaemonSetup,
         recovery: Option<RecoveryWorkspaceSetup>,
+        recovery_anchor: Option<std::fs::File>,
     ) -> Result<Arc<Self>, ApplicationError> {
-        if let Some(recovery) = &recovery {
-            super::config::verify_recovery_store(&setup, recovery).map_err(ApplicationError::Io)?;
+        if recovery.is_some() != recovery_anchor.is_some() {
+            return Err(ApplicationError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery Store custody is absent",
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if recovery.is_some() {
+            return Err(ApplicationError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable recovery requires Linux",
+            )));
         }
         // Open the export before any Overlay or Store effect and retain its
         // exact descriptors through the kernel serving owner's lifetime.
@@ -136,34 +147,88 @@ impl Application {
                 })
             }
         };
-        let mut existing = match &setup.existing_store {
-            Some(m) => match open_store_observed(
-                PersistenceConfig::sqlite(&setup.store).with_sqlite_profile(match m.profile {
-                    layerfs_bridge::provision::StoreProfile::Disposable => {
-                        SqlitePersistenceProfile::Disposable
-                    }
-                    layerfs_bridge::provision::StoreProfile::Durable => {
-                        SqlitePersistenceProfile::Durable
-                    }
-                }),
-                &m.binding,
-                m.cursor_key,
-                l.namespaces as usize,
-                cache_bytes,
-                ReservationBlocks::default(),
-            ) {
-                Ok(opened) => Some(opened),
+        #[cfg(target_os = "linux")]
+        let early_kernel = if recovery.is_some() {
+            let kernel = match super::filesystem::assemble(&setup, host_export.take()) {
+                Ok(kernel) => kernel,
                 Err(cause) => {
                     return Err(ApplicationError::AfterOverlay {
                         owner: Box::new(owner),
-                        cause: Box::new(ApplicationError::Store(cause)),
+                        cause: Box::new(ApplicationError::Io(cause)),
                     })
                 }
-            },
+            };
+            Some(kernel)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        if let (Some(recovery), Some(anchor)) = (&recovery, &recovery_anchor) {
+            if let Err(cause) = super::config::verify_recovery_access(&setup, recovery, anchor) {
+                return Err(ApplicationError::AfterOverlay {
+                    owner: Box::new(owner),
+                    cause: Box::new(ApplicationError::Io(cause)),
+                });
+            }
+        }
+        let mut existing = match &setup.existing_store {
+            Some(m) => {
+                let config =
+                    PersistenceConfig::sqlite(&setup.store).with_sqlite_profile(match m.profile {
+                        layerfs_bridge::provision::StoreProfile::Disposable => {
+                            SqlitePersistenceProfile::Disposable
+                        }
+                        layerfs_bridge::provision::StoreProfile::Durable => {
+                            SqlitePersistenceProfile::Durable
+                        }
+                    });
+                #[cfg(target_os = "linux")]
+                let opened = if let Some(anchor) = recovery_anchor.as_ref() {
+                    crate::bootstrap::open_existing_store_observed(
+                        config,
+                        anchor,
+                        &m.binding,
+                        m.cursor_key,
+                        l.namespaces as usize,
+                        cache_bytes,
+                        ReservationBlocks::default(),
+                    )
+                } else {
+                    open_store_observed(
+                        config,
+                        &m.binding,
+                        m.cursor_key,
+                        l.namespaces as usize,
+                        cache_bytes,
+                        ReservationBlocks::default(),
+                    )
+                };
+                #[cfg(not(target_os = "linux"))]
+                let opened = open_store_observed(
+                    config,
+                    &m.binding,
+                    m.cursor_key,
+                    l.namespaces as usize,
+                    cache_bytes,
+                    ReservationBlocks::default(),
+                );
+                match opened {
+                    Ok(opened) => Some(opened),
+                    Err(cause) => {
+                        return Err(ApplicationError::AfterOverlay {
+                            owner: Box::new(owner),
+                            cause: Box::new(ApplicationError::Store(cause)),
+                        })
+                    }
+                }
+            }
             None => None,
         };
         #[cfg(target_os = "linux")]
-        let assembled = super::filesystem::assemble(&setup, host_export);
+        let assembled = match early_kernel {
+            Some(kernel) => Ok(kernel),
+            None => super::filesystem::assemble(&setup, host_export),
+        };
         #[cfg(not(target_os = "linux"))]
         let assembled = super::filesystem::assemble(&setup);
         let kernel = match assembled {
@@ -182,6 +247,7 @@ impl Application {
                 kernel.as_ref(),
                 &setup,
                 recovery.as_ref(),
+                recovery_anchor.as_ref(),
             ) {
                 Ok(service) => Some(service),
                 Err(mut failure) => {

@@ -149,6 +149,15 @@ fn recovery_requires_original_private_store_identity() {
     rejected(&wrong, &config_dir.join("boot"), &overlay);
     fs::set_permissions(&store, fs::Permissions::from_mode(0o644)).unwrap();
     rejected(&setup, &config_dir.join("mode"), &overlay);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+    match fs::File::open(&store) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            rejected(&setup, &config_dir.join("unreadable"), &overlay);
+            println!("RECOVERY_UNREADABLE_DENIED");
+        }
+        Err(error) => panic!("unexpected permission probe failure: {error}"),
+    }
     fs::set_permissions(&store, fs::Permissions::from_mode(0o600)).unwrap();
     let alias = store_dir.join("hardlink");
     fs::hard_link(&store, &alias).unwrap();

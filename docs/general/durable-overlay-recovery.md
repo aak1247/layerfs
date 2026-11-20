@@ -164,9 +164,14 @@ files. A separately retained original 277 fixture also completed the transition,
 closed and reopened its original Store and Workspace, and committed a new
 write. Its retained Store and SQLite sidecars were independently copied and
 checked after the test; the outer observation's stricter no-sidecar check failed
-and remains recorded. These tests do not establish a physical crash, FUSE mount
-or application startup result. Application startup and Native integration have
-not yet adopted this transition.
+and remains recorded. These tests do not establish a physical crash or FUSE
+mount. The protected daemon recovery startup retains a physical Store anchor
+from configuration through ordinary catalog recovery. It opens an already
+supported Store without schema changes or scratch cleanup; the old recovery
+request alone does not prove that other sandboxes using the Store have stopped.
+The full migration remains a separate operation requiring the original
+whole-Store writer, mount and consumer fence. The embedded Native path has not
+yet adopted that transition.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

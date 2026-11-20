@@ -127,6 +127,56 @@ pub fn open_store_observed(
     }
     reservations.validate()?;
     let writer = Handles::open_writable(config.clone(), binding, cursor_key)?;
+    compose_store(
+        config,
+        binding,
+        cursor_key,
+        workspace_capacity,
+        cache_bytes,
+        reservations,
+        writer,
+    )
+}
+
+/// Open an original Durable Store for ordinary recovery without schema DDL
+/// or scratch cleanup. The caller retains its physical identity anchor and
+/// fences the prior Workspace consumer; no Store-wide migration is implied.
+#[cfg(target_os = "linux")]
+pub fn open_existing_store_observed(
+    config: PersistenceConfig,
+    original: &std::fs::File,
+    binding: &[u8],
+    cursor_key: [u8; 32],
+    workspace_capacity: usize,
+    cache_bytes: usize,
+    reservations: ReservationBlocks,
+) -> StorageResult<OpenedStore> {
+    if workspace_capacity == 0 {
+        return Err(StorageError::Integrity("empty Workspace reader capacity"));
+    }
+    reservations.validate()?;
+    let writer =
+        Handles::open_existing_original_writable(config.clone(), original, binding, cursor_key)?;
+    compose_store(
+        config,
+        binding,
+        cursor_key,
+        workspace_capacity,
+        cache_bytes,
+        reservations,
+        writer,
+    )
+}
+
+fn compose_store(
+    config: PersistenceConfig,
+    binding: &[u8],
+    cursor_key: [u8; 32],
+    workspace_capacity: usize,
+    cache_bytes: usize,
+    reservations: ReservationBlocks,
+    writer: Handles,
+) -> StorageResult<OpenedStore> {
     let sqlite_version = writer.profile().sqlite_version.clone();
     let durable_writer = (writer.storage.supports_durable_barrier()
         && crate::kernel_guard::check(&config.path).is_ok())

@@ -111,6 +111,7 @@ impl Application {
             self.kernel.as_ref(),
             &self.setup,
             None,
+            None,
         ) {
             Ok(service) => {
                 state.startup.service = Some(service);

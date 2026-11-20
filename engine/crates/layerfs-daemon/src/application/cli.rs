@@ -38,7 +38,7 @@ fn run() -> Result<(), ApplicationError> {
     }
     let setup = config::read(Path::new(&path)).map_err(ApplicationError::Io)?;
     let listener = TcpListener::bind(&setup.daemon.listen).map_err(ApplicationError::Io)?;
-    let application = Application::start(setup.daemon, setup.recovery)?;
+    let application = Application::start(setup.daemon, setup.recovery, setup.recovery_anchor)?;
     println!(
         "LAYERFS_DAEMON_LISTEN {}",
         listener.local_addr().map_err(ApplicationError::Io)?

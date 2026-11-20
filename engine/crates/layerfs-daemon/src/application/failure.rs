@@ -23,6 +23,13 @@ pub enum ServiceStartCause {
     FreshVolume(Box<crate::control::FreshVolumeFailure>),
     #[cfg(target_os = "linux")]
     Recovery(Box<crate::control::RecoverControlFailure>),
+    #[cfg(target_os = "linux")]
+    StoreIdentity(layerfs_storage::port::PersistenceError),
+    #[cfg(target_os = "linux")]
+    StoreIdentityAfterRecovery {
+        cause: layerfs_storage::port::PersistenceError,
+        completed: Vec<layerfs_bridge::control::WorkspaceToken>,
+    },
     #[cfg(not(target_os = "linux"))]
     Unsupported,
 }

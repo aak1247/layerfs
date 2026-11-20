@@ -17,13 +17,40 @@ pub(super) fn service(
     kernel: Option<&Arc<KernelServing>>,
     setup: &DaemonSetup,
     recovery: Option<&RecoveryWorkspaceSetup>,
+    recovery_anchor: Option<&std::fs::File>,
 ) -> Result<Arc<Service>, Box<ServiceStartFailure>> {
     store.set_serial_low_water(setup.limits.serial_low_water);
+    #[cfg(target_os = "linux")]
+    let physical = store.clone();
     let mut service = match kernel {
         Some(kernel) => Service::with_kernel(store, owner, kernel.clone()),
         None => Service::new(store, owner),
     };
-    if let Err(cause) = configure(&mut service, owner, setup, recovery) {
+    let configured = (|| {
+        if recovery.is_some() != recovery_anchor.is_some() {
+            return Err(ServiceStartCause::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery Store custody is absent",
+            )));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(anchor) = recovery_anchor {
+            physical
+                .verify_original_file(anchor)
+                .map_err(ServiceStartCause::StoreIdentity)?;
+        }
+        let completed = configure(&mut service, owner, setup, recovery)?;
+        #[cfg(target_os = "linux")]
+        if let Some(anchor) = recovery_anchor {
+            physical.verify_original_file(anchor).map_err(|cause| {
+                ServiceStartCause::StoreIdentityAfterRecovery { cause, completed }
+            })?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = completed;
+        Ok(())
+    })();
+    if let Err(cause) = configured {
         return Err(Box::new(ServiceStartFailure {
             cause,
             service: Box::new(service),
@@ -40,10 +67,9 @@ fn configure(
     owner: &Owner,
     setup: &DaemonSetup,
     recovery: Option<&RecoveryWorkspaceSetup>,
-) -> Result<(), ServiceStartCause> {
+) -> Result<Vec<layerfs_bridge::control::WorkspaceToken>, ServiceStartCause> {
     use std::os::unix::fs::MetadataExt;
     if let Some(recovery) = recovery {
-        super::config::verify_recovery_store(setup, recovery).map_err(ServiceStartCause::Io)?;
         return service
             .recover_durable_control(
                 owner,
@@ -59,11 +85,10 @@ fn configure(
                     store_device: recovery.store_device,
                 },
             )
-            .map(|_| ())
             .map_err(ServiceStartCause::Recovery);
     }
     let Some(fresh) = &setup.fresh_workspace else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let metadata = std::fs::symlink_metadata(&setup.store).map_err(ServiceStartCause::Io)?;
     if !metadata.is_file()
@@ -94,6 +119,7 @@ fn configure(
                     store_device: metadata.dev(),
                 },
             )
+            .map(|_| Vec::new())
             .map_err(ServiceStartCause::FreshVolume);
     }
     service
@@ -107,6 +133,7 @@ fn configure(
                 store_device: metadata.dev(),
             },
         )
+        .map(|_| Vec::new())
         .map_err(ServiceStartCause::Fresh)
 }
 
@@ -116,11 +143,11 @@ fn configure(
     _owner: &Owner,
     setup: &DaemonSetup,
     recovery: Option<&RecoveryWorkspaceSetup>,
-) -> Result<(), ServiceStartCause> {
+) -> Result<Vec<layerfs_bridge::control::WorkspaceToken>, ServiceStartCause> {
     if setup.fresh_workspace.is_some() || recovery.is_some() {
         Err(ServiceStartCause::Unsupported)
     } else {
-        Ok(())
+        Ok(Vec::new())
     }
 }
 /// Kernel serving is a Linux capability; elsewhere control alone is assembled.

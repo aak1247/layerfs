@@ -114,6 +114,34 @@ impl DurableDirectory {
 }
 
 impl super::connection::Session {
+    /// Open an existing writer while the caller keeps the protected Store name
+    /// stable. The anchor and name are checked on both sides of SQLite open;
+    /// this does not inspect SQLite's internal descriptor or authorize DDL.
+    pub(crate) fn connect_existing_original_writable(
+        path: &Path,
+        original: &File,
+        layout: crate::SqlitePackLayout,
+        acquisition: crate::SqliteAcquisitionSchema,
+    ) -> Result<Self, BackendError> {
+        let directory = DurableDirectory::open(path)?;
+        directory
+            .verify_original_file(original)
+            .map_err(|_| BackendError::Integrity)?;
+        let session = Self::connect(
+            path,
+            true,
+            false,
+            crate::SqlitePersistenceProfile::Durable,
+            layout,
+            acquisition,
+        )?;
+        session.verify_original_store_file(original)?;
+        directory
+            .verify_original_file(original)
+            .map_err(|_| BackendError::Integrity)?;
+        Ok(session)
+    }
+
     /// The caller retains its authenticated original File and full Store fence
     /// across this opening window. Ordinary read-only opens have no such proof.
     pub(crate) fn connect_original_read_only(

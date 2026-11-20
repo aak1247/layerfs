@@ -5,7 +5,7 @@ use layerfs_bridge::{
 };
 use nix::{fcntl::OFlag, unistd::Uid};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::Path,
@@ -14,6 +14,7 @@ use std::{
 pub(super) struct StartupConfig {
     pub daemon: DaemonSetup,
     pub recovery: Option<RecoveryWorkspaceSetup>,
+    pub recovery_anchor: Option<File>,
 }
 
 pub(super) fn read(path: &Path) -> io::Result<StartupConfig> {
@@ -94,9 +95,11 @@ pub(super) fn read(path: &Path) -> io::Result<StartupConfig> {
         if manifest.daemon_sqlite.is_none() {
             return Err(invalid("existing installation metadata"));
         }
-        protected_file(store)?;
+        if recovery.is_none() {
+            protected_file(store)?;
+        }
     }
-    if let Some(recovery) = &recovery {
+    let recovery_anchor = if let Some(recovery) = &recovery {
         for directory in [&recovery.catalog_directory, &recovery.overlay_directory] {
             let directory = Path::new(directory);
             if path.starts_with(directory) || directory.starts_with(path) {
@@ -110,18 +113,21 @@ pub(super) fn read(path: &Path) -> io::Result<StartupConfig> {
                 false,
             )?;
         }
-        verify_recovery_store(&config, recovery)?;
-    }
+        Some(open_recovery_store(&config, recovery)?)
+    } else {
+        None
+    };
     Ok(StartupConfig {
         daemon: config,
         recovery,
+        recovery_anchor,
     })
 }
 
-pub(super) fn verify_recovery_store(
+pub(super) fn open_recovery_store(
     config: &DaemonSetup,
     recovery: &RecoveryWorkspaceSetup,
-) -> io::Result<()> {
+) -> io::Result<File> {
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let file = OpenOptions::new()
         .read(true)
@@ -145,6 +151,66 @@ pub(super) fn verify_recovery_store(
         || named.ino() != recovery.store_inode
     {
         return Err(invalid("recovery Store identity or privacy changed"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // O_PATH preserves this identity without closing another ordinary
+        // descriptor after SQLite has acquired process-scoped locks. The
+        // O_RDONLY open above already checked the effective read permission.
+        let anchor = OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(&config.store)?;
+        let anchored = anchor.metadata()?;
+        if !anchored.is_file()
+            || (
+                anchored.dev(),
+                anchored.ino(),
+                anchored.uid(),
+                anchored.mode(),
+                anchored.nlink(),
+            ) != (
+                opened.dev(),
+                opened.ino(),
+                opened.uid(),
+                opened.mode(),
+                opened.nlink(),
+            )
+        {
+            return Err(invalid("recovery Store anchor identity changed"));
+        }
+        drop(file);
+        Ok(anchor)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(file)
+}
+
+/// Repeat the original effective read-permission check before any SQLite
+/// connection exists, and retain the first O_PATH identity across that check.
+#[cfg(target_os = "linux")]
+pub(super) fn verify_recovery_access(
+    config: &DaemonSetup,
+    recovery: &RecoveryWorkspaceSetup,
+    anchor: &File,
+) -> io::Result<()> {
+    let checked = open_recovery_store(config, recovery)?;
+    let first = anchor.metadata()?;
+    let current = checked.metadata()?;
+    if (
+        first.dev(),
+        first.ino(),
+        first.uid(),
+        first.mode(),
+        first.nlink(),
+    ) != (
+        current.dev(),
+        current.ino(),
+        current.uid(),
+        current.mode(),
+        current.nlink(),
+    ) {
+        return Err(invalid("recovery Store anchor identity changed"));
     }
     Ok(())
 }

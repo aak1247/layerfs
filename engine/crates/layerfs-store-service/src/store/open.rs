@@ -99,6 +99,19 @@ impl Store {
         self.durable_writer.is_some()
     }
 
+    /// Check the actual Durable writer against an original file descriptor.
+    /// This local identity check does not authorize migration or prove a fence.
+    #[cfg(target_os = "linux")]
+    pub fn verify_original_file(
+        &self,
+        original: &std::fs::File,
+    ) -> Result<(), layerfs_storage::port::PersistenceError> {
+        self.durable_writer
+            .as_ref()
+            .ok_or(layerfs_storage::port::PersistenceError::Malformed)?
+            .verify_original_file(original)
+    }
+
     /// Compare the actual Durable writer with a previously observed original
     /// Store identity. External Store fencing remains the caller's duty.
     #[cfg(target_os = "linux")]

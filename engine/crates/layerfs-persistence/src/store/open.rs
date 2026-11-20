@@ -92,6 +92,35 @@ impl Handles {
         .shared();
         Self::validated(session, directory, binding, cursor_key)
     }
+
+    /// Opens an already supported Durable Store without schema changes or
+    /// scratch cleanup. The caller retains the original path anchor and
+    /// authenticates the prior Workspace consumer separately. A regular file
+    /// descriptor must remain open until all same-process SQLite connections
+    /// close; a Linux O_PATH anchor may be closed earlier. The caller must keep
+    /// the protected Store name stable throughout the opening window.
+    #[cfg(target_os = "linux")]
+    pub fn open_existing_original_writable(
+        config: PersistenceConfig,
+        original: &std::fs::File,
+        binding: &[u8],
+        cursor_key: [u8; 32],
+    ) -> Result<Self, PersistenceError> {
+        if config.backend != BackendSelection::Sqlite
+            || config.sqlite_profile != crate::SqlitePersistenceProfile::Durable
+        {
+            return Err(PersistenceError::Malformed);
+        }
+        let directory = config.path.parent().map(Path::to_path_buf);
+        let session = Session::connect_existing_original_writable(
+            &config.path,
+            original,
+            config.sqlite_pack_layout,
+            config.sqlite_acquisition,
+        )?;
+        Self::validated(session.shared(), directory, binding, cursor_key)
+    }
+
     fn open(
         config: PersistenceConfig,
         binding: &[u8],
