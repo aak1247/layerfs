@@ -8,10 +8,8 @@ impl Overlay {
         if self.profile().schema_version != 44
             || item.resource != 0
             || item.target <= 0
-            || item.phase != 0
             || item.cursor < 0
-            || item.aux != -1
-            || !item.name.is_empty()
+            || !matches!(item.phase, 0 | 1)
         {
             return Err(OverlayError::Invalid("conflict cleanup item"));
         }
@@ -41,13 +39,20 @@ impl Overlay {
         if *written != expected_written {
             return Err(OverlayError::Invalid("conflict cleanup progress"));
         }
-        let pending:Vec<(i64,Option<i64>,Option<i64>)>=self.query(StatementKind::Reclaim,
-            "SELECT phase,conflict_generation,conflict_cleanup_completed FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND generation=?2",
-            &[&attempt,&generation],24,|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        // Until retirement of an older installed conflict is implemented, a
-        // cleanup item must retain the exact failed-stage attempt as its owner.
-        if pending.as_slice() != [(3, Some(generation), Some(0))] {
-            return Err(OverlayError::Invalid("conflict cleanup owner"));
+        if item.phase == 0 {
+            if item.aux != -1 || !item.name.is_empty() {
+                return Err(OverlayError::Invalid("conflict cleanup item"));
+            }
+            let pending:Vec<(i64,Option<i64>,Option<i64>)>=self.query(StatementKind::Reclaim,
+                "SELECT phase,conflict_generation,conflict_cleanup_completed FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND generation=?2",
+                &[&attempt,&generation],24,|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            if pending.as_slice() != [(3, Some(generation), Some(0))] {
+                return Err(OverlayError::Invalid("conflict cleanup owner"));
+            }
+        } else {
+            crate::database::durable_conflict_stage::check_retired_active(
+                self, generation, item.aux, &item.name,
+            )?;
         }
         let stale: Vec<bool> = self.query(
             StatementKind::Reclaim,
@@ -91,7 +96,7 @@ impl Overlay {
             {
                 return Err(OverlayError::Invalid("conflict cleanup page"));
             }
-            self.advance_item(item, 0, item.cursor + 1, -1, &[])?;
+            self.advance_item(item, item.phase, item.cursor + 1, item.aux, &item.name)?;
             return Ok((1, expected as u64, false));
         }
         let extra: Vec<bool> = self.query(
@@ -113,10 +118,12 @@ impl Overlay {
         {
             return Err(OverlayError::Invalid("conflict cleanup predecessor"));
         }
-        if self.execute(StatementKind::Frontier,
-            "UPDATE durable_checkpoint_attempt SET conflict_cleanup_completed=1 WHERE id=1 AND attempt=?1 AND generation=?2 AND phase=3 AND conflict_generation=?2 AND conflict_cleanup_completed=0",
-            &[&attempt,&generation],40)?!=1 {
-            return Err(OverlayError::Invalid("conflict cleanup owner"));
+        if item.phase == 0 {
+            if self.execute(StatementKind::Frontier,
+                "UPDATE durable_checkpoint_attempt SET conflict_cleanup_completed=1 WHERE id=1 AND attempt=?1 AND generation=?2 AND phase=3 AND conflict_generation=?2 AND conflict_cleanup_completed=0",
+                &[&attempt,&generation],40)?!=1 {
+                return Err(OverlayError::Invalid("conflict cleanup owner"));
+            }
         }
         self.finish_item(item)?;
         Ok((0, 0, true))

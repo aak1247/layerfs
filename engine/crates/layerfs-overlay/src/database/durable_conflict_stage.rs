@@ -23,6 +23,19 @@ struct Plan {
     state: i64,
 }
 
+/// An active conflict's immutable local and history identities. This is not
+/// authorization to open either root or to trust a caller-supplied Store.
+pub(crate) struct ActiveConflict {
+    pub generation: i64,
+    pub attempt: Vec<u8>,
+    pub workspace: Vec<u8>,
+    pub catalog: Vec<u8>,
+    pub incarnation: i64,
+    pub root: Vec<u8>,
+    pub target: Vec<u8>,
+    pub digest: [u8; 32],
+}
+
 fn descriptor(generation: i64, plan: &Plan) -> OverlayResult<[u8; 32]> {
     if plan.attempt.len() != 32
         || plan.workspace.len() != 32
@@ -72,6 +85,136 @@ fn read_plan(db: &Overlay, generation: i64) -> OverlayResult<Plan> {
     Ok(rows.remove(0))
 }
 
+/// Validates the fixed active descriptor without scanning its paged content.
+/// Staging made each page immutable and proved the complete chain; cold bind
+/// must independently read and validate that chain before exposing a view.
+pub(crate) fn active_conflict(db: &Overlay) -> OverlayResult<Option<ActiveConflict>> {
+    if db.profile.schema_version != 44 {
+        return Ok(None);
+    }
+    let binding: Vec<(Vec<u8>, Vec<u8>, bool, Option<i64>, Option<Vec<u8>>)> = db.query(
+        StatementKind::Frontier,
+        "SELECT root,snapshot,recoverable,conflict_generation,conflict_digest FROM durable_binding WHERE id=1",
+        &[], 128, |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    )?;
+    let [(root, snapshot, true, generation, digest)] = binding.as_slice() else {
+        return Err(OverlayError::Invalid("conflict binding identity"));
+    };
+    let (generation, digest) = match (generation, digest) {
+        (None, None) => {
+            let rows: Vec<bool> = db.query(
+                StatementKind::Frontier,
+                "SELECT EXISTS(SELECT 1 FROM durable_conflict_plan WHERE state=1)",
+                &[],
+                8,
+                |r| r.get(0),
+            )?;
+            if rows.as_slice() != [false] {
+                return Err(OverlayError::Invalid("conflict active binding"));
+            }
+            return Ok(None);
+        }
+        (Some(g), Some(d)) => (*g, d),
+        _ => return Err(OverlayError::Invalid("conflict binding identity")),
+    };
+    let plan = read_plan(db, generation)?;
+    let actual = descriptor(generation, &plan)?;
+    let state = db.state()?;
+    let identity: Vec<Vec<u8>> = db.query(
+        StatementKind::Frontier,
+        "SELECT identity FROM durable_identity WHERE id=1",
+        &[],
+        32,
+        |r| r.get(0),
+    )?;
+    let current_namespace = db
+        .durable_namespace()?
+        .ok_or(OverlayError::Invalid("conflict namespace"))?;
+    if plan.state != 1
+        || plan.next_page != plan.pages
+        || plan.written != plan.bytes
+        || plan.chain != plan.final_digest
+        || plan.descriptor != actual
+        || digest.as_slice() != actual
+        || plan.root != *root
+        || plan.target != *snapshot
+        || plan.root.as_slice() != state.base_root
+        || generation != state.installed
+        || plan.namespace > current_namespace
+        || identity.as_slice() != [plan.workspace.clone()]
+    {
+        return Err(OverlayError::Invalid("conflict active binding"));
+    }
+    Ok(Some(ActiveConflict {
+        generation,
+        attempt: plan.attempt,
+        workspace: plan.workspace,
+        catalog: plan.catalog,
+        incarnation: plan.incarnation,
+        root: plan.root,
+        target: plan.target,
+        digest: actual,
+    }))
+}
+
+/// A successor's atomic pointer replacement is retained in the original
+/// maintenance item, so later attempts need not remain live during GC.
+pub(crate) fn check_retired_active(
+    db: &Overlay,
+    generation: i64,
+    next_generation: i64,
+    evidence: &[u8],
+) -> OverlayResult<()> {
+    if evidence.len() != 64
+        || next_generation <= generation
+        || db.state()?.installed < next_generation
+    {
+        return Err(OverlayError::Invalid("conflict retired successor"));
+    }
+    let plan = read_plan(db, generation)?;
+    let actual = descriptor(generation, &plan)?;
+    let workspace: Vec<Vec<u8>> = db.query(
+        StatementKind::Reclaim,
+        "SELECT identity FROM durable_identity WHERE id=1",
+        &[],
+        32,
+        |r| r.get(0),
+    )?;
+    let namespace = db
+        .durable_namespace()?
+        .ok_or(OverlayError::Invalid("conflict namespace"))?;
+    let successor: Vec<(Vec<u8>,i64,Option<Vec<u8>>,Vec<u8>,Vec<u8>,i64)> = db.query(
+        StatementKind::Reclaim,
+        "SELECT attempt,phase,original_pending_digest,workspace,catalog,incarnation FROM durable_checkpoint_attempt WHERE id=1 AND generation=?1",
+        &[&next_generation],
+        112,
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+    )?;
+    if plan.state != 2
+        || plan.next_page != plan.pages
+        || plan.written != plan.bytes
+        || plan.chain != plan.final_digest
+        || plan.descriptor != actual
+        || evidence[..32] != actual
+        || workspace.as_slice() != [plan.workspace.clone()]
+        || plan.namespace > namespace
+        || successor.len() > 1
+        || successor.first().is_some_and(
+            |(attempt, phase, pending, workspace, catalog, incarnation)| {
+                attempt.as_slice() != &evidence[32..]
+                    || !matches!(*phase, 4 | 5)
+                    || pending.as_deref() != Some(actual.as_slice())
+                    || workspace.as_slice() != plan.workspace
+                    || catalog.as_slice() != plan.catalog
+                    || *incarnation != plan.incarnation
+            },
+        )
+    {
+        return Err(OverlayError::Invalid("conflict retired identity"));
+    }
+    Ok(())
+}
+
 fn require_format(db: &Overlay) -> OverlayResult<()> {
     if db.durable.is_none() || db.profile.schema_version != 44 {
         return Err(OverlayError::Invalid("conflict staging format"));
@@ -87,7 +230,7 @@ pub(crate) fn require_no_stage(db: &Overlay, recorded: RecordedCapture) -> Overl
     }
     let rows: Vec<(Option<i64>, Option<i64>, bool, bool, bool)> = db.query(
         StatementKind::Frontier,
-        "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND phase=1 AND original_pending_digest IS NULL AND NOT EXISTS(SELECT 1 FROM durable_binding WHERE conflict_generation IS NOT NULL)",
+        "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND phase=1",
         &[&recorded.capture.generation.0, &recorded.attempt.as_slice()], 24,
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     )?;
@@ -115,6 +258,7 @@ pub(crate) fn cleanup_ready(
         [(None, None, false, false, false)] => Ok(true),
         [(Some(g), Some(0), _, _, _)] if *g == generation && phase == 3 => Ok(false),
         [(Some(g), Some(1), false, false, false)] if *g == generation && phase == 3 => Ok(true),
+        [(Some(g), Some(0), true, true, false)] if *g == generation && phase == 5 => Ok(true),
         _ => Err(OverlayError::Invalid("conflict cleanup state")),
     }
 }
@@ -142,13 +286,13 @@ impl Overlay {
         self.atomic_cleanup(|| {
             let namespace = super::durable_attempt::check_original(self, recorded)?;
             require_no_stage(self, recorded)?;
-            let rows: Vec<(Vec<u8>, Vec<u8>, i64, Option<Vec<u8>>, bool)> = self.query(
+            let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = self.query(
                 StatementKind::Frontier,
-                "SELECT workspace,catalog,incarnation,original_pending_digest,EXISTS(SELECT 1 FROM durable_binding WHERE conflict_generation IS NOT NULL) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND phase=1 AND request IS NULL",
+                "SELECT workspace,catalog,incarnation FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND phase=1 AND request IS NULL",
                 &[&recorded.attempt.as_slice(),&namespace], 112,
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
             )?;
-            let [(workspace,catalog,incarnation,None,false)] = rows.as_slice() else {
+            let [(workspace,catalog,incarnation)] = rows.as_slice() else {
                 return Err(OverlayError::Invalid("conflict staging predecessor"));
             };
             let generation=recorded.capture.generation.0;
@@ -181,7 +325,7 @@ impl Overlay {
             let namespace=super::durable_attempt::check_original(self,stage.recorded)?;
             let generation=stage.recorded.capture.generation.0;
             let marker: Vec<(Option<i64>,Option<i64>)>=self.query(StatementKind::Frontier,
-                "SELECT conflict_generation,conflict_cleanup_completed FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND phase=1 AND request IS NULL AND original_pending_digest IS NULL AND NOT EXISTS(SELECT 1 FROM durable_binding WHERE conflict_generation IS NOT NULL)",
+                "SELECT conflict_generation,conflict_cleanup_completed FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND phase=1 AND request IS NULL",
                 &[&stage.recorded.attempt.as_slice(),&namespace],16,|r|Ok((r.get(0)?,r.get(1)?)))?;
             let plan=read_plan(self,generation)?;
             if marker.as_slice()!=[(Some(generation),Some(0))] || plan.attempt!=stage.recorded.attempt || plan.namespace!=namespace
@@ -211,6 +355,98 @@ impl Overlay {
             Ok(())
         })
     }
+
+    /// Installs an already staged local conflict without sending History. The
+    /// caller authenticates the Store, target snapshot and marker root; this
+    /// atomic local transition alone does not authorize a cold recovery.
+    pub fn install_recorded_conflict(
+        &self,
+        stage: ConflictStage,
+        marker_root: [u8; 32],
+        target_snapshot: &[u8],
+    ) -> OverlayResult<()> {
+        require_format(self)?;
+        if target_snapshot.is_empty() || target_snapshot.len() > 4096 {
+            return Err(OverlayError::Invalid("conflict target snapshot"));
+        }
+        self.atomic_cleanup(|| {
+            let namespace=super::durable_attempt::check_original(self,stage.recorded)?;
+            if !self.install_ready(stage.recorded.capture)? { return Err(OverlayError::BaseSourcesPending); }
+            let generation=stage.recorded.capture.generation.0;
+            let marker:Vec<(Option<i64>,Option<i64>,bool)>=self.query(StatementKind::Frontier,
+                "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND namespace=?3 AND phase=1 AND request IS NULL",
+                &[&generation,&stage.recorded.attempt.as_slice(),&namespace],24,
+                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            let plan=read_plan(self,generation)?;
+            if marker.as_slice()!=[(Some(generation),Some(0),false)]
+                || plan.attempt!=stage.recorded.attempt || plan.namespace!=namespace || plan.state!=0
+                || plan.descriptor!=stage.descriptor || descriptor(generation,&plan)?!=stage.descriptor
+                || plan.root!=marker_root || plan.target!=target_snapshot || plan.next_page!=plan.pages
+                || plan.written!=plan.bytes || plan.chain!=plan.final_digest {
+                return Err(OverlayError::Invalid("conflict install predecessor"));
+            }
+            retire_active(self,stage.recorded)?;
+            if self.execute(StatementKind::Frontier,
+                "UPDATE durable_conflict_plan SET state=1 WHERE generation=?1 AND attempt=?2 AND descriptor_digest=?3 AND state=0",
+                &[&generation,&stage.recorded.attempt.as_slice(),&stage.descriptor.as_slice()],72)?!=1 {
+                return Err(OverlayError::Invalid("conflict install predecessor"));
+            }
+            self.install_captured_inner(stage.recorded.capture,marker_root,Some(target_snapshot))?;
+            if self.execute(StatementKind::Frontier,
+                "UPDATE durable_binding SET conflict_generation=?1,conflict_digest=?2 WHERE id=1 AND conflict_generation IS NULL AND conflict_digest IS NULL AND root=?3 AND snapshot=?4",
+                &[&generation,&stage.descriptor.as_slice(),&marker_root.as_slice(),&target_snapshot],target_snapshot.len() as u64+72)?!=1 {
+                return Err(OverlayError::Invalid("conflict install binding"));
+            }
+            if self.execute(StatementKind::Frontier,
+                "UPDATE durable_checkpoint_attempt SET phase=5,retire_completed=0 WHERE id=1 AND attempt=?1 AND namespace=?2 AND generation=?3 AND phase=1 AND conflict_generation=?3 AND conflict_cleanup_completed=0",
+                &[&stage.recorded.attempt.as_slice(),&namespace,&generation],48)?!=1 {
+                return Err(OverlayError::Invalid("conflict install predecessor"));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Clear and retire the previous marker only with its exact active pointer.
+/// The caller performs the replacement install in the same transaction.
+pub(crate) fn retire_active(db: &Overlay, successor: RecordedCapture) -> OverlayResult<()> {
+    let Some(active) = active_conflict(db)? else {
+        return Ok(());
+    };
+    let next_generation = successor.capture.generation.0;
+    if next_generation <= active.generation {
+        return Err(OverlayError::Invalid("conflict retirement successor"));
+    }
+    let queued: Vec<bool> = db.query(
+        StatementKind::Frontier,
+        "SELECT EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1)",
+        &[&active.generation],
+        8,
+        |r| r.get(0),
+    )?;
+    if queued.as_slice() != [false] {
+        return Err(OverlayError::Invalid("conflict retirement queue"));
+    }
+    if db.execute(StatementKind::Frontier,
+        "UPDATE durable_binding SET conflict_generation=NULL,conflict_digest=NULL WHERE id=1 AND conflict_generation=?1 AND conflict_digest=?2",
+        &[&active.generation,&active.digest.as_slice()],40)?!=1 {
+        return Err(OverlayError::Invalid("conflict retirement binding"));
+    }
+    if db.execute(StatementKind::Frontier,
+        "UPDATE durable_conflict_plan SET state=2 WHERE generation=?1 AND descriptor_digest=?2 AND state=1",
+        &[&active.generation,&active.digest.as_slice()],40)?!=1 {
+        return Err(OverlayError::Invalid("conflict retirement predecessor"));
+    }
+    let mut evidence = Vec::with_capacity(64);
+    evidence.extend_from_slice(&active.digest);
+    evidence.extend_from_slice(&successor.attempt);
+    if db.execute(StatementKind::Frontier,
+        "INSERT INTO cleanup_task(kind,resource,target,phase,cursor,aux,name) VALUES(13,0,?1,1,0,?2,?3)",
+        &[&active.generation,&next_generation,&evidence],80)?!=1 {
+        return Err(OverlayError::Invalid("conflict retirement queue"));
+    }
+    db.maintenance_ready.set(true);
+    Ok(())
 }
 
 /// Retires only this attempt's staging; an older active binding is unaffected.
@@ -224,7 +460,7 @@ pub(crate) fn retire_staging(
     }
     let generation = recorded.capture.generation.0;
     let rows:Vec<(Option<i64>,Option<i64>,bool,bool,bool)>=db.query(StatementKind::Frontier,
-        "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND namespace=?3 AND phase=1 AND original_pending_digest IS NULL AND NOT EXISTS(SELECT 1 FROM durable_binding WHERE conflict_generation IS NOT NULL)",
+        "SELECT conflict_generation,conflict_cleanup_completed,EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation=?1),EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1),EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13 AND resource=0 AND target=?1) FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?2 AND namespace=?3 AND phase=1",
         &[&generation,&recorded.attempt.as_slice(),&namespace],40,|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     match rows.as_slice() {
         [(None, None, false, false, false)] => Ok(()),

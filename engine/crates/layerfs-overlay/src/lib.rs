@@ -33,7 +33,8 @@ pub use close::CleanupState;
 pub use compound::SourceRows;
 pub use contract::checkpoint::{CheckpointCompletion, CheckpointOutcome};
 pub use contract::conflict::{
-    conflict_page_digest, ConflictStage, ConflictStageInput, CONFLICT_PAGE_BYTES,
+    conflict_page_digest, ConflictCompletion, ConflictStage, ConflictStageInput,
+    CONFLICT_PAGE_BYTES,
 };
 pub use contract::custody::{CapturedReader, FileRead, LookupOwner, OpenFile, OperationOwner};
 pub use contract::indexed_operation_record::{

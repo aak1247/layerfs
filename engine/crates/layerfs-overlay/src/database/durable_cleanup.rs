@@ -1,7 +1,7 @@
 //! Completion of the original, definitely unpublished checkpoint's local work.
 use crate::{
-    CheckpointCompletion, CheckpointOutcome, Overlay, OverlayError, OverlayResult, RecordedCapture,
-    StatementKind,
+    CheckpointCompletion, CheckpointOutcome, ConflictCompletion, Overlay, OverlayError,
+    OverlayResult, RecordedCapture, StatementKind,
 };
 
 struct Cleanup {
@@ -20,11 +20,18 @@ fn ready(
     db: &Overlay,
     recorded: RecordedCapture,
     installed: Option<CheckpointCompletion<'_>>,
+    conflict: Option<ConflictCompletion<'_>>,
 ) -> OverlayResult<(bool, i64)> {
     let state = db.live()?;
     let namespace = super::durable_attempt::check_context(db, recorded, false)?;
     let generation = recorded.capture.generation.0;
-    let phase = if installed.is_some() { 4_i64 } else { 3_i64 };
+    let phase = if installed.is_some() {
+        4_i64
+    } else if conflict.is_some() {
+        5_i64
+    } else {
+        3_i64
+    };
     let rows: Vec<Cleanup> = db.query(
         StatementKind::Frontier,
         "SELECT reader_owner,reader_request,reader_floor,reader_released,operation_owner,\
@@ -58,9 +65,31 @@ fn ready(
     if !super::durable_conflict_stage::cleanup_ready(db, recorded, phase)? {
         return Ok((false, namespace));
     }
-    if let Some(expected) = installed {
+    let expected_owners = if let Some(expected) = installed {
         check_installed(db, recorded, expected)?;
-        let expected_reader = expected.reader.map(|reader| {
+        if expected.recorded != recorded {
+            return Err(OverlayError::Invalid("checkpoint cleanup original owners"));
+        }
+        Some((expected.reader, expected.operation))
+    } else if let Some(expected) = conflict {
+        let active = super::durable_conflict_stage::active_conflict(db)?;
+        if expected.stage.recorded() != recorded
+            || !active.as_ref().is_some_and(|c| {
+                c.generation == generation
+                    && c.attempt == recorded.attempt
+                    && c.digest == expected.stage.descriptor()
+                    && c.root.as_slice() == expected.marker_root
+                    && c.target == expected.target_snapshot
+            })
+        {
+            return Err(OverlayError::Invalid("conflict cleanup identity"));
+        }
+        Some((expected.reader, expected.operation))
+    } else {
+        None
+    };
+    if let Some((reader, operation)) = expected_owners {
+        let expected_reader = reader.map(|reader| {
             (
                 reader.owner,
                 reader.capture,
@@ -79,9 +108,7 @@ fn ready(
             )),
             _ => return Err(OverlayError::Invalid("checkpoint reader cleanup identity")),
         };
-        let expected_operation = expected
-            .operation
-            .map(|owner| (owner.owner, owner.engine, owner.recorded));
+        let expected_operation = operation.map(|owner| (owner.owner, owner.engine, owner.recorded));
         let stored_operation = cleanup
             .operation
             .map(|owner| {
@@ -90,10 +117,7 @@ fn ready(
                     .map_err(|_| OverlayError::Invalid("checkpoint operation owner"))
             })
             .transpose()?;
-        if expected.recorded != recorded
-            || expected_reader != stored_reader
-            || expected_operation != stored_operation
-        {
+        if expected_reader != stored_reader || expected_operation != stored_operation {
             return Err(OverlayError::Invalid("checkpoint cleanup original owners"));
         }
     }
@@ -213,7 +237,7 @@ fn ready(
         }
     }
     if (phase == 3 && cleanup.fold_completed != Some(1))
-        || (phase == 4 && cleanup.fold_completed.is_some())
+        || (matches!(phase, 4 | 5) && cleanup.fold_completed.is_some())
         || cleanup.retire_completed != Some(1)
         || state.consolidating.is_some()
         || db.generation_held(generation)?
@@ -309,14 +333,14 @@ impl Overlay {
         &self,
         recorded: RecordedCapture,
     ) -> OverlayResult<bool> {
-        ready(self, recorded, None).map(|(ready, _)| ready)
+        ready(self, recorded, None, None).map(|(ready, _)| ready)
     }
 
     /// Rechecks and finishes the original definitely unpublished attempt once.
     /// Its caller must already have established that no publication was sent.
     pub fn finish_folded_checkpoint_cleanup(&self, recorded: RecordedCapture) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
-            let (complete, namespace) = ready(self, recorded, None)?;
+            let (complete, namespace) = ready(self, recorded, None, None)?;
             if !complete {
                 return Err(OverlayError::Invalid("checkpoint fold cleanup pending"));
             }
@@ -339,7 +363,7 @@ impl Overlay {
         &self,
         expected: CheckpointCompletion<'_>,
     ) -> OverlayResult<bool> {
-        ready(self, expected.recorded, Some(expected)).map(|(ready, _)| ready)
+        ready(self, expected.recorded, Some(expected), None).map(|(ready, _)| ready)
     }
 
     /// Finishes the exact installed checkpoint after its authenticated
@@ -350,7 +374,7 @@ impl Overlay {
     ) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             let recorded = expected.recorded;
-            let (complete, namespace) = ready(self, recorded, Some(expected))?;
+            let (complete, namespace) = ready(self, recorded, Some(expected), None)?;
             if !complete {
                 return Err(OverlayError::Invalid("checkpoint installed cleanup pending"));
             }
@@ -362,6 +386,33 @@ impl Overlay {
             )?;
             if changed != 1 {
                 return Err(OverlayError::Invalid("checkpoint installed cleanup predecessor"));
+            }
+            Ok(())
+        })
+    }
+
+    /// Observes original local-conflict cleanup without claiming Store authority.
+    pub fn conflict_checkpoint_cleanup_ready(
+        &self,
+        expected: ConflictCompletion<'_>,
+    ) -> OverlayResult<bool> {
+        ready(self, expected.stage.recorded(), None, Some(expected)).map(|(ready, _)| ready)
+    }
+
+    /// Finishes only the local attempt. Its active conflict plan remains bound
+    /// to the Workspace until a later authenticated replacement is installed.
+    pub fn finish_conflict_checkpoint_cleanup(
+        &self,
+        expected: ConflictCompletion<'_>,
+    ) -> OverlayResult<()> {
+        self.atomic_cleanup(|| {
+            let recorded=expected.stage.recorded();
+            let (complete,namespace)=ready(self,recorded,None,Some(expected))?;
+            if !complete { return Err(OverlayError::Invalid("conflict cleanup pending")); }
+            if self.execute(StatementKind::Frontier,
+                "DELETE FROM durable_checkpoint_attempt WHERE id=1 AND phase=5 AND attempt=?1 AND namespace=?2 AND generation=?3",
+                &[&recorded.attempt.as_slice(),&namespace,&recorded.capture.generation.0],48)?!=1 {
+                return Err(OverlayError::Invalid("conflict cleanup predecessor"));
             }
             Ok(())
         })

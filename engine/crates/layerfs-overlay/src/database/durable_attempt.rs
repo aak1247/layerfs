@@ -104,6 +104,16 @@ pub(crate) fn record(
         .durable_namespace()?
         .filter(|value| *value > 0)
         .ok_or(OverlayError::Invalid("recorded capture namespace"))?;
+    let active = super::durable_conflict_stage::active_conflict(db)?;
+    if active.as_ref().is_some_and(|conflict| {
+        conflict.workspace != workspace
+            || conflict.catalog != catalog
+            || conflict.incarnation != incarnation
+            || conflict.target != snapshot
+    }) {
+        return Err(OverlayError::Invalid("recorded conflict context"));
+    }
+    let pending = active.as_ref().map(|conflict| conflict.digest);
     let attempt = identity(
         &workspace,
         &catalog,
@@ -111,13 +121,36 @@ pub(crate) fn record(
         namespace,
         capture,
         snapshot,
+        pending.as_ref(),
     );
+    let statement = if db.profile.schema_version == 44 {
+        "INSERT INTO durable_checkpoint_attempt(id,attempt,workspace,catalog,incarnation,namespace,generation,revision,base_root,snapshot,original_pending_digest,phase) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)"
+    } else {
+        "INSERT INTO durable_checkpoint_attempt(id,attempt,workspace,catalog,incarnation,namespace,generation,revision,base_root,snapshot,phase) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,1)"
+    };
+    let pending_bytes = pending.as_ref().map(|value| value.as_slice());
+    let attempt_bytes = attempt.as_slice();
+    let workspace_bytes = workspace.as_slice();
+    let catalog_bytes = catalog.as_slice();
+    let base_bytes = capture.base_root.as_slice();
+    let mut args: Vec<&dyn rusqlite::ToSql> = vec![
+        &attempt_bytes,
+        &workspace_bytes,
+        &catalog_bytes,
+        &incarnation,
+        &namespace,
+        &capture.generation.0,
+        &capture.revision,
+        &base_bytes,
+        &snapshot,
+    ];
+    if db.profile.schema_version == 44 {
+        args.push(&pending_bytes);
+    }
     db.execute(
         StatementKind::Frontier,
-        "INSERT INTO durable_checkpoint_attempt(id,attempt,workspace,catalog,incarnation,namespace,generation,revision,base_root,snapshot,phase) \
-         VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,1)",
-        &[&attempt.as_slice(), &workspace.as_slice(), &catalog.as_slice(), &incarnation, &namespace,
-          &capture.generation.0, &capture.revision, &capture.base_root.as_slice(), &snapshot],
+        statement,
+        &args,
         snapshot.len() as u64 + 144,
     )?;
     Ok(attempt)
@@ -130,9 +163,14 @@ fn identity(
     namespace: i64,
     capture: Capture,
     snapshot: &[u8],
+    pending: Option<&[u8; 32]>,
 ) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"layerfs-checkpoint-attempt-v1\0");
+    hash.update(if pending.is_some() {
+        b"layerfs-checkpoint-attempt-v2\0"
+    } else {
+        b"layerfs-checkpoint-attempt-v1\0"
+    });
     hash.update(workspace);
     hash.update(catalog);
     hash.update(&incarnation.to_be_bytes());
@@ -142,6 +180,9 @@ fn identity(
     hash.update(&capture.base_root);
     hash.update(&(snapshot.len() as u64).to_be_bytes());
     hash.update(snapshot);
+    if let Some(pending) = pending {
+        hash.update(pending);
+    }
     *hash.finalize().as_bytes()
 }
 
@@ -154,6 +195,7 @@ struct AttemptContext {
     reader_floor: Option<i64>,
     candidate: Option<Vec<u8>>,
     installed_snapshot: Option<Vec<u8>>,
+    pending_digest: Option<Vec<u8>>,
 }
 
 /// Checks the complete original context before a recorded owner or send stage.
@@ -175,11 +217,14 @@ pub(super) fn check_context(
         .durable_namespace()?
         .filter(|value| *value > 0)
         .ok_or(OverlayError::Invalid("recorded capture namespace"))?;
+    let sql = if db.profile.schema_version == 44 {
+        "SELECT workspace,catalog,incarnation,snapshot,phase,reader_floor,candidate_root,installed_snapshot,original_pending_digest FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND generation=?3 AND revision=?4 AND base_root=?5"
+    } else {
+        "SELECT workspace,catalog,incarnation,snapshot,phase,reader_floor,candidate_root,installed_snapshot,NULL FROM durable_checkpoint_attempt WHERE id=1 AND attempt=?1 AND namespace=?2 AND generation=?3 AND revision=?4 AND base_root=?5"
+    };
     let original: Vec<AttemptContext> = db.query(
         StatementKind::Frontier,
-        "SELECT workspace,catalog,incarnation,snapshot,phase,reader_floor,candidate_root,installed_snapshot FROM durable_checkpoint_attempt \
-         WHERE id=1 AND attempt=?1 AND namespace=?2 AND generation=?3 \
-         AND revision=?4 AND base_root=?5",
+        sql,
         &[
             &recorded.attempt.as_slice(),
             &namespace,
@@ -188,16 +233,27 @@ pub(super) fn check_context(
             &capture.base_root.as_slice(),
         ],
         112,
-        |row| Ok(AttemptContext {
-            workspace: row.get(0)?, catalog: row.get(1)?, incarnation: row.get(2)?,
-            snapshot: row.get(3)?, phase: row.get(4)?, reader_floor: row.get(5)?,
-            candidate: row.get(6)?, installed_snapshot: row.get(7)?,
-        }),
+        |row| {
+            Ok(AttemptContext {
+                workspace: row.get(0)?,
+                catalog: row.get(1)?,
+                incarnation: row.get(2)?,
+                snapshot: row.get(3)?,
+                phase: row.get(4)?,
+                reader_floor: row.get(5)?,
+                candidate: row.get(6)?,
+                installed_snapshot: row.get(7)?,
+                pending_digest: row.get(8)?,
+            })
+        },
     )?;
     let [original] = original.as_slice() else {
         return Err(OverlayError::Invalid("checkpoint publication predecessor"));
     };
-    if (starting && original.phase != 1) || (!starting && ![1, 2, 3, 4].contains(&original.phase)) {
+    if (starting && original.phase != 1)
+        || (!starting && ![1, 2, 3, 4, 5].contains(&original.phase))
+        || (original.phase == 5 && db.profile.schema_version != 44)
+    {
         return Err(OverlayError::Invalid("checkpoint publication predecessor"));
     }
     match original.phase {
@@ -223,6 +279,13 @@ pub(super) fn check_context(
             && state.revision >= capture.revision
             && original.candidate.as_deref() == Some(state.base_root.as_slice())
             && original.installed_snapshot.is_some() => {}
+        5 if capture.engine() == db.identity
+            && state.captured.is_none()
+            && state.captured_revision.is_none()
+            && state.consolidating.is_none()
+            && state.installed == capture.generation.0
+            && capture.generation.0.checked_add(1) == Some(state.active.0)
+            && state.revision >= capture.revision => {}
         _ => return Err(OverlayError::Invalid("checkpoint fold state")),
     }
     let identities: Vec<Vec<u8>> = db.query(
@@ -232,10 +295,42 @@ pub(super) fn check_context(
         0,
         |row| row.get(0),
     )?;
-    let expected_binding = if original.phase == 4 {
-        original.installed_snapshot.as_deref()
-    } else {
-        Some(original.snapshot.as_slice())
+    let pending = original
+        .pending_digest
+        .as_deref()
+        .map(|v| <&[u8; 32]>::try_from(v))
+        .transpose()
+        .map_err(|_| OverlayError::Invalid("checkpoint pending identity"))?;
+    let active = super::durable_conflict_stage::active_conflict(db)?;
+    if matches!(original.phase, 1 | 2 | 3) {
+        if active.as_ref().map(|c| c.digest).as_ref() != pending
+            || active.as_ref().is_some_and(|c| {
+                c.workspace != original.workspace
+                    || c.catalog != original.catalog
+                    || c.incarnation != original.incarnation
+                    || c.target != original.snapshot
+            })
+        {
+            return Err(OverlayError::Invalid("checkpoint pending identity"));
+        }
+    } else if original.phase == 5 {
+        if !active.as_ref().is_some_and(|c| {
+            c.generation == capture.generation.0
+                && c.attempt == recorded.attempt
+                && c.workspace == original.workspace
+                && c.catalog == original.catalog
+                && c.incarnation == original.incarnation
+                && c.root.as_slice() == state.base_root
+        }) {
+            return Err(OverlayError::Invalid("checkpoint conflict identity"));
+        }
+    } else if active.is_some() {
+        return Err(OverlayError::Invalid("checkpoint pending identity"));
+    }
+    let expected_binding = match original.phase {
+        4 => original.installed_snapshot.as_deref(),
+        5 => active.as_ref().map(|c| c.target.as_slice()),
+        _ => Some(original.snapshot.as_slice()),
     };
     if original.workspace.len() != 32
         || original.catalog.len() != 32
@@ -250,6 +345,7 @@ pub(super) fn check_context(
             namespace,
             capture,
             &original.snapshot,
+            pending,
         ) != recorded.attempt
     {
         return Err(OverlayError::Invalid("checkpoint original identity"));
@@ -471,13 +567,13 @@ pub(crate) fn maintenance_completed(
             "UPDATE durable_checkpoint_attempt SET fold_completed=1 WHERE id=1 AND phase=3 AND generation=?1 AND fold_completed=0"
         }
         (3, 0, generation) if generation == context.generation => {
-            if ![3, 4].contains(&context.phase)
+            if ![3, 4, 5].contains(&context.phase)
                 || (context.phase == 3 && context.fold_completed != Some(1))
                 || context.retire_completed != Some(0)
             {
                 return Err(OverlayError::Invalid("checkpoint retirement completion"));
             }
-            "UPDATE durable_checkpoint_attempt SET retire_completed=1 WHERE id=1 AND phase IN(3,4) AND generation=?1 AND retire_completed=0"
+            "UPDATE durable_checkpoint_attempt SET retire_completed=1 WHERE id=1 AND phase IN(3,4,5) AND generation=?1 AND retire_completed=0"
         }
         (6, owner, _) if context.operation == Some(owner) => {
             if target != 2
@@ -588,6 +684,7 @@ impl Overlay {
             if changed != 1 {
                 return Err(OverlayError::Invalid("checkpoint install predecessor"));
             }
+            super::durable_conflict_stage::retire_active(self,recorded)?;
             self.install_captured_inner(recorded.capture, candidate_root, Some(installed_snapshot))
         })
     }

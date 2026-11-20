@@ -1,5 +1,5 @@
 //! Typed local-conflict staging, without publication or recovery authority.
-use crate::{OverlayError, OverlayResult, RecordedCapture};
+use crate::{CapturedReader, OperationOwner, OverlayError, OverlayResult, RecordedCapture};
 
 /// Fixed maximum bytes in one persisted conflict path page.
 pub const CONFLICT_PAGE_BYTES: usize = 16_384;
@@ -28,6 +28,17 @@ impl ConflictStage {
     pub const fn descriptor(self) -> [u8; 32] {
         self.descriptor
     }
+}
+
+/// The exact locally installed conflict and original construction owners.
+/// The caller must separately authenticate the Store and its historical target.
+#[derive(Clone, Copy)]
+pub struct ConflictCompletion<'a> {
+    pub stage: ConflictStage,
+    pub marker_root: [u8; 32],
+    pub target_snapshot: &'a [u8],
+    pub reader: Option<CapturedReader>,
+    pub operation: Option<OperationOwner>,
 }
 
 /// One page-chain step. The initial predecessor is 32 zero bytes. Callers
