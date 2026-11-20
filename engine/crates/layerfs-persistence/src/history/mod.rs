@@ -4,6 +4,7 @@ mod ancestry;
 mod bindings;
 mod branch;
 mod catalog;
+mod checkpoint;
 mod commit;
 mod digests;
 mod hints;

@@ -161,6 +161,25 @@ impl HistoryCatalog for HistoryProvider {
         self.write(|tx| commit::commit_branch(tx, request))
     }
 
+    fn require_checkpoint_receipts(&self) -> HistoryResult<()> {
+        self.checkpoint_receipts_supported()
+    }
+
+    fn commit_checkpoint(
+        &self,
+        attempt: CheckpointAttemptId,
+        request: &CommitRequest,
+    ) -> HistoryResult<CommitOutcome> {
+        self.checkpoint_commit(attempt, request)
+    }
+
+    fn checkpoint_receipt(
+        &self,
+        attempt: CheckpointAttemptId,
+    ) -> HistoryResult<Option<CheckpointReceipt>> {
+        self.read_checkpoint_receipt(attempt)
+    }
+
     fn add_layer(&self, request: &AddLayerRequest) -> HistoryResult<AddLayerOutcome> {
         self.write(|tx| layerstack::add_layer(tx, request))
     }

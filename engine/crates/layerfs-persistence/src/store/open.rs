@@ -107,7 +107,7 @@ impl Handles {
             return Err(PersistenceError::Malformed);
         }
         let catalog_id = CatalogId::derive(binding).map_err(|_| PersistenceError::Malformed)?;
-        let incarnation = session.validate(catalog_id, binding)?;
+        let (incarnation, checkpoint_format) = session.validate(catalog_id, binding)?;
         let storage = Arc::new(StorageProvider {
             session: session.clone(),
         });
@@ -119,6 +119,7 @@ impl Handles {
                 catalog_id,
                 incarnation,
                 cursor_key,
+                checkpoint_format,
             },
         })
     }

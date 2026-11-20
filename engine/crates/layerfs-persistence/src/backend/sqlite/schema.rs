@@ -22,10 +22,27 @@ pub(crate) const LINEAGE: &str = include_str!("../../../sql/sqlite/lineage.sql")
 pub(crate) const SCRATCH: &str = include_str!("../../../sql/sqlite/merge_scratch.sql");
 /// Whole-content file digests (#364); a Store written before them gains them at open.
 pub(crate) const DIGESTS: &str = include_str!("../../../sql/sqlite/file_digest.sql");
+const CHECKPOINT_RECEIPTS: &str = include_str!("../../../sql/sqlite/checkpoint_receipts.sql");
 const UNIT_INDEX: &str = include_str!("../../../sql/sqlite/objects_units_index.sql");
 const UNITS: &str = include_str!("../../../sql/sqlite/objects_units.sql");
 const ACQUISITION: &str = include_str!("../../../sql/sqlite/acquisition/schema.sql");
 type Selection = (crate::SqlitePackLayout, crate::SqliteAcquisitionSchema);
+
+/// A format established by the authenticated schema, not a caller preference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointFormat {
+    Legacy,
+    Receipts,
+}
+
+impl CheckpointFormat {
+    fn for_creation(profile: crate::SqlitePersistenceProfile) -> Self {
+        match profile {
+            crate::SqlitePersistenceProfile::Durable => Self::Receipts,
+            crate::SqlitePersistenceProfile::Disposable => Self::Legacy,
+        }
+    }
+}
 fn scripts((layout, acquisition): Selection) -> Vec<String> {
     let objects = match layout {
         crate::SqlitePackLayout::Monolithic => OBJECTS.to_owned(),
@@ -50,6 +67,13 @@ fn scripts((layout, acquisition): Selection) -> Vec<String> {
 pub(crate) fn source(selection: Selection) -> String {
     scripts(selection).concat()
 }
+fn format_source(selection: Selection, format: CheckpointFormat) -> String {
+    let mut source = source(selection);
+    if format == CheckpointFormat::Receipts {
+        source.push_str(CHECKPOINT_RECEIPTS);
+    }
+    source
+}
 pub(crate) fn definition(c: &Connection, w: &RefCell<SqlWork>) -> Result<String, BackendError> {
     let rows: Vec<Record> = query::run(
         c,
@@ -72,6 +96,7 @@ pub(crate) fn check(
     w: &RefCell<SqlWork>,
     (layout, acquisition): Selection,
     profile: crate::SqlitePersistenceProfile,
+    format: CheckpointFormat,
 ) -> Result<(), BackendError> {
     let app = query::run(c, "PRAGMA application_id", vec![], w)?
         .first()
@@ -126,11 +151,24 @@ pub(crate) fn check(
             "sqlite_sequence",
         ]);
     }
+    if format == CheckpointFormat::Receipts {
+        expected.push("checkpoint_receipt");
+    }
     expected.sort_unstable();
     if actual != expected {
         return Err(BackendError::Integrity);
     }
     Ok(())
+}
+
+fn expected_definition(
+    selection: Selection,
+    format: CheckpointFormat,
+) -> Result<String, BackendError> {
+    let connection = Connection::open_in_memory().map_err(super::rows::error)?;
+    let work = RefCell::new(SqlWork::default());
+    query::batch(&connection, &format_source(selection, format), &work)?;
+    definition(&connection, &work)
 }
 
 impl super::connection::Session {
@@ -143,12 +181,14 @@ impl super::connection::Session {
         self.run::<_,BackendError>(true,|tx| {
    let version=self.schema_version();
    let selection=(self.layout,self.acquisition);
+   let format=CheckpointFormat::for_creation(self.profile.persistence);
    for script in scripts(selection) { tx.bootstrap(&script)?; }
+   if format==CheckpointFormat::Receipts { tx.bootstrap(CHECKPOINT_RECEIPTS)?; }
    tx.query(&format!("PRAGMA application_id={}",application_id(self.profile.persistence)),vec![])?;
    tx.query(&format!("PRAGMA user_version={version}"),vec![])?;
    tx.query(&format!("INSERT INTO store_policy(id,schema_version,format_profile,small_file_threshold_bytes,whole_file_delta_max_depth,chunk_delta_max_depth,metadata_delta_max_depth) VALUES(1,{version},?1,?2,?3,?4,?5)"),vec![Param::I64(i64::from(policy.format_profile())),Param::I64(policy.small_file_threshold_bytes() as i64),Param::I64(i64::from(policy.whole_file_delta_max_depth())),Param::I64(i64::from(policy.chunk_delta_max_depth())),Param::I64(i64::from(policy.metadata_delta_max_depth()))])?;
    let definition=definition(tx.connection,tx.work)?;
-   tx.query(&format!("INSERT INTO history_meta(id,catalog_id,catalog_incarnation,binding_key,identity_format,schema_version,schema_source,schema_definition) VALUES(1,?1,?2,?3,3,{version},?4,?5)"),vec![Param::Bytes(catalog_id.as_slice().to_vec()),Param::I64(history.incarnation as i64),Param::Bytes(history.binding_key.clone()),Param::Text(source(selection)),Param::Text(definition)])?;
+   tx.query(&format!("INSERT INTO history_meta(id,catalog_id,catalog_incarnation,binding_key,identity_format,schema_version,schema_source,schema_definition) VALUES(1,?1,?2,?3,3,{version},?4,?5)"),vec![Param::Bytes(catalog_id.as_slice().to_vec()),Param::I64(history.incarnation as i64),Param::Bytes(history.binding_key.clone()),Param::Text(format_source(selection,format)),Param::Text(definition)])?;
    Ok(())
   })?;
         Ok(())
@@ -316,15 +356,20 @@ impl super::connection::Session {
         &self,
         catalog_id: layerfs_history::CatalogId,
         binding: &[u8],
-    ) -> Result<u64, BackendError> {
+    ) -> Result<(u64, CheckpointFormat), BackendError> {
         self.run::<_,BackendError>(false,|tx| {
    let selection=(self.layout,self.acquisition);
-   check(tx.connection,tx.work,selection,self.profile.persistence)?;
    let rows=tx.query("SELECT catalog_id,catalog_incarnation,binding_key,identity_format,schema_version,schema_source,schema_definition FROM history_meta WHERE id=1",vec![])?;
    let r=rows.first().filter(|_|rows.len()==1).ok_or(BackendError::Integrity)?;
    let incarnation:i64=r.get(1)?;
-   if r.get::<Vec<u8>>(0)?!=catalog_id.as_slice() || r.get::<Vec<u8>>(2)?!=binding || incarnation<=0 || r.get::<i64>(3)?!=3 || r.get::<i64>(4)?!=self.schema_version() || r.get::<String>(5)?!=source(selection) || r.get::<String>(6)?!=definition(tx.connection,tx.work)? {return Err(BackendError::Integrity);}
-   Ok(incarnation as u64)
+   let recorded_source=r.get::<String>(5)?;
+   let format=if recorded_source==format_source(selection,CheckpointFormat::Legacy) { CheckpointFormat::Legacy }
+      else if self.profile.persistence==crate::SqlitePersistenceProfile::Durable && recorded_source==format_source(selection,CheckpointFormat::Receipts) { CheckpointFormat::Receipts }
+      else { return Err(BackendError::Integrity); };
+   check(tx.connection,tx.work,selection,self.profile.persistence,format)?;
+   let recorded_definition=r.get::<String>(6)?;
+   if r.get::<Vec<u8>>(0)?!=catalog_id.as_slice() || r.get::<Vec<u8>>(2)?!=binding || incarnation<=0 || r.get::<i64>(3)?!=3 || r.get::<i64>(4)?!=self.schema_version() || recorded_definition!=definition(tx.connection,tx.work)? || recorded_definition!=expected_definition(selection,format)? {return Err(BackendError::Integrity);}
+   Ok((incarnation as u64,format))
   })
     }
 }

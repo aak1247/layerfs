@@ -216,6 +216,12 @@ pub trait HistoryCatalog: Send + Sync {
     /// Unknown retains the original request; nothing is reread or replayed.
     fn commit_branch(&self, request: &CommitRequest) -> HistoryResult<CommitOutcome>;
 
+    /// Checks whether this authenticated Store can record checkpoint outcomes.
+    /// Call before creating a durable capture that depends on such an outcome.
+    fn require_checkpoint_receipts(&self) -> HistoryResult<()> {
+        Err(crate::HistoryError::Unsupported("checkpoint receipt"))
+    }
+
     /// Publishes once and records its exact outcome in the same Store transaction.
     /// The default refuses: it never falls back to the unrecorded operation.
     fn commit_checkpoint(

@@ -8,4 +8,5 @@ pub struct HistoryProvider {
     pub(crate) catalog_id: CatalogId,
     pub(crate) incarnation: u64,
     pub(crate) cursor_key: [u8; 32],
+    pub(crate) checkpoint_format: crate::backend::sqlite::schema::CheckpointFormat,
 }

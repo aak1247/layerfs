@@ -59,6 +59,12 @@ pub(crate) fn history(key: &str) -> Result<&'static str, BackendError> {
         "commit_insert_commit" => Ok(include_str!(
             "../../../sql/sqlite/queries/history/commit_insert_commit.sql"
         )),
+        "checkpoint_receipt_insert" => Ok(include_str!(
+            "../../../sql/sqlite/queries/history/checkpoint_receipt_insert.sql"
+        )),
+        "checkpoint_receipt_select" => Ok(include_str!(
+            "../../../sql/sqlite/queries/history/checkpoint_receipt_select.sql"
+        )),
         "layerstack_advance_stack" => Ok(include_str!(
             "../../../sql/sqlite/queries/history/layerstack_advance_stack.sql"
         )),
