@@ -33,6 +33,11 @@ impl Overlay {
             if !self.install_ready(capture)? {
                 return Err(OverlayError::BaseSourcesPending);
             }
+            if crate::database::durable_attempt::pending(self)? {
+                return Err(OverlayError::Invalid(
+                    "recorded capture requires disposition",
+                ));
+            }
             match snapshot {
                 Some(snapshot) => {
                     self.install_durable_binding(capture.base_root, root, snapshot)?
@@ -102,43 +107,67 @@ impl Overlay {
     /// Seals existing rows without copying them. The daemon parks capture until
     /// earlier reply attempts settle; this method does not block a SQL owner.
     pub fn capture(&self) -> OverlayResult<Capture> {
+        self.atomic_cleanup(|| self.capture_inner())
+    }
+    /// Captures and records one prepublication checkpoint in the same durable
+    /// transaction. The caller authenticates the catalog and physical Store;
+    /// this local record alone does not authorize recovery or prove publication.
+    pub fn capture_recorded(
+        &self,
+        workspace: [u8; 32],
+        catalog: [u8; 32],
+        incarnation: u64,
+        snapshot: &[u8],
+    ) -> OverlayResult<crate::RecordedCapture> {
         self.atomic_cleanup(|| {
-            let state = self.live()?;
-            if state.captured.is_some() {
-                return Err(OverlayError::CaptureInFlight);
-            }
-            if state.consolidating.is_some() {
-                return Err(OverlayError::Consolidating);
-            }
-            if self.tickets.pending() {
-                return Err(OverlayError::ReplyAttemptsPending);
-            }
-            let next = state
-                .active
-                .0
-                .checked_add(1)
-                .ok_or(OverlayError::Invalid("generation exhausted"))?;
-            self.change_state(|current| {
-                current.captured = Some(state.active);
-                current.captured_revision = Some(state.revision);
-                current.active = crate::Generation(next);
-                current.dirty_inodes = 0;
-                current.dirty_directory_entries = 0;
-                Ok(())
-            })?;
-            // Kept rows are frozen with the generation; construction of this
-            // capture carries them again.
-            let kept: Vec<i64> = self.open.borrow().kept_live.rows.keys().copied().collect();
-            crate::database::durable_kept::clear(self, state.active.0, kept.len())?;
-            for serial in kept {
-                self.open.borrow_mut().kept_live.remove(serial);
-            }
-            Ok(Capture {
-                engine: self.identity,
-                generation: state.active,
-                revision: state.revision,
-                base_root: state.base_root,
-            })
+            let capture = self.capture_inner()?;
+            let attempt = crate::database::durable_attempt::record(
+                self,
+                workspace,
+                catalog,
+                incarnation,
+                snapshot,
+                capture,
+            )?;
+            Ok(crate::RecordedCapture { capture, attempt })
+        })
+    }
+    fn capture_inner(&self) -> OverlayResult<Capture> {
+        let state = self.live()?;
+        if state.captured.is_some() {
+            return Err(OverlayError::CaptureInFlight);
+        }
+        if state.consolidating.is_some() {
+            return Err(OverlayError::Consolidating);
+        }
+        if self.tickets.pending() {
+            return Err(OverlayError::ReplyAttemptsPending);
+        }
+        let next = state
+            .active
+            .0
+            .checked_add(1)
+            .ok_or(OverlayError::Invalid("generation exhausted"))?;
+        self.change_state(|current| {
+            current.captured = Some(state.active);
+            current.captured_revision = Some(state.revision);
+            current.active = crate::Generation(next);
+            current.dirty_inodes = 0;
+            current.dirty_directory_entries = 0;
+            Ok(())
+        })?;
+        // Kept rows are frozen with the generation; construction of this
+        // capture carries them again.
+        let kept: Vec<i64> = self.open.borrow().kept_live.rows.keys().copied().collect();
+        crate::database::durable_kept::clear(self, state.active.0, kept.len())?;
+        for serial in kept {
+            self.open.borrow_mut().kept_live.remove(serial);
+        }
+        Ok(Capture {
+            engine: self.identity,
+            generation: state.active,
+            revision: state.revision,
+            base_root: state.base_root,
         })
     }
     /// Captured inode page with a fixed indexed domain and bounded reply. Later

@@ -240,6 +240,21 @@ impl Capture {
         self.engine
     }
 }
+/// One live capture and its immutable, durably recorded checkpoint identity.
+/// This identity is not itself proof of publication or recovery authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedCapture {
+    pub(crate) capture: Capture,
+    pub(crate) attempt: [u8; 32],
+}
+impl RecordedCapture {
+    pub const fn capture(self) -> Capture {
+        self.capture
+    }
+    pub const fn attempt(self) -> [u8; 32] {
+        self.attempt
+    }
+}
 /// Bounded read-only installed state; no namespace counting or payload acquisition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkspaceState {

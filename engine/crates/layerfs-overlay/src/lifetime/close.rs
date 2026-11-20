@@ -30,7 +30,8 @@ impl Overlay {
             || state.captured.is_some()
             || state.base_readers != 0
             || self.tickets.pending()
-            || pins;
+            || pins
+            || crate::database::durable_attempt::pending(self)?;
         Ok(if held {
             CleanupState::Held
         } else {
@@ -59,6 +60,11 @@ impl Overlay {
         self.atomic_cleanup(|| {
             let state = self.state()?;
             self.checked_capture(capture)?;
+            if crate::database::durable_attempt::pending(self)? {
+                return Err(OverlayError::Invalid(
+                    "recorded capture requires disposition",
+                ));
+            }
             if !state.closed {
                 return Err(OverlayError::Stale);
             }

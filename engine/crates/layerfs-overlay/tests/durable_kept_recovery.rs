@@ -233,7 +233,7 @@ fn kept_rows_do_not_hide_unresolved_operation_or_legacy_custody() {
     );
     connection
         .execute_batch(
-            "DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
+            "DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
         )
         .unwrap();
     drop(connection);
@@ -281,7 +281,7 @@ fn clean_legacy_41_reopens_without_implicit_conversion() {
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
+            "DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
         )
         .unwrap();
     drop(connection);
@@ -303,7 +303,7 @@ fn legacy_42_reconstructs_kept_rows_without_implicit_conversion() {
     let fixture = Fixture::new();
     drop(with_kept(&fixture));
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
-    connection.execute_batch("DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=42;").unwrap();
+    connection.execute_batch("DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=42;").unwrap();
     drop(connection);
     let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
     assert_eq!(db.profile().schema_version, 42);

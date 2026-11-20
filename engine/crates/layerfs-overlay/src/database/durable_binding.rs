@@ -74,6 +74,7 @@ impl Overlay {
             || state.captured.is_some()
             || state.consolidating.is_some()
             || super::durable::volatile(self)
+            || super::durable_attempt::pending(self)?
         {
             return Err(OverlayError::Invalid(
                 "durable overlay requires reconciliation",

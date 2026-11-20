@@ -205,7 +205,7 @@ fn legacy_durable_database_reopens_without_implicit_conversion() {
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE durable_binding; DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=39;",
+            "DROP TABLE durable_binding; DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=39;",
         )
         .unwrap();
     drop(connection);
@@ -232,7 +232,7 @@ fn legacy_schema_40_keeps_its_binding_without_a_namespace_conversion() {
     db.close_database().unwrap();
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
-        .execute_batch("DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=40;")
+        .execute_batch("DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=40;")
         .unwrap();
     drop(connection);
     let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();

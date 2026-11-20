@@ -350,6 +350,7 @@ mod linux {
                 0,
             )?;
             crate::database::durable_owners::initialize(&db)?;
+            crate::database::durable_attempt::initialize(&db)?;
             db.execute(StatementKind::Startup, "PRAGMA user_version=43", &[], 0)?;
             db.execute(
                 StatementKind::Startup,
@@ -510,11 +511,22 @@ mod linux {
         } else {
             0
         };
+        let pending_attempt = if profile.has_recorded_owners() {
+            super::super::profile::readback(
+                &connection,
+                &work,
+                "SELECT EXISTS(SELECT 1 FROM durable_checkpoint_attempt)",
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
         if state.closed
             || state.captured.is_some()
             || state.consolidating.is_some()
             || held
             || pending
+            || pending_attempt
         {
             return Err(OverlayError::Invalid(
                 "durable overlay requires reconciliation",

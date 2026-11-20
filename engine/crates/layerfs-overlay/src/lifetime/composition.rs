@@ -13,6 +13,11 @@ impl Overlay {
     pub fn resolve_failed_capture(&self, capture: Capture) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             self.checked_capture(capture)?;
+            if crate::database::durable_attempt::pending(self)? {
+                return Err(OverlayError::Invalid(
+                    "recorded capture requires disposition",
+                ));
+            }
             if self.state()?.closed {
                 return Err(OverlayError::Closed);
             };
