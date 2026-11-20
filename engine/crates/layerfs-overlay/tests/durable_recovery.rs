@@ -205,7 +205,7 @@ fn legacy_durable_database_reopens_without_implicit_conversion() {
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE durable_binding; DROP TABLE durable_route; PRAGMA user_version=39;",
+            "DROP TABLE durable_binding; DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=39;",
         )
         .unwrap();
     drop(connection);
@@ -232,7 +232,7 @@ fn legacy_schema_40_keeps_its_binding_without_a_namespace_conversion() {
     db.close_database().unwrap();
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
-        .execute_batch("DROP TABLE durable_route; PRAGMA user_version=40;")
+        .execute_batch("DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=40;")
         .unwrap();
     drop(connection);
     let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
@@ -254,7 +254,7 @@ fn legacy_schema_40_keeps_its_binding_without_a_namespace_conversion() {
 fn namespace_requires_initialization_and_strictly_increases() {
     let fixture = Fixture::new();
     let db = create(&fixture.path());
-    assert_eq!(db.profile().schema_version, 41);
+    assert_eq!(db.profile().schema_version, 42);
     assert_eq!(db.durable_namespace().unwrap(), None);
     assert!(db.advance_durable_namespace(1).is_err());
     db.initialize_durable_namespace(7).unwrap();

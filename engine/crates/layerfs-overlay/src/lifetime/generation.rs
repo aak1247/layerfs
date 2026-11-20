@@ -129,6 +129,7 @@ impl Overlay {
             // Kept rows are frozen with the generation; construction of this
             // capture carries them again.
             let kept: Vec<i64> = self.open.borrow().kept_live.rows.keys().copied().collect();
+            crate::database::durable_kept::clear(self, state.active.0, kept.len())?;
             for serial in kept {
                 self.open.borrow_mut().kept_live.remove(serial);
             }

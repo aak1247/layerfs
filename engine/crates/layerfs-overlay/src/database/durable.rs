@@ -59,10 +59,12 @@ impl Drop for Lease {
     }
 }
 
-/// Runtime custody that cannot yet be reconstructed after process loss.
+/// Runtime custody that the selected durable format cannot reconstruct.
 pub(super) fn volatile(db: &Overlay) -> bool {
     let open = db.open.borrow();
-    db.orphan_seen.get() || !open.kept_live.rows.is_empty() || open.operations.len() != 0
+    db.orphan_seen.get()
+        || (!db.profile.has_classified_custody() && !open.kept_live.rows.is_empty())
+        || open.operations.len() != 0
 }
 
 pub(super) fn same_persistent_state(a: Option<WorkspaceState>, b: Option<WorkspaceState>) -> bool {
@@ -329,7 +331,25 @@ mod linux {
                 &[],
                 0,
             )?;
-            db.execute(StatementKind::Startup, "PRAGMA user_version=41", &[], 0)?;
+            db.execute(
+                StatementKind::Startup,
+                "CREATE TABLE durable_kept_live(serial INTEGER PRIMARY KEY CHECK(serial>0), generation INTEGER NOT NULL CHECK(generation>0)) STRICT",
+                &[],
+                0,
+            )?;
+            db.execute(
+                StatementKind::Startup,
+                "CREATE TABLE durable_custody(id INTEGER PRIMARY KEY CHECK(id=1), orphan_owners INTEGER NOT NULL CHECK(orphan_owners IN(0,1)), operation_owners INTEGER NOT NULL CHECK(operation_owners IN(0,1)), kept_count INTEGER NOT NULL CHECK(kept_count>=0)) STRICT",
+                &[],
+                0,
+            )?;
+            db.execute(
+                StatementKind::Startup,
+                "INSERT INTO durable_custody(id,orphan_owners,operation_owners,kept_count) VALUES(1,0,0,0)",
+                &[],
+                0,
+            )?;
+            db.execute(StatementKind::Startup, "PRAGMA user_version=42", &[], 0)?;
             db.execute(
                 StatementKind::Startup,
                 "PRAGMA application_id=1279676211",
@@ -344,7 +364,7 @@ mod linux {
             )?;
             Ok(())
         })?;
-        db.profile.schema_version = 41;
+        db.profile.schema_version = 42;
         let sync = db.allocation.sync_durable_file().and_then(|_| {
             File::open(
                 path.parent()
@@ -415,7 +435,7 @@ mod linux {
             super::super::profile::readback(&connection, &work, "PRAGMA user_version", |r| {
                 r.get(0)
             })?;
-        if ![39, 40, 41].contains(&profile.schema_version) {
+        if ![39, 40, 41, 42].contains(&profile.schema_version) {
             return Err(OverlayError::Invalid("durable overlay schema version"));
         }
         let integrity: String =
@@ -429,7 +449,7 @@ mod linux {
         // Ready retirement is safe only for an installed generation with a
         // matching recorded receipt. The caller still fences the old mount and
         // validates that receipt against the same authorized Store first.
-        let bound = if matches!(profile.schema_version, 40 | 41) {
+        let bound = if profile.has_durable_binding() {
             super::super::profile::readback(
                 &connection,
                 &work,
@@ -452,6 +472,24 @@ mod linux {
         };
         let pending: bool =
             super::super::profile::readback(&connection, &work, pending_sql, |r| r.get(0))?;
+        let kept_count = if profile.has_classified_custody() {
+            let (orphan, operation, kept): (bool, bool, i64) = super::super::profile::readback(
+                &connection,
+                &work,
+                "SELECT orphan_owners,operation_owners,kept_count FROM durable_custody WHERE id=1",
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if held != (orphan || operation) {
+                return Err(OverlayError::Invalid("durable custody record changed"));
+            }
+            u64::try_from(kept).map_err(|_| OverlayError::Invalid("durable kept count invalid"))?
+        } else if held && profile.schema_version == 41 {
+            return Err(OverlayError::Invalid(
+                "legacy durable volatile custody unresolved",
+            ));
+        } else {
+            0
+        };
         if state.closed
             || state.captured.is_some()
             || state.consolidating.is_some()
@@ -476,7 +514,7 @@ mod linux {
         let quarantine = super::super::connection_owner::Quarantine::default();
         quarantine.set_durable();
         lease.track(quarantine.clone());
-        Ok(Overlay {
+        let db = Overlay {
             identity: engine,
             connection: super::super::connection_owner::ConnectionOwner::new(
                 connection,
@@ -500,7 +538,11 @@ mod linux {
             profile,
             allocation,
             durable: Some(lease),
-        })
+        };
+        if db.profile.has_classified_custody() {
+            super::super::durable_kept::restore(&db, state.active.0, bound, kept_count)?;
+        }
+        Ok(db)
     }
 
     struct StoredState {

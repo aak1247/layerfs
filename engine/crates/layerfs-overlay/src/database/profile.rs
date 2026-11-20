@@ -41,6 +41,22 @@ pub struct DatabaseProfile {
     pub temp_store: i64,
     pub auto_vacuum: i64,
 }
+
+impl DatabaseProfile {
+    /// Whether the durable format records the authenticated Branch snapshot.
+    pub fn has_durable_binding(&self) -> bool {
+        matches!(self.schema_version, 40..=42)
+    }
+
+    /// Whether the durable format records the consumed namespace high-water.
+    pub fn has_durable_namespace(&self) -> bool {
+        matches!(self.schema_version, 41 | 42)
+    }
+
+    pub(crate) fn has_classified_custody(&self) -> bool {
+        self.schema_version == 42
+    }
+}
 pub(crate) fn initialize(
     c: &Connection,
     config: ProfileConfig,

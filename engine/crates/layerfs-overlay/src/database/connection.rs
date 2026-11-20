@@ -388,6 +388,11 @@ impl Overlay {
             .durable
             .as_ref()
             .map(|_| crate::database::durable::volatile(self));
+        let custody = self.durable.as_ref().and_then(|_| {
+            self.profile
+                .has_classified_custody()
+                .then(|| crate::database::durable_kept::custody(self))
+        });
         let result = job().and_then(|value| {
             if let Some(previous) = volatile {
                 let current = crate::database::durable::volatile(self);
@@ -398,6 +403,12 @@ impl Overlay {
                     )
                 {
                     crate::database::durable::save(self, current)?;
+                }
+            }
+            if let Some(previous) = custody {
+                let current = crate::database::durable_kept::custody(self);
+                if current != previous {
+                    crate::database::durable_kept::save_custody(self, current)?;
                 }
             }
             Ok(value)

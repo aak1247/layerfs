@@ -4,7 +4,7 @@ use crate::{Overlay, OverlayError, OverlayResult, StatementKind};
 impl Overlay {
     /// The last namespace consumed for this Workspace, if initialized.
     pub fn durable_namespace(&self) -> OverlayResult<Option<i64>> {
-        if self.durable.is_none() || self.profile.schema_version != 41 {
+        if self.durable.is_none() || !self.profile.has_durable_namespace() {
             return Err(OverlayError::Invalid("durable namespace profile"));
         }
         let rows = self.query(

@@ -259,7 +259,7 @@ impl Owner {
                 "durable Workspace base root",
             )));
         }
-        if db.profile().schema_version == 41 {
+        if db.profile().has_durable_namespace() {
             db.advance_durable_namespace(spec.namespace)
                 .map_err(OwnerError::Overlay)?;
         }
@@ -310,7 +310,7 @@ impl Owner {
         };
         let incarnation = admission(&spec)?;
         let db = Overlay::recover_durable(path, profile, identity).map_err(OwnerError::Overlay)?;
-        if choose_next && db.profile().schema_version != 41 {
+        if choose_next && !db.profile().has_durable_namespace() {
             return Err(OwnerError::Overlay(OverlayError::Invalid(
                 "durable namespace freshness is not recorded",
             )));
@@ -341,7 +341,7 @@ impl Owner {
             } else {
                 namespace
             };
-        if db.profile().schema_version == 41 {
+        if db.profile().has_durable_namespace() {
             db.advance_durable_namespace(namespace)
                 .map_err(OwnerError::Overlay)?;
         }

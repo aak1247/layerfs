@@ -111,6 +111,7 @@ impl Overlay {
                 .checked_add(1)
                 .ok_or(OverlayError::Invalid("revision exhausted"))?;
             self.open.borrow_mut().kept_live.put(key, ());
+            crate::database::durable_kept::record(self, key, state.active.0)?;
             self.change_state(|state| {
                 state.revision = revision;
                 Ok(())
@@ -120,13 +121,17 @@ impl Overlay {
     }
     /// True when `serial`'s active row was kept live and not written since.
     /// It is no longer kept: the caller writes that row and counts it dirty.
-    pub(crate) fn unkeep(&self, serial: i64) -> bool {
+    pub(crate) fn unkeep(&self, serial: i64) -> OverlayResult<bool> {
         let mut open = self.open.borrow_mut();
         let kept = open.kept_live.rows.contains_key(&serial);
         if kept {
             open.kept_live.remove(serial);
         }
-        kept
+        drop(open);
+        if kept {
+            crate::database::durable_kept::forget(self, serial, self.state()?.active.0)?;
+        }
+        Ok(kept)
     }
     /// Latest local inode at the current view; None delegates to immutable base.
     pub fn inode(&self, serial: u64) -> OverlayResult<Option<Inode>> {
@@ -303,7 +308,7 @@ impl Overlay {
             return Err(OverlayError::Invalid("inode row of the running job"));
         }
         // A kept row is active but was never counted: this write counts it.
-        let kept = !orphan && self.unkeep(serial);
+        let kept = !orphan && self.unkeep(serial)?;
         Ok(((!active && !orphan) || kept, layer))
     }
     /// The active row and the latest lower row of one name within

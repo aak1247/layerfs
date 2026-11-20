@@ -23,7 +23,7 @@ engine instead of allowing it to resume.
 lock. The caller supplies the stable identity, the expected base root and a
 daemon-local namespace. Recovery refuses a different stored root, and makes a
 fresh random internal route incarnation so a route from the old owner cannot
-select the recovered connection. New schema 41 files also persist a
+select the recovered connection. Schema 41 and 42 files also persist a
 per-Workspace high-water mark before an owner or recovered token is returned.
 Recovery requires a strictly greater namespace and records it durably before
 exposing the new owner; gaps are allowed and a failed or unknown attempt must
@@ -45,23 +45,23 @@ replace the original view: a later explicit Commit uses the existing merge
 path. The caller must keep the owner private during binding and authenticate
 its Workspace, Store and requested Branch; the snapshot is not authorization.
 
-New durable overlay files use schema 41 and persist their encoded snapshot.
+New durable overlay files use schema 42 and persist their encoded snapshot.
 For a known published Commit, its new snapshot and the overlay's installed
 base advance in the same SQLite transaction. An install without a known
 receipt marks the binding unresolved in that transaction; recovery refuses it
 until reconciled. A subsequent known publication in the live owner can replace
 that marker. A crash with a pending capture still refuses automatic recovery.
-Existing schema 39 and 40 durable files are not converted; the caller must
-independently prove a fresh namespace for either format. Schema 39 also
+Existing schema 39, 40 and 41 durable files are not converted. The caller must
+independently prove a fresh namespace for schema 39 or 40. Schema 39 also
 requires the caller's independently retained snapshot. Old inode reservation
 windows are not reused; future allocations require the same durable Store
 authority and scope.
-`Owner::recover_recorded` reads the snapshot and root from schema 40 or 41 without
+`Owner::recover_recorded` reads the snapshot and root from schema 40, 41 or 42 without
 requiring an external root, but still requires the independently known file
 path and Workspace identity. The resulting snapshot must pass Store binding
 and the caller's authorization and old-owner fencing checks.
 `Owner::recover_recorded_next` also selects a namespace greater than the
-schema-41 high-water mark while holding the original file lease. Its caller
+schema-41/42 high-water mark while holding the original file lease. Its caller
 supplies a minimum and must serialize it with all other live Workspace routes;
 legacy schemas lack this evidence and are refused by that method.
 
@@ -193,6 +193,19 @@ qualified cleanup rows remain available to ordinary bounded maintenance. The cal
 must separately prove the old mount and consumers have stopped, validate the
 base root against its authorized Store, and reconcile any unknown external operation before exposing
 the returned state. A released file lock alone does not establish those facts.
+
+Schema 42 records each carried live inode and its active generation, together
+with a count and separate orphan/operation custody. The rows and custody change
+in the same transaction as the filesystem and lifecycle state. After the usual
+owner, binding and pending-work checks, reopening validates every carried row
+against the active inode and reconstructs the kept set in bounded pages. A later
+write counts a carried inode dirty once; a capture transfers the kept set along
+with its generation. Missing or inconsistent records require reconciliation.
+Schema 41 has only an aggregate volatile bit, so a set bit cannot establish
+that its custody consists solely of carried rows; that database remains retained
+and recovery refuses it. This format does not establish external fencing or
+reconcile an unknown operation, and recovery never silently upgrades a legacy
+database.
 
 The scoped tests cover same- and cross-process ownership, identity mismatch,
 process termination after acknowledged writes, further writes after reopening,

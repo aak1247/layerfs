@@ -285,7 +285,7 @@ fn legacy_binding_requires_external_namespace_freshness() {
 
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection
-        .execute_batch("DROP TABLE durable_route; PRAGMA user_version=40;")
+        .execute_batch("DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=40;")
         .unwrap();
     drop(connection);
     assert!(matches!(

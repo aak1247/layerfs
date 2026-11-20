@@ -144,7 +144,7 @@ impl Overlay {
         let top = match layers.first().filter(|layer| layer.gen == state.active.0) {
             Some(layer) => {
                 // Folding into a kept row writes it: it is counted now.
-                if self.unkeep(serial) {
+                if self.unkeep(serial)? {
                     self.dirty_counts(1, 0)?;
                 }
                 *layer
