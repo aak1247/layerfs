@@ -20,6 +20,7 @@ pub mod read_service;
 pub mod recognizer;
 pub mod settle;
 pub mod statistics;
+mod synchronize;
 pub mod types;
 pub use bind::checked_base;
 pub use commit_merge::{Stale, StaleError, LANE_MERGE_PATHS};
@@ -41,6 +42,7 @@ pub use ports::{PortError, StorePorts};
 pub use read_handle::StoreReader;
 pub use read_service::{ReadAdmissionError, ReadServiceWork, ReaderFactory};
 pub use recognizer::{Recognizer, RecognizerWork, RECOGNIZER_SLOTS};
+pub use synchronize::{SynchronizeFailure, SynchronizeStep};
 pub use types::{BindError, BindPhase, BindRefusal, BindRequest, BindSuccess, CloseError};
 
 pub use commit_types::owner_uncertain;

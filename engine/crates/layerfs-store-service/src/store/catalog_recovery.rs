@@ -74,7 +74,7 @@ pub struct PreparedCatalogRecovery {
     pending: OverlayCatalogRecovery,
     record: LocalRecord,
     snapshot: BranchSnapshot,
-    conflict: Option<Arc<super::commit_merge::PendingMerge>>,
+    conflict: Option<Arc<super::commit_merge::PendingProjection>>,
 }
 impl fmt::Debug for PreparedCatalogRecovery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -91,7 +91,7 @@ pub struct RecoveredCatalogBinding {
     request: BindRequest,
     snapshot: BranchSnapshot,
     namespace: i64,
-    conflict: Option<(SettledConflict, Arc<super::commit_merge::PendingMerge>)>,
+    conflict: Option<(SettledConflict, Arc<super::commit_merge::PendingProjection>)>,
 }
 impl RecoveredCatalogBinding {
     pub fn snapshot(&self) -> &BranchSnapshot {
@@ -116,7 +116,7 @@ impl Store {
             .map_err(|error| {
                 Box::new(CatalogPreparationFailure::Open(OwnerError::Overlay(error)))
             })?;
-        let prepared=(|| -> Result<(LocalRecord,BranchSnapshot,Option<Arc<super::commit_merge::PendingMerge>>),BindError> {
+        let prepared=(|| -> Result<(LocalRecord,BranchSnapshot,Option<Arc<super::commit_merge::PendingProjection>>),BindError> {
             let (bytes,root,record)=match &pending {
                 OverlayCatalogRecovery::Ready(value)=>{
                     let observed=value.observed().clone();
@@ -155,7 +155,10 @@ impl Store {
                         decoder.push(number,&bytes).map_err(|message|BindError::History(HistoryError::Integrity(message)))?;
                     }
                     let conflicted=decoder.finish().map_err(|message|BindError::History(HistoryError::Integrity(message)))?;
-                    Some(Arc::new(super::commit_merge::PendingMerge{local_root:marker,conflicted}))
+                    Some(Arc::new(super::commit_merge::PendingProjection {
+                        merge: super::commit_merge::PendingMerge { local_root:marker, conflicted },
+                        descriptor: Some(observed.descriptor),
+                    }))
                 }
                 _=>return Err(identity_error()),
             };

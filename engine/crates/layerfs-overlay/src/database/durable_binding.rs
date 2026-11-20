@@ -1,6 +1,18 @@
 //! Durable opaque Branch metadata, paired with an Overlay base root.
 use crate::{Overlay, OverlayError, OverlayResult, StatementKind};
 
+/// Locally checked conflict facts for a Store-authenticated synchronization.
+/// This value does not itself authenticate a Store or fence another owner.
+pub struct ConflictSyncIdentity<'a> {
+    pub workspace: [u8; 32],
+    pub catalog: [u8; 32],
+    pub incarnation: u64,
+    pub namespace: i64,
+    pub marker_root: [u8; 32],
+    pub target_snapshot: &'a [u8],
+    pub descriptor: [u8; 32],
+}
+
 impl Overlay {
     /// Stores the first trusted Branch record for a newly created Workspace.
     /// The caller authenticates and encodes it; this engine validates its
@@ -62,24 +74,7 @@ impl Overlay {
     /// The caller still validates the recorded base against its durable Store
     /// and must fence the previous mount and external operations after loss.
     pub fn require_recorded_recovery_ready(&self) -> OverlayResult<()> {
-        self.available()?;
-        if self.transaction.get() != super::connection::Transaction::None {
-            return Err(OverlayError::Invalid("recovery check inside atomic job"));
-        }
-        if self.durable_binding()?.is_none() {
-            return Err(OverlayError::Invalid("durable binding is absent"));
-        }
-        let state = self.state()?;
-        if state.closed
-            || state.captured.is_some()
-            || state.consolidating.is_some()
-            || super::durable::volatile(self)
-            || super::durable_attempt::pending(self)?
-        {
-            return Err(OverlayError::Invalid(
-                "durable overlay requires reconciliation",
-            ));
-        }
+        self.require_bound_ready()?;
         if self.profile.schema_version == 44 {
             super::durable_conflict::verify_schema(self)?;
             let pending = self.query(
@@ -98,6 +93,80 @@ impl Overlay {
                 ));
             }
         }
+        self.require_ready_cleanup()
+    }
+
+    /// Checks one settled active conflict for a local barrier. The caller
+    /// authenticates the actual Store and Workspace and verifies its base;
+    /// these local comparisons alone do not authorize recovery or a mount.
+    pub fn require_conflict_synchronize_ready(
+        &self,
+        expected: &ConflictSyncIdentity<'_>,
+    ) -> OverlayResult<()> {
+        self.require_bound_ready()?;
+        if self.profile.schema_version != 44 {
+            return Err(OverlayError::Invalid(
+                "durable conflict synchronization identity",
+            ));
+        }
+        super::durable_conflict::verify_schema(self)?;
+        let active = super::durable_conflict_stage::active_conflict(self)?.ok_or(
+            OverlayError::Invalid("durable conflict synchronization identity"),
+        )?;
+        if active.workspace.as_slice() != expected.workspace
+            || active.catalog.as_slice() != expected.catalog
+            || u64::try_from(active.incarnation).ok() != Some(expected.incarnation)
+            || self.durable_namespace()? != Some(expected.namespace)
+            || active.root.as_slice() != expected.marker_root
+            || active.target.as_slice() != expected.target_snapshot
+            || active.digest != expected.descriptor
+        {
+            return Err(OverlayError::Invalid(
+                "durable conflict synchronization identity",
+            ));
+        }
+        let other = self.query(
+            StatementKind::Frontier,
+            "SELECT EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation<?1) \
+             OR EXISTS(SELECT 1 FROM durable_conflict_plan WHERE generation>?1) \
+             OR EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation<?1) \
+             OR EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation>?1) \
+             OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13)",
+            &[&active.generation],
+            8,
+            |row| row.get::<_, bool>(0),
+        )?;
+        if other.as_slice() != [false] {
+            return Err(OverlayError::Invalid(
+                "durable conflict requires reconciliation",
+            ));
+        }
+        self.require_ready_cleanup()
+    }
+
+    fn require_bound_ready(&self) -> OverlayResult<()> {
+        self.available()?;
+        if self.transaction.get() != super::connection::Transaction::None {
+            return Err(OverlayError::Invalid("recovery check inside atomic job"));
+        }
+        if self.durable_binding()?.is_none() {
+            return Err(OverlayError::Invalid("durable binding is absent"));
+        }
+        let state = self.state()?;
+        if state.closed
+            || state.captured.is_some()
+            || state.consolidating.is_some()
+            || super::durable::volatile(self)
+            || super::durable_attempt::pending(self)?
+        {
+            return Err(OverlayError::Invalid(
+                "durable overlay requires reconciliation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_ready_cleanup(&self) -> OverlayResult<()> {
         let pending = self.query(
             StatementKind::Frontier,
             super::durable::BOUND_PENDING_SQL,

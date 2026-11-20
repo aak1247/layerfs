@@ -13,7 +13,7 @@ use layerfs_content::{
 use layerfs_history::BranchSnapshot;
 use layerfs_storage::Save;
 use layerfs_workspace::{InodeSerials, WorkspaceError};
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 /// Serials one reservation takes while a merge needs fresh ones.
 const MERGE_SERIALS: u64 = 64;
@@ -34,9 +34,24 @@ pub struct PendingMerge {
     pub conflicted: Vec<String>,
 }
 
+/// The private binding of the visible merge to its durable local plan.
+pub(super) struct PendingProjection {
+    pub merge: PendingMerge,
+    pub descriptor: Option<[u8; 32]>,
+}
+impl Deref for PendingProjection {
+    type Target = PendingMerge;
+
+    fn deref(&self) -> &Self::Target {
+        &self.merge
+    }
+}
+
 impl BoundWorkspace {
     /// Clone only the immutable handle while holding the projection lock.
-    pub(super) fn pending_snapshot(&self) -> Result<Option<Arc<PendingMerge>>, WorkspaceError> {
+    pub(super) fn pending_snapshot(
+        &self,
+    ) -> Result<Option<Arc<PendingProjection>>, WorkspaceError> {
         self.pending
             .lock()
             .map(|pending| pending.clone())

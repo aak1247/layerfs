@@ -409,13 +409,13 @@ impl BoundWorkspace {
                 // Nothing is published: the history binding follows the head
                 // merged with, and the merge stays the local base.
                 next = current.clone();
-                let pending = Arc::new(super::commit_merge::PendingMerge {
+                let pending = super::commit_merge::PendingMerge {
                     local_root: candidate.0,
                     conflicted: merge
                         .as_ref()
                         .map(|report| report.conflicts.iter().map(|c| c.path.clone()).collect())
                         .unwrap_or_default(),
-                });
+                };
                 if let Some(recorded) = retained.recorded {
                     let version = self
                         .job(|client, route| {
@@ -477,7 +477,10 @@ impl BoundWorkspace {
                         paths: description,
                     });
                 }
-                Some(pending)
+                Some(Arc::new(super::commit_merge::PendingProjection {
+                    merge: pending,
+                    descriptor: conflict.as_ref().map(|value| value.stage.descriptor()),
+                }))
             } else {
                 retained.phase = CommitPhase::Publish;
                 let intent = retained.intent.as_ref().expect("checked intent");

@@ -245,7 +245,8 @@ impl BoundWorkspace {
             .pending_snapshot()
             .map_err(CommitError::Workspace)?
             .ok_or(CommitError::Context("conflict projection is absent"))?;
-        if pending.local_root != conflict.marker
+        if pending.descriptor != Some(conflict.stage.descriptor())
+            || pending.local_root != conflict.marker
             || super::conflict_paths::pages(&pending.conflicted, |_, _| Ok(()))? != conflict.paths
         {
             return Err(CommitError::Context("conflict path projection"));

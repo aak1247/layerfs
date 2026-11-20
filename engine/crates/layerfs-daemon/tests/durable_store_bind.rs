@@ -12,9 +12,12 @@ use layerfs_daemon::{
     bootstrap::open_store,
     control::{Failure, Service},
     durable_roster::{Authority, Roster, WorkspaceRecord},
-    store::{BindRequest, BoundWorkspace, CommitError, CommitOptions},
+    store::{
+        BindRequest, BoundWorkspace, CommitError, CommitOptions, StoreOperation, SynchronizeStep,
+    },
     Owner, OwnerConfig, OwnerError,
 };
+use layerfs_fuse::{operations::KernelRead, ports::Fenced, MountRequests};
 use layerfs_history::{CommitOutcome, HistoryError, WorkspaceId};
 use layerfs_overlay::{
     conflict_page_digest, ConflictCompletion, ConflictStageInput, MaintenanceCursor, Overlay,
@@ -22,8 +25,114 @@ use layerfs_overlay::{
 };
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
-use layerfs_workspace::{Operation, Outcome, Position, Time};
-use std::{os::unix::fs::PermissionsExt, path::Path};
+use layerfs_workspace::{KernelReadOperation, Operation, Outcome, Position, Time};
+use std::{
+    future::Future,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::{mpsc, Arc},
+    task::{Context, Poll, Wake, Waker},
+    time::{Duration, Instant},
+};
+
+struct WakeTest(mpsc::SyncSender<()>);
+impl Wake for WakeTest {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+fn wait<T>(future: impl Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let (send, receive) = mpsc::sync_channel(1);
+    let waker = Waker::from(Arc::new(WakeTest(send)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            return value;
+        }
+        receive
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("bounded request did not complete");
+    }
+}
+
+fn synchronize_bound_workspace(workspace: &BoundWorkspace, stale: Option<&StoreOperation>) {
+    let operation = workspace.operation().unwrap();
+    let root = operation
+        .workspace()
+        .base()
+        .unwrap()
+        .root()
+        .root_inode()
+        .serial();
+    let client = operation.overlay().clone();
+    let route = workspace.route();
+    let mount = client.kernel_mount(route, root).unwrap();
+    let requests = MountRequests::new(mount);
+    let services = layerfs_daemon::mount_request(workspace, &requests.fence()).unwrap();
+    let lookup = wait(KernelRead::prepare(
+        services.clone(),
+        mount,
+        1,
+        root,
+        None,
+        KernelReadOperation::Lookup {
+            parent: root,
+            name: PathName::new("file-000000").unwrap(),
+        },
+    ))
+    .unwrap();
+    let serial = lookup.value().unwrap().stat.serial;
+    wait(lookup.dispose()).unwrap();
+    let opened = wait(KernelRead::prepare(
+        services.clone(),
+        mount,
+        2,
+        serial,
+        None,
+        KernelReadOperation::Open {
+            serial,
+            writable: true,
+        },
+    ))
+    .unwrap();
+    let file = opened.value().unwrap().file.unwrap().owner_id();
+    wait(opened.dispose()).unwrap();
+    let opened = wait(KernelRead::prepare(
+        services.clone(),
+        mount,
+        3,
+        root,
+        None,
+        KernelReadOperation::Opendir { serial: root },
+    ))
+    .unwrap();
+    let directory = opened.value().unwrap().directory.unwrap().owner_id();
+    wait(opened.dispose()).unwrap();
+    assert!(wait(services.synchronize(mount, serial, file, false)).is_ok());
+    assert!(wait(services.synchronize(mount, root, directory, true)).is_ok());
+    if let Some(stale) = stale {
+        assert!(matches!(
+            stale.synchronize_cancellable(mount, serial, file, false, Arc::new(|| false)),
+            Ok(SynchronizeStep::Unavailable)
+        ));
+    }
+    let wrong = wait(services.synchronize(mount, serial, u64::MAX, false))
+        .err()
+        .unwrap();
+    assert!(matches!(wrong.downcast_ref::<OwnerError>(),
+        Some(OwnerError::Attempted(failure)) if matches!(failure.cause.as_ref(), OwnerError::Overlay(OverlayError::Stale))));
+    requests.stop_service().unwrap();
+    let stopped = wait(services.synchronize(mount, serial, file, false))
+        .err()
+        .unwrap();
+    assert!(stopped.is::<Fenced>());
+    wait(services.close_file(mount, serial, file)).unwrap();
+    wait(services.close_directory(mount, root, directory)).unwrap();
+    wait(services.forget(mount, serial, 1)).unwrap();
+    client.kernel_revoke(route, mount).unwrap();
+}
 
 fn spec(path: &Path, root: [u8; 32]) -> DurableWorkspace<'_> {
     DurableWorkspace {
@@ -423,12 +532,22 @@ fn catalog_conflict_paths_preserve_cross_page_utf8_order_and_duplicates() {
         .workspace;
     assert_eq!(bound.identity(), id);
     assert!(bound.route().namespace() > 1);
+    assert_eq!(bound.pending_conflicts().unwrap(), Some(paths.clone()));
+    let before_sync = read(&bound, "file-000000");
+    synchronize_bound_workspace(&bound, None);
+    assert_eq!(read(&bound, "file-000000"), before_sync);
     assert_eq!(bound.pending_conflicts().unwrap(), Some(paths));
     drop(bound);
     store.close_reader(id).unwrap();
     owner.stop().unwrap();
     drop(roster);
     drop(store);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: i64 = history
+        .query_row("SELECT count(*) FROM checkpoint_receipt", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(receipts, 0);
+    drop(history);
     fixture.cleanup();
 }
 fn read(workspace: &BoundWorkspace, name: &str) -> Vec<u8> {
@@ -564,6 +683,7 @@ fn recorded_conflict_keeps_markers_until_resolved_then_publishes_once() {
         )
         .unwrap()
         .workspace;
+    let pre_conflict = second.operation().unwrap();
     let mut ours = support::bytes(0);
     ours[0] = b'X';
     let mut theirs = support::bytes(0);
@@ -599,9 +719,17 @@ fn recorded_conflict_keeps_markers_until_resolved_then_publishes_once() {
             .unwrap(),
         winning
     );
-    assert!(String::from_utf8(read(&second, "file-000000"))
+    let marker = read(&second, "file-000000");
+    assert!(String::from_utf8(marker.clone())
         .unwrap()
         .contains("<<<<<<< workspace"));
+    synchronize_bound_workspace(&second, Some(&pre_conflict));
+    assert_eq!(read(&second, "file-000000"), marker);
+    assert_eq!(
+        second.pending_conflicts().unwrap(),
+        Some(vec!["/file-000000".into()])
+    );
+    let pending_operation = second.operation().unwrap();
     assert_eq!(read(&first, "file-000000"), ours);
     let refused = second
         .commit_captured(&CommitOptions::default())
@@ -625,6 +753,9 @@ fn recorded_conflict_keeps_markers_until_resolved_then_publishes_once() {
     ));
     assert!(second.pending_conflicts().unwrap().is_none());
     assert_eq!(read(&second, "file-000000"), b"resolved\n");
+    synchronize_bound_workspace(&second, Some(&pending_operation));
+    drop(pre_conflict);
+    drop(pending_operation);
     drop(first);
     drop(second);
     store.close_reader(id1).unwrap();

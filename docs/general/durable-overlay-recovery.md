@@ -74,9 +74,9 @@ This recovers the pending conflict for an explicit resolution; it does not resen
 the earlier Commit. Ordinary Overlay and Owner recovery continue to reject the
 active conflict, and pending captures, publications and orphan custody remain
 unreconciled. The caller still proves the original processes, mounts and
-consumers have stopped. Active-conflict FUSE synchronization remains unavailable
-until its bound Store and Overlay barriers are integrated. These component tests
-do not establish crash, FUSE or Sandbox recovery.
+consumers have stopped. Nonprivileged request-adapter tests exercise the bound
+Store and Overlay barriers for a live conflict and a separately reconstructed
+cold conflict; a physical FUSE mount and Sandbox recovery remain unverified.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it
@@ -167,11 +167,14 @@ local custody returns EAGAIN without attempting the Overlay sync; failed
 sync returns EIO and retains its original failure. A stop may cancel waiting
 for the Store or Workspace owner before an attempt, while an attempted sync
 retains its original result.
-The service-owner variant also requires a recorded root-matched binding and
-applies reopening's capture, volatile-custody, operation-record and cleanup
-refusals. Its checks use the existing generation and cleanup indexes; they do
-not repeat `quick_check` or authorize recovery of an old mount or unknown
-external action.
+The service-owner variant also requires a recorded binding and applies
+reopening's capture, volatile-custody, operation-record and cleanup refusals.
+A settled active conflict may synchronize only through the actual bound
+Workspace, Store and private descriptor projection; a stale projection or
+unsettled capture refuses the barrier. The local marker and pending paths are
+not changed, and synchronization does not publish a History receipt. Its checks
+use the existing generation and cleanup indexes; they do not repeat
+`quick_check` or authorize recovery of an old mount or unknown external action.
 
 The durable profile is SQLite DELETE/EXTRA/EXCLUSIVE. SQLite documents that
 [FULL alone is not necessarily durable in DELETE mode](https://sqlite.org/pragma.html#pragma_synchronous).

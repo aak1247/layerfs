@@ -1,6 +1,9 @@
 //! Async Fuse ports over typed Workspace calls and direct Store readers.
 use crate::{
-    store::{BoundWorkspace, PortError, ReadAdmissionError, StoreOperation},
+    store::{
+        BoundWorkspace, PortError, ReadAdmissionError, StoreOperation, SynchronizeFailure,
+        SynchronizeStep,
+    },
     OwnerError,
 };
 use layerfs_fuse::ports::{
@@ -45,11 +48,6 @@ impl MountServices for Mounted {
             SyncCapability::Disposable
         }
     }
-}
-enum SyncStep {
-    Complete,
-    Stopped,
-    Unavailable,
 }
 /// One kernel request's services over `workspace`, under `fence`.
 pub fn request(
@@ -125,48 +123,31 @@ impl RequestServices for FilesystemPort {
         Box::pin(async move {
             self.fenced(true)?;
             let fence = self.1.clone();
-            match self.0.durable_barrier_cancellable(&|| fence.stopped()) {
-                Ok(()) => {}
-                Err(layerfs_persistence::DurableBarrierError::Cancelled) if fence.stopped() => {
-                    return Err(Box::new(Fenced) as ServiceError);
-                }
-                Err(error) => return Err(Box::new(error) as ServiceError),
-            }
-            self.fenced(true)?;
             let client = self.0.overlay().clone();
-            let route = self.0.workspace().route();
-            let waiting = fence.clone();
-            let action_fence = fence.clone();
-            let result =
-                client.call_cancellable(route, Arc::new(move || waiting.stopped()), move |db| {
-                    if action_fence.stopped() {
-                        return Ok(SyncStep::Stopped);
-                    }
-                    match db.require_recorded_recovery_ready() {
-                        Ok(()) => {}
-                        Err(layerfs_overlay::OverlayError::Invalid(
-                            "durable binding profile"
-                            | "durable binding is absent"
-                            | "durable binding requires reconciliation"
-                            | "durable overlay requires reconciliation",
-                        )) => {
-                            return Ok(SyncStep::Unavailable);
-                        }
-                        Err(error) => return Err(error),
-                    }
-                    db.synchronize_kernel(mount, serial, handle, directory)?;
-                    Ok(SyncStep::Complete)
-                });
+            let stopped = fence.clone();
+            let result = self.0.synchronize_cancellable(
+                mount,
+                serial,
+                handle,
+                directory,
+                Arc::new(move || stopped.stopped()),
+            );
             match result {
-                Ok(SyncStep::Complete) => Ok(ServiceReply::new((), client)),
-                Ok(SyncStep::Stopped) => Err(Box::new(Fenced) as ServiceError),
-                Ok(SyncStep::Unavailable) => Err(Box::new(SyncUnavailable) as ServiceError),
-                Err(OwnerError::Unattempted { cause, .. })
+                Ok(SynchronizeStep::Complete) => Ok(ServiceReply::new((), client)),
+                Ok(SynchronizeStep::Stopped) => Err(Box::new(Fenced) as ServiceError),
+                Ok(SynchronizeStep::Unavailable) => Err(Box::new(SyncUnavailable) as ServiceError),
+                Err(SynchronizeFailure::Store(
+                    layerfs_persistence::DurableBarrierError::Cancelled,
+                )) if fence.stopped() => Err(Box::new(Fenced) as ServiceError),
+                Err(SynchronizeFailure::Owner(OwnerError::Unattempted { cause, .. }))
                     if matches!(*cause, OwnerError::Cancelled) && fence.stopped() =>
                 {
                     Err(Box::new(Fenced) as ServiceError)
                 }
-                Err(error) => Err(Box::new(error) as ServiceError),
+                Err(SynchronizeFailure::Store(error)) => Err(Box::new(error) as ServiceError),
+                Err(SynchronizeFailure::Workspace(error)) => Err(Box::new(error) as ServiceError),
+                Err(SynchronizeFailure::Binding(error)) => Err(Box::new(error) as ServiceError),
+                Err(SynchronizeFailure::Owner(error)) => Err(Box::new(error) as ServiceError),
             }
         })
     }

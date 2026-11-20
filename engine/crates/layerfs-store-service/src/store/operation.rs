@@ -14,14 +14,15 @@ pub struct BoundWorkspace {
     pub(super) committing: AtomicBool,
     pub(super) producer: super::producer::Producer,
     /// A conflicted merge installed locally and not yet committed.
-    pub(super) pending: Mutex<Option<Arc<super::commit_merge::PendingMerge>>>,
+    pub(super) pending: Mutex<Option<Arc<super::commit_merge::PendingProjection>>>,
 }
 pub struct StoreOperation {
-    workspace: Workspace,
-    ports: Arc<StorePorts>,
-    client: Arc<CanonicalClient>,
-    owner: OwnerClient,
-    durable_writer: Option<Arc<layerfs_persistence::StorageProvider>>,
+    pub(super) workspace: Workspace,
+    pub(super) ports: Arc<StorePorts>,
+    pub(super) client: Arc<CanonicalClient>,
+    pub(super) owner: OwnerClient,
+    pub(super) durable_writer: Option<Arc<layerfs_persistence::StorageProvider>>,
+    pub(super) sync_conflict: Option<super::synchronize::ConflictProjection>,
 }
 impl BoundWorkspace {
     /// Terminal local close, then the Workspace's opened Store reader.
@@ -36,7 +37,21 @@ impl BoundWorkspace {
             .map_err(super::CloseError::Reader)
     }
     pub fn operation(&self) -> WorkspaceResult<StoreOperation> {
-        let ports = self.store.ports_for(self.snapshot()?.scope, self.identity);
+        let snapshot = self.snapshot()?;
+        let pending = self.pending_snapshot()?;
+        let sync_conflict = pending.and_then(|pending| {
+            pending
+                .descriptor
+                .map(|descriptor| super::synchronize::ConflictProjection {
+                    workspace: self.identity.to_bytes(),
+                    catalog: self.store.history().catalog_id().to_bytes(),
+                    incarnation: self.store.history().incarnation(),
+                    snapshot: snapshot.clone(),
+                    marker_root: pending.local_root,
+                    descriptor,
+                })
+        });
+        let ports = self.store.ports_for(snapshot.scope, self.identity);
         let client = ports.client();
         let workspace = self.workspace.scoped(client.clone())?;
         Ok(StoreOperation {
@@ -45,6 +60,7 @@ impl BoundWorkspace {
             client,
             owner: self.owner.clone(),
             durable_writer: self.store.durable_writer.clone(),
+            sync_conflict,
         })
     }
     pub fn snapshot(&self) -> WorkspaceResult<BranchSnapshot> {
