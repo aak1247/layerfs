@@ -18,6 +18,13 @@
 > with marker blocks as the Workspace's local base. See
 > [architecture 81](81-compare-and-merge.md#merge-on-commit).
 
+> **Recorded checkpoint work:** the experimental durable checkpoint path
+> freezes the complete `CommitRequest` in versioned LFCP bytes. Its decoder
+> validates the entire canonical encoding, including merge facts and optional
+> identities, before returning a request for comparison with an original Store
+> receipt. Decoding does not publish, replay or authorize recovery; the
+> authenticated Store/Workspace reconciliation path remains separate work.
+
 BoundWorkspace::commit admits one active lifecycle for that Workspace, captures
 once through the existing overlay owner, creates independently owned Storage/Save
 state and invokes one synchronous Content producer with the exact capture and

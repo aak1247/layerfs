@@ -76,14 +76,23 @@ pub fn decode(mut bytes: &[u8]) -> HistoryResult<(Vec<LwwDecision>, Vec<MergeUni
     while !bytes.is_empty() {
         if bytes.starts_with(&UNITS) {
             bytes = &bytes[4..];
-            for _ in 0..count(&mut bytes)? {
+            let unit_count = count(&mut bytes)?;
+            if unit_count == 0 || unit_count > bytes.len() / 8 {
+                return Err(HistoryError::Integrity("history fact units"));
+            }
+            for _ in 0..unit_count {
                 let name = text(&mut bytes)?;
-                let patterns = (0..count(&mut bytes)?)
-                    .map(|_| text(&mut bytes))
-                    .collect::<HistoryResult<_>>()?;
+                let pattern_count = count(&mut bytes)?;
+                if pattern_count > bytes.len() / 4 {
+                    return Err(HistoryError::Integrity("history fact patterns"));
+                }
+                let mut patterns = Vec::new();
+                for _ in 0..pattern_count {
+                    patterns.push(text(&mut bytes)?);
+                }
                 units.push(MergeUnit { name, patterns });
             }
-            if !bytes.is_empty() || units.is_empty() {
+            if !bytes.is_empty() {
                 return Err(HistoryError::Integrity("history fact units"));
             }
             break;

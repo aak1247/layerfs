@@ -3,8 +3,8 @@ use layerfs_content::{
     ObjectId,
 };
 use layerfs_history::{
-    checkpoint_request_digest, encode_checkpoint_request, facts, BranchId, CommitId, CommitMeta,
-    CommitRequest, CommitVia, LayerId, NodeId,
+    checkpoint_request_digest, decode_checkpoint_request, encode_checkpoint_request, facts,
+    BranchId, CommitId, CommitMeta, CommitRequest, CommitVia, HistoryError, LayerId, NodeId,
 };
 
 fn branch(value: u8) -> BranchId {
@@ -44,6 +44,7 @@ fn request() -> CommitRequest {
 fn complete_checkpoint_request_changes_for_each_publication_field() {
     let original = request();
     let bytes = encode_checkpoint_request(&original).unwrap();
+    assert_eq!(decode_checkpoint_request(&bytes).unwrap(), original);
     assert_eq!(bytes, encode_checkpoint_request(&original).unwrap());
     let encoded_hex: String = bytes.iter().map(|value| format!("{value:02x}")).collect();
     assert_eq!(
@@ -103,7 +104,77 @@ fn complete_checkpoint_request_changes_for_each_publication_field() {
         let encoded = encode_checkpoint_request(&changed).unwrap();
         assert_ne!(encoded, bytes);
         assert_ne!(checkpoint_request_digest(&encoded), digest);
+        assert_eq!(decode_checkpoint_request(&encoded).unwrap(), changed);
     }
+}
+
+#[test]
+fn checkpoint_decoder_preserves_full_metadata_and_rejects_invalid_input() {
+    let mut original = request();
+    original.meta.branch = Some(branch(9));
+    original.meta.message = Some("checkpoint <测试>\nready".into());
+    original.meta.merged_from = Some(NodeId::Commit(commit(9)));
+    original.meta.lww.push(LwwDecision {
+        path: "path".into(),
+        rule: "rule".into(),
+        kept_ours: true,
+        deleted: true,
+    });
+    original.meta.units.push(MergeUnit {
+        name: "group".into(),
+        patterns: vec!["*.rs".into(), "src/**".into()],
+    });
+    original.meta.lww_truncated = true;
+    original.meta.statistics.logical = u64::MAX;
+    original.meta.statistics.new_canonical = 17;
+    original.meta.statistics.new_stored = 18;
+    original.meta.statistics.new_metadata = 19;
+    original.meta.displaced = Some(commit(10));
+    original.meta.time_ms = -123456789;
+    original.force = true;
+    let bytes = encode_checkpoint_request(&original).unwrap();
+    assert_eq!(decode_checkpoint_request(&bytes).unwrap(), original);
+    for end in 0..bytes.len() {
+        assert!(
+            decode_checkpoint_request(&bytes[..end]).is_err(),
+            "truncation at {end}"
+        );
+    }
+    let mut invalid = bytes.clone();
+    invalid.push(0);
+    assert!(decode_checkpoint_request(&invalid).is_err());
+    invalid = bytes.clone();
+    invalid[0] ^= 1;
+    assert!(decode_checkpoint_request(&invalid).is_err());
+    invalid = bytes.clone();
+    invalid[5] = 0;
+    assert!(decode_checkpoint_request(&invalid).is_err());
+    invalid = bytes.clone();
+    invalid[22] = 2;
+    assert!(decode_checkpoint_request(&invalid).is_err());
+    invalid = bytes.clone();
+    *invalid.last_mut().unwrap() = 2;
+    assert!(decode_checkpoint_request(&invalid).is_err());
+    invalid = bytes.clone();
+    let offset = bytes
+        .windows("checkpoint <测试>\nready".len())
+        .position(|value| value == "checkpoint <测试>\nready".as_bytes())
+        .unwrap();
+    invalid[offset] = 0;
+    assert!(decode_checkpoint_request(&invalid).is_err());
+    invalid[offset] = 0xff;
+    assert_eq!(
+        decode_checkpoint_request(&invalid),
+        Err(HistoryError::Integrity("checkpoint request message UTF-8"))
+    );
+}
+
+#[test]
+fn merge_facts_refuse_counts_that_cannot_fit_the_encoded_bytes() {
+    assert!(facts::decode(&[255, 255, 255, 255, 255, 255, 255, 254]).is_err());
+    assert!(
+        facts::decode(&[255, 255, 255, 255, 0, 0, 0, 1, 0, 0, 0, 0, 255, 255, 255, 254]).is_err()
+    );
 }
 
 #[test]

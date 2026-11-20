@@ -30,6 +30,7 @@ pub use catalog::{HistoryCatalog, HistoryCatalogConfig, PublishLane};
 pub use checkpoint::{
     checkpoint_request_digest, encode_checkpoint_request, CheckpointAttemptId, CheckpointReceipt,
 };
+pub use contract::checkpoint_decode::decode_checkpoint_request;
 pub use error::{HistoryError, HistoryResult};
 pub use identity::{
     BranchId, CatalogId, CommitId, HistoryName, LayerId, LayerStackId, NodeId, WorkspaceId,
