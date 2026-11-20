@@ -3,6 +3,8 @@ use crate::{Overlay, OverlayError, OverlayResult, ReadyRecord, StatementKind};
 use rusqlite::Connection;
 
 const SCHEMA_41: &str = include_str!("../../sql/legacy_schema_41.sql");
+const SCHEMA_43: &str = include_str!("../../sql/legacy_schema_43.sql");
+const SCHEMA_44: &str = include_str!("../../sql/legacy_schema_44.sql");
 const KEPT: &str = "CREATE TABLE durable_kept_live(serial INTEGER PRIMARY KEY CHECK(serial>0), generation INTEGER NOT NULL CHECK(generation>0)) STRICT";
 const CUSTODY: &str = "CREATE TABLE durable_custody(id INTEGER PRIMARY KEY CHECK(id=1), orphan_owners INTEGER NOT NULL CHECK(orphan_owners IN(0,1)), operation_owners INTEGER NOT NULL CHECK(operation_owners IN(0,1)), kept_count INTEGER NOT NULL CHECK(kept_count>=0)) STRICT";
 // Full four-field schema of a freshly created schema-45 database. The golden
@@ -58,11 +60,15 @@ fn schema_objects(
 
 fn verify_predecessor(db: &Overlay, version: i64) -> OverlayResult<()> {
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(SCHEMA_41)?;
-    if version == 42 {
-        expected.execute_batch(&format!("{KEPT};{CUSTODY};"))?;
-    } else if version != 41 {
-        return Err(OverlayError::Invalid("unsupported legacy migration schema"));
+    match version {
+        41 => expected.execute_batch(SCHEMA_41)?,
+        42 => {
+            expected.execute_batch(SCHEMA_41)?;
+            expected.execute_batch(&format!("{KEPT};{CUSTODY};"))?;
+        }
+        43 => expected.execute_batch(SCHEMA_43)?,
+        44 => expected.execute_batch(SCHEMA_44)?,
+        _ => return Err(OverlayError::Invalid("unsupported legacy migration schema")),
     }
     let mut statement =
         expected.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")?;
@@ -138,7 +144,7 @@ fn replace_binding(db: &Overlay) -> OverlayResult<()> {
 /// Store and old-consumer authority are established separately by the caller.
 pub(super) fn preflight(db: &Overlay, record: &ReadyRecord) -> OverlayResult<i64> {
     let version = db.profile.schema_version;
-    if !matches!(version, 41 | 42 | 45) {
+    if !matches!(version, 41..=45) {
         return Err(OverlayError::Invalid("unsupported legacy migration schema"));
     }
     let original = db.state()?;
@@ -176,15 +182,21 @@ pub(super) fn upgrade(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<(
             || db.durable_binding()?.as_deref() != Some(record.snapshot.as_slice())
         { return Err(OverlayError::Invalid("legacy migration predecessor")); }
         verify_predecessor(db, version)?;
-        replace_binding(db)?;
-        if version == 41 {
-            db.execute(StatementKind::Startup, KEPT, &[], 0)?;
-            db.execute(StatementKind::Startup, CUSTODY, &[], 0)?;
-            db.execute(StatementKind::Startup, "INSERT INTO durable_custody(id,orphan_owners,operation_owners,kept_count) VALUES(1,0,0,0)", &[], 0)?;
+        if version != 44 {
+            replace_binding(db)?;
+            if version == 41 {
+                db.execute(StatementKind::Startup, KEPT, &[], 0)?;
+                db.execute(StatementKind::Startup, CUSTODY, &[], 0)?;
+                db.execute(StatementKind::Startup, "INSERT INTO durable_custody(id,orphan_owners,operation_owners,kept_count) VALUES(1,0,0,0)", &[], 0)?;
+            }
+            if version <= 42 {
+                super::durable_owners::initialize(db)?;
+            } else {
+                db.execute(StatementKind::Startup, "DROP TABLE durable_checkpoint_attempt", &[], 0)?;
+            }
+            super::durable_attempt::initialize(db)?;
+            super::durable_conflict::upgrade_legacy(db)?;
         }
-        super::durable_owners::initialize(db)?;
-        super::durable_attempt::initialize(db)?;
-        super::durable_conflict::upgrade_legacy(db)?;
         super::durable_serial_retirement::initialize(db)?;
         super::durable_conflict::verify_schema(db)?;
         super::durable_serial_retirement::verify_schema(db)?;

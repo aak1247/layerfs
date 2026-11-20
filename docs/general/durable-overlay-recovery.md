@@ -124,7 +124,7 @@ new SQLite connections close. A failed or unwound uncertain transaction retains
 the original file and session until process exit. It is also used by the
 fenced daemon catalog transition described below.
 
-A locally ready schema-41 or schema-42 Overlay can also be upgraded to 45
+A locally ready supported schema-41 through schema-44 Overlay can also be upgraded to 45
 under its original lease and namespace. The operation checks the complete
 supported predecessor schema, preserves its binding, dirty state, cleanup queue
 and classified kept rows, and checks the complete resulting schema in the same
@@ -175,7 +175,7 @@ yet adopted that transition.
 
 `PreparedCatalogCohort` provides a maintenance transition for multiple
 original rosters on one physical Store. Under the caller's full-Store fence it
-prepares all supported ready schema-41, 42 and 45 members, rechecks each
+prepares supported ready schema-41 through 45 members, rechecks each
 database and owner-file identity, transitions the Store once, and converts the
 members under their original leases. It closes the maintenance Store and each
 Overlay connection without admitting a Workspace or advancing a namespace; the
@@ -185,8 +185,10 @@ member and the unprocessed tail. A Store or Overlay outcome that is unknown is
 observed only after the original executor has exited, not reissued. Local
 leases and a caller-provided roster list do not prove that all users of the
 physical Store have stopped; that proof and durable operation accounting remain
-the responsibility of the application owner. Pending operations, active
-conflicts and source schemas 43 and 44 are not migrated by this batch.
+the responsibility of the application owner. Schema 43 and 44 predecessors
+must match the complete definitions from their explicitly supported original
+SDKs; an unproven legacy serial-retirement item remains unresolved. Pending
+operations and active conflicts are not migrated by this batch.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

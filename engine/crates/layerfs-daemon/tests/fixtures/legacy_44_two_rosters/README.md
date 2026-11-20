@@ -1,0 +1,1 @@
+Two real rosters and three dirty schema-44 Workspaces on one Store were created by unmodified SDK ec68fa1fd003fe49343269ea4638e069f779553e. All original owners and the Store exited before copying. Tests use private copies.

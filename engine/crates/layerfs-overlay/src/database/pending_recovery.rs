@@ -155,7 +155,7 @@ impl ReadyRecovery {
         super::legacy_upgrade::preflight(&self.db, expected)
     }
 
-    /// Upgrade an exact ready schema-41/42 predecessor while retaining this
+    /// Upgrade an exact supported ready predecessor while retaining this
     /// original lease and namespace. Store, roster and old-consumer authority
     /// must already have been authenticated by the trusted caller.
     #[cfg(target_os = "linux")]

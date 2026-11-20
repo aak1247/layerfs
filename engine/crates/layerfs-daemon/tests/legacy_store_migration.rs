@@ -1602,6 +1602,172 @@ mod interrupted_catalog {
         let db = Connection::open_with_flags(store_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='checkpoint_receipt'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
+
+    fn exercise_recorded_predecessor(version: i64) {
+        let fixture = Fixture::named(&format!("legacy_{version}_two_rosters"));
+        let root = &fixture.0;
+        let store_path = root.join("store-private/store.sqlite");
+        let store_before = fs::metadata(&store_path).unwrap();
+        let before = [42_u8, 43, 44].map(|byte| {
+            let path = cohort_overlay(root, byte);
+            let identity = fs::metadata(&path).unwrap().ino();
+            let rows = dirty_rows(&path);
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
+            (identity, rows)
+        });
+        assert_eq!(cohort_receipts(root), 0);
+        let owner = cohort_owner(root, "recorded-cohort-maintenance.sqlite");
+        let result = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(&store_path).unwrap(),
+            &owner,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert!(!result.store_upgraded());
+        assert_eq!(result.completed().len(), 3);
+        for (index, entry) in result.completed().iter().enumerate() {
+            assert_eq!(entry.source_version(), version);
+            assert_eq!(entry.previous_namespace(), (index + 1) as i64);
+            cohort_lease_is_held(root, 42 + index as u8);
+        }
+        drop(result);
+        owner.stop().unwrap();
+        assert_eq!(fs::metadata(&store_path).unwrap().ino(), store_before.ino());
+        for (index, byte) in [42_u8, 43, 44].into_iter().enumerate() {
+            let path = cohort_overlay(root, byte);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), before[index].0);
+            assert_eq!(dirty_rows(&path), before[index].1);
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                45
+            );
+            assert_eq!(
+                db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                (index + 1) as i64
+            );
+        }
+        recover_cohort(root);
+        assert_eq!(cohort_receipts(root), 0);
+    }
+
+    #[test]
+    fn cohort_migrates_original_schema43_dirty_workspaces() {
+        exercise_recorded_predecessor(43);
+    }
+
+    #[test]
+    fn cohort_migrates_original_schema44_dirty_workspaces() {
+        exercise_recorded_predecessor(44);
+    }
+
+    #[test]
+    fn cohort_rejects_same_version_with_different_schema() {
+        let fixture = Fixture::named("legacy_43_two_rosters");
+        let root = &fixture.0;
+        let path = cohort_overlay(root, 42);
+        let before = dirty_rows(&path);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TRIGGER durable_checkpoint_attempt_owner_immutable; CREATE TRIGGER durable_checkpoint_attempt_owner_immutable BEFORE UPDATE ON durable_checkpoint_attempt BEGIN SELECT 1; END;").unwrap();
+        drop(db);
+        let owner = cohort_owner(root, "invalid-schema-maintenance.sqlite");
+        let failure = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(root.join("store-private/store.sqlite")).unwrap(),
+            &owner,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(failure.cause(), CatalogCohortCause::Group { index: 0, failure }
+            if matches!(failure.cause(), layerfs_daemon::control::CatalogTransitionCause::Migration { record: failed, failure }
+                if *failed == record(42) && matches!(failure.as_ref(),
+                    layerfs_daemon::store::CatalogMigrationFailure::Refused {
+                        cause: layerfs_daemon::store::BindError::Owner(layerfs_daemon::OwnerError::Overlay(OverlayError::Invalid("legacy overlay schema identity"))), ..
+                    })))
+        );
+        assert_eq!(failure.progress().store_upgraded, None);
+        drop(failure);
+        owner.stop().unwrap();
+        assert_eq!(dirty_rows(&path), before);
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            43
+        );
+        assert_eq!(
+            db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(cohort_receipts(root), 0);
+    }
+
+    #[test]
+    fn cohort_retains_unproven_legacy_serial_retirement() {
+        let fixture = Fixture::named("legacy_43_two_rosters");
+        let root = &fixture.0;
+        let path = cohort_overlay(root, 42);
+        let before = dirty_rows(&path);
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO cleanup_task(kind,resource,target) VALUES(7,99,1)",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let owner = cohort_owner(root, "unknown-retirement-maintenance.sqlite");
+        let failure = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(root.join("store-private/store.sqlite")).unwrap(),
+            &owner,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(failure.cause(), CatalogCohortCause::Group { index: 0, failure }
+            if matches!(failure.cause(), layerfs_daemon::control::CatalogTransitionCause::Overlay { record: failed, .. }
+                if *failed == record(42)))
+        );
+        assert_eq!(failure.progress().store_upgraded, None);
+        drop(failure);
+        owner.stop().unwrap();
+        assert_eq!(dirty_rows(&path), before);
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            43
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM cleanup_task WHERE kind=7 AND resource=99 AND target=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(cohort_receipts(root), 0);
+    }
 }
 
 mod shared_store_recovery {

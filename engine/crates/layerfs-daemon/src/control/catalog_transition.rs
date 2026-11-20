@@ -593,7 +593,11 @@ impl PreparedCatalogTransition {
                         41 | 42 => legacy = true,
                         45 => recorded = true,
                         43 | 44 => {
-                            ordinary = true;
+                            if matches!(purpose, PreparationPurpose::Maintenance) {
+                                legacy = true;
+                            } else {
+                                ordinary = true;
+                            }
                             recorded = true;
                         }
                         _ => {
