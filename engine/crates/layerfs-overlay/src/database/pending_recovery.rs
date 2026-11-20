@@ -127,6 +127,24 @@ impl ReadyRecovery {
         self.db.profile().schema_version
     }
 
+    /// Check the original database and owner-file identities while retaining
+    /// this connection and lease. This does not authenticate a Store or fence.
+    pub fn verify_original(&self) -> OverlayResult<()> {
+        let lease = self
+            .db
+            .durable
+            .as_ref()
+            .ok_or(OverlayError::Invalid("durable lease is absent"))?;
+        let result = lease
+            .verify()
+            .and_then(|()| self.db.allocation.state().map(|_| ()))
+            .and_then(|()| lease.verify());
+        if result.is_err() {
+            lease.quarantine();
+        }
+        result
+    }
+
     /// Check the exact supported local format without changing its namespace
     /// or database. This does not authenticate the Store or consumer fence.
     #[cfg(target_os = "linux")]

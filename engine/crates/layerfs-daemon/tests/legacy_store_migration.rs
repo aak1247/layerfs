@@ -802,6 +802,9 @@ fn ready_current_overlay_keeps_legacy_store_readable_without_receipts() {
 
 mod interrupted_catalog {
     use super::*;
+    use layerfs_daemon::control::{
+        CatalogCohortCause, PreparedCatalogCohort, RecoverControlConfig,
+    };
     use layerfs_history::{BranchId, WorkspaceId};
     use layerfs_overlay::{OverlayCatalogRecovery, OverlayError};
     use rusqlite::{auto_extension, ffi};
@@ -1109,6 +1112,495 @@ mod interrupted_catalog {
                 .unwrap(),
             0
         );
+    }
+
+    fn cohort_config(root: &Path, name: &str, sandbox: [u8; 32]) -> CatalogTransitionConfig {
+        let mut value = config(root);
+        value.catalog_directory = root.join(name).join("catalog");
+        value.overlay_directory = root.join(name).join("overlays");
+        value.sandbox = sandbox;
+        value
+    }
+
+    fn cohort_configs(root: &Path) -> Vec<CatalogTransitionConfig> {
+        vec![
+            cohort_config(root, "sandbox-a", [8; 32]),
+            cohort_config(root, "sandbox-b", [9; 32]),
+        ]
+    }
+
+    fn cohort_overlay(root: &Path, byte: u8) -> PathBuf {
+        let sandbox = if byte == 42 { "sandbox-a" } else { "sandbox-b" };
+        root.join(sandbox)
+            .join("overlays")
+            .join(record(byte).overlay_name())
+    }
+
+    fn cohort_owner(root: &Path, name: &str) -> Owner {
+        Owner::start(
+            &root.join(name),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 3 },
+        )
+        .unwrap()
+    }
+
+    fn cohort_lease_is_held(root: &Path, byte: u8) {
+        let result = OverlayCatalogRecovery::open(
+            &cohort_overlay(root, byte),
+            ProfileConfig::default(),
+            [byte; 32],
+        );
+        assert!(
+            matches!(result, Err(OverlayError::Io(error)) if error.kind() == ErrorKind::WouldBlock)
+        );
+    }
+
+    fn cohort_receipts(root: &Path) -> i64 {
+        let db = Connection::open_with_flags(
+            root.join("store-private/store.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row("SELECT count(*) FROM checkpoint_receipt", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    fn cohort_authorities(root: &Path) -> [Authority; 2] {
+        let handles = Handles::open_read_only(config(root).store, BINDING, CURSOR).unwrap();
+        [
+            Authority::for_catalog([8; 32], &handles.history).unwrap(),
+            Authority::for_catalog([9; 32], &handles.history).unwrap(),
+        ]
+    }
+
+    fn cohort_rosters_are_held(root: &Path, authorities: [Authority; 2]) {
+        for (name, authority) in ["sandbox-a", "sandbox-b"].into_iter().zip(authorities) {
+            let result = Roster::open(&root.join(name).join("catalog"), authority);
+            assert!(
+                matches!(result, Err(layerfs_daemon::durable_roster::RosterError::Io(error))
+                if error.kind() == ErrorKind::WouldBlock)
+            );
+        }
+    }
+
+    fn recover_cohort(root: &Path) {
+        let store = open_current(config(root).store);
+        for (name, sandbox, bytes) in [
+            ("sandbox-a", [8; 32], &[42_u8][..]),
+            ("sandbox-b", [9; 32], &[43_u8, 44][..]),
+        ] {
+            let owner = cohort_owner(root, &format!("recover-{name}.sqlite"));
+            let mut service = Service::new(store.clone(), &owner);
+            let tokens = service
+                .recover_durable_control(
+                    &owner,
+                    RecoverControlConfig {
+                        catalog_directory: root.join(name).join("catalog"),
+                        overlay_directory: root.join(name).join("overlays"),
+                        sandbox,
+                        profile: ProfileConfig::default(),
+                        minimum_namespace: 1,
+                        store_device: fs::metadata(root.join("store-private/store.sqlite"))
+                            .unwrap()
+                            .dev(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(tokens.len(), bytes.len());
+            for (&byte, token) in bytes.iter().zip(&tokens) {
+                assert_eq!(token.workspace, record(byte).workspace);
+                assert_eq!(token.namespace, i64::from(byte - 40));
+                let operation = service.operation(*token).unwrap();
+                let mut expected = b"complete installed file 000001\n".to_vec();
+                expected[0] = b'X' + byte - 42;
+                assert_eq!(read_operation(&operation, "file-000001"), expected);
+            }
+            drop(service);
+            for token in tokens {
+                store.close_reader(token.workspace).unwrap();
+            }
+            owner.stop().unwrap();
+        }
+        drop(store);
+    }
+
+    #[test]
+    fn cohort_migrates_both_original_rosters_before_any_admission() {
+        let fixture = Fixture::named("legacy_277_two_rosters");
+        let root = &fixture.0;
+        let store_path = root.join("store-private/store.sqlite");
+        let store_before = fs::metadata(&store_path).unwrap();
+        let authorities = cohort_authorities(root);
+        let before = [42_u8, 43, 44].map(|byte| {
+            let path = cohort_overlay(root, byte);
+            (fs::metadata(&path).unwrap().ino(), dirty_rows(&path))
+        });
+        let owner = cohort_owner(root, "cohort-maintenance.sqlite");
+        let plan = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(&store_path).unwrap(),
+            &owner,
+        )
+        .unwrap();
+        for byte in [42_u8, 43, 44] {
+            cohort_lease_is_held(root, byte);
+        }
+        let result = plan.execute().unwrap();
+        assert!(result.store_upgraded());
+        assert_eq!(result.completed().len(), 3);
+        cohort_rosters_are_held(root, authorities);
+        for (index, entry) in result.completed().iter().enumerate() {
+            assert_eq!(entry.group, usize::from(index > 0));
+            assert_eq!(entry.record, record(42 + index as u8));
+            assert_eq!(entry.previous_namespace(), (index + 1) as i64);
+            assert_eq!(entry.source_version(), 41);
+            cohort_lease_is_held(root, 42 + index as u8);
+        }
+        assert_eq!(cohort_receipts(root), 0);
+        assert_eq!(fs::metadata(&store_path).unwrap().ino(), store_before.ino());
+        drop(result);
+        owner.stop().unwrap();
+        for (index, byte) in [42_u8, 43, 44].into_iter().enumerate() {
+            let path = cohort_overlay(root, byte);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), before[index].0);
+            assert_eq!(dirty_rows(&path), before[index].1);
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                45
+            );
+            assert_eq!(
+                db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                (index + 1) as i64
+            );
+        }
+        recover_cohort(root);
+        assert_eq!(cohort_receipts(root), 0);
+    }
+
+    const COHORT_SWAP_CHILD: &str = "LAYERFS_TEST_COHORT_SWAP_CHILD";
+
+    fn cohort_swap_child(root: &Path) {
+        let target = cohort_overlay(root, 43);
+        // Read before opening any SQLite connection to this Overlay.
+        let original_bytes = fs::read(&target).unwrap();
+        let owner = cohort_owner(root, "swap-maintenance.sqlite");
+        let plan = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(root.join("store-private/store.sqlite")).unwrap(),
+            &owner,
+        )
+        .unwrap();
+        let displaced = target.with_extension("sqlite.displaced");
+        fs::rename(&target, displaced).unwrap();
+        fs::write(&target, original_bytes).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let failure = plan.execute().err().unwrap();
+        assert!(
+            matches!(failure.cause(), CatalogCohortCause::OverlayIdentity {
+            index: 1, record: failed, cause: OverlayError::Invalid("allocation path identity"),
+        } if *failed == record(43))
+        );
+        let progress = failure.progress();
+        assert_eq!(progress.store_upgraded, None);
+        assert!(progress.completed.is_empty());
+        assert_eq!(progress.pending.len(), 3);
+        assert_eq!(progress.current_group, Some(1));
+        signal(&root.join("cohort-swap-held"));
+        await_file(&root.join("release-cohort-swap"), Duration::from_secs(30));
+        drop(failure);
+        drop(owner);
+    }
+
+    #[test]
+    fn cohort_rejects_replaced_member_before_store_upgrade() {
+        if let Some(root) = std::env::var_os(COHORT_SWAP_CHILD) {
+            cohort_swap_child(Path::new(&root));
+            return;
+        }
+        let fixture = Fixture::named("legacy_277_two_rosters");
+        let root = &fixture.0;
+        let store_path = root.join("store-private/store.sqlite");
+        let authorities = cohort_authorities(root);
+        let store_before = fs::metadata(&store_path).unwrap();
+        let original: Vec<_> = [42_u8, 43, 44]
+            .into_iter()
+            .map(|byte| {
+                let path = cohort_overlay(root, byte);
+                (fs::metadata(&path).unwrap().ino(), dirty_rows(&path))
+            })
+            .collect();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("interrupted_catalog::cohort_rejects_replaced_member_before_store_upgrade")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(COHORT_SWAP_CHILD, root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !root.join("cohort-swap-held").exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "swap child exited early"
+            );
+            assert!(Instant::now() < deadline, "bounded swap handoff expired");
+            thread::sleep(Duration::from_millis(20));
+        }
+        for byte in [42_u8, 43, 44] {
+            cohort_lease_is_held(root, byte);
+        }
+        cohort_rosters_are_held(root, authorities);
+        let store =
+            Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(store.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='checkpoint_receipt'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        drop(store);
+        signal(&root.join("release-cohort-swap"));
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::metadata(&store_path).unwrap().ino(), store_before.ino());
+        for (index, byte) in [42_u8, 43, 44].into_iter().enumerate() {
+            let path = cohort_overlay(root, byte);
+            let observed = if byte == 43 {
+                path.with_extension("sqlite.displaced")
+            } else {
+                path
+            };
+            assert_eq!(fs::metadata(&observed).unwrap().ino(), original[index].0);
+            assert_eq!(dirty_rows(&observed), original[index].1);
+            let db =
+                Connection::open_with_flags(observed, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                41
+            );
+            assert_eq!(
+                db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                (index + 1) as i64
+            );
+        }
+    }
+
+    const COHORT_FAILURE_CHILD: &str = "LAYERFS_TEST_COHORT_FAILURE_CHILD";
+
+    fn cohort_failure_child(root: &Path) {
+        let target = fs::metadata(cohort_overlay(root, 43)).unwrap();
+        *WATCHED.lock().unwrap() = Some((target.dev(), target.ino()));
+        // SAFETY: the callback is scoped to this child and only configures
+        // the matching SQLite connection while SQLite owns it.
+        unsafe { auto_extension::register_auto_extension(opened).unwrap() };
+        let owner = cohort_owner(root, "failed-cohort-maintenance.sqlite");
+        let plan = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(root.join("store-private/store.sqlite")).unwrap(),
+            &owner,
+        )
+        .unwrap();
+        assert!(auto_extension::cancel_auto_extension(opened));
+        let failure = plan.execute().err().unwrap();
+        assert!(
+            matches!(failure.cause(), CatalogCohortCause::Migration { index: 1, record: failed, failure }
+            if *failed == record(43) && matches!(failure.as_ref(),
+                layerfs_daemon::store::CatalogMigrationFailure::Upgrade {
+                    cause: layerfs_daemon::store::BindError::Owner(layerfs_daemon::OwnerError::Overlay(OverlayError::Sql(rusqlite::Error::SqliteFailure(error,_)))), ..
+                } if error.extended_code == ffi::SQLITE_AUTH))
+        );
+        assert!(FIRED.load(Ordering::Relaxed) > 0);
+        let progress = failure.progress();
+        assert_eq!(progress.store_upgraded, Some(true));
+        assert_eq!(progress.current_group, Some(1));
+        assert_eq!(progress.unprepared_groups, 0);
+        assert_eq!(progress.completed.len(), 1);
+        assert_eq!(progress.completed[0].group, 0);
+        assert_eq!(progress.completed[0].record, record(42));
+        assert_eq!(progress.completed[0].previous_namespace, 1);
+        assert_eq!(progress.completed[0].source_version, 41);
+        assert_eq!(progress.pending, vec![(1, record(43)), (1, record(44))]);
+        signal(&root.join("cohort-failure-held"));
+        await_file(
+            &root.join("release-cohort-failure"),
+            Duration::from_secs(30),
+        );
+        drop(failure);
+        drop(owner);
+    }
+
+    #[test]
+    fn cohort_retains_original_groups_after_mid_batch_failure_and_resumes() {
+        if let Some(root) = std::env::var_os(COHORT_FAILURE_CHILD) {
+            cohort_failure_child(Path::new(&root));
+            return;
+        }
+        let fixture = Fixture::named("legacy_277_two_rosters");
+        let root = &fixture.0;
+        let store_path = root.join("store-private/store.sqlite");
+        let authorities = cohort_authorities(root);
+        let store_before = fs::metadata(&store_path).unwrap();
+        let original: Vec<_> = [42_u8, 43, 44]
+            .into_iter()
+            .map(|byte| {
+                let path = cohort_overlay(root, byte);
+                (fs::metadata(&path).unwrap().ino(), dirty_rows(&path))
+            })
+            .collect();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("interrupted_catalog::cohort_retains_original_groups_after_mid_batch_failure_and_resumes")
+            .arg("--exact").arg("--nocapture").env(COHORT_FAILURE_CHILD, root)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !root.join("cohort-failure-held").exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "failure child exited early"
+            );
+            assert!(Instant::now() < deadline, "bounded failure handoff expired");
+            thread::sleep(Duration::from_millis(20));
+        }
+        for byte in [42_u8, 43, 44] {
+            cohort_lease_is_held(root, byte);
+        }
+        cohort_rosters_are_held(root, authorities);
+        assert_eq!(cohort_receipts(root), 0);
+        signal(&root.join("release-cohort-failure"));
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::metadata(&store_path).unwrap().ino(), store_before.ino());
+        for (index, byte) in [42_u8, 43, 44].into_iter().enumerate() {
+            let path = cohort_overlay(root, byte);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), original[index].0);
+            assert_eq!(dirty_rows(&path), original[index].1);
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                if index == 0 { 45 } else { 41 }
+            );
+            assert_eq!(
+                db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                (index + 1) as i64
+            );
+        }
+        let owner = cohort_owner(root, "resumed-cohort-maintenance.sqlite");
+        let result = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(&store_path).unwrap(),
+            &owner,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert!(!result.store_upgraded());
+        assert_eq!(
+            result
+                .completed()
+                .iter()
+                .map(|entry| entry.source_version())
+                .collect::<Vec<_>>(),
+            vec![45, 41, 41]
+        );
+        for byte in [42_u8, 43, 44] {
+            cohort_lease_is_held(root, byte);
+        }
+        drop(result);
+        owner.stop().unwrap();
+        recover_cohort(root);
+        assert_eq!(cohort_receipts(root), 0);
+    }
+
+    #[test]
+    fn cohort_accepts_ready_schema45_on_an_original_legacy_store() {
+        let fixture = Fixture::named("legacy_277_two_rosters");
+        let root = &fixture.0;
+        let first = match OverlayCatalogRecovery::open(
+            &cohort_overlay(root, 42),
+            ProfileConfig::default(),
+            [42; 32],
+        )
+        .unwrap()
+        {
+            OverlayCatalogRecovery::Ready(ready) => ready,
+            _ => panic!("expected locally ready original Workspace"),
+        };
+        let observed = first.observed().clone();
+        drop(first.upgrade_legacy(&observed).unwrap());
+        let store_path = root.join("store-private/store.sqlite");
+        let db =
+            Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='checkpoint_receipt'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        drop(db);
+        let owner = cohort_owner(root, "current-cohort-maintenance.sqlite");
+        let result = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(store_path).unwrap(),
+            &owner,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert!(result.store_upgraded());
+        assert_eq!(
+            result
+                .completed()
+                .iter()
+                .map(|entry| entry.source_version())
+                .collect::<Vec<_>>(),
+            vec![45, 41, 41]
+        );
+        assert_eq!(result.completed()[0].previous_namespace(), 1);
+        drop(result);
+        owner.stop().unwrap();
+        assert_eq!(cohort_receipts(root), 0);
+    }
+
+    #[test]
+    fn cohort_reports_the_group_whose_preparation_failed() {
+        let fixture = Fixture::named("legacy_277_two_rosters");
+        let root = &fixture.0;
+        let mut configs = cohort_configs(root);
+        configs[1].sandbox = [7; 32];
+        let store_path = root.join("store-private/store.sqlite");
+        let owner = cohort_owner(root, "refused-cohort-maintenance.sqlite");
+        let failure =
+            PreparedCatalogCohort::prepare(configs, fs::File::open(&store_path).unwrap(), &owner)
+                .err()
+                .unwrap();
+        assert!(matches!(
+            failure.cause(),
+            CatalogCohortCause::Group { index: 1, .. }
+        ));
+        let progress = failure.progress();
+        assert_eq!(progress.store_upgraded, None);
+        assert_eq!(progress.current_group, Some(1));
+        assert_eq!(progress.pending, vec![(0, record(42))]);
+        assert!(progress.completed.is_empty());
+        assert_eq!(progress.unprepared_groups, 0);
+        cohort_lease_is_held(root, 42);
+        drop(failure);
+        owner.stop().unwrap();
+        let db = Connection::open_with_flags(store_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='checkpoint_receipt'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
 }
 

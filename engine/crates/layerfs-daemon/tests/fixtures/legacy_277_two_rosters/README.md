@@ -1,0 +1,1 @@
+Three synthetic Workspaces in two independent sandbox rosters share one Store. The unmodified SDK 277368a810c3edd4d5e5555d846fcf367cb48e0c created all files and acknowledged independent dirty writes; both original owners and the Store were closed before this fixture copy. Tests use private copies.

@@ -42,6 +42,13 @@ impl Lease {
     fn track(&mut self, quarantine: super::connection_owner::Quarantine) {
         self.quarantine = Some(quarantine);
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn quarantine(&self) {
+        if let Some(state) = &self.quarantine {
+            state.set(true);
+        }
+    }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -726,6 +733,8 @@ impl Lease {
     pub(crate) fn verify(&self) -> OverlayResult<()> {
         Err(OverlayError::UnsupportedPlatform)
     }
+
+    pub(crate) fn quarantine(&self) {}
 }
 
 #[cfg(target_os = "linux")]

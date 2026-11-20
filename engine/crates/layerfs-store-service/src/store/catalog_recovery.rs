@@ -95,11 +95,44 @@ pub struct PreparedLegacyRecovery {
     version: i64,
     physical: layerfs_persistence::StorePhysicalIdentity,
 }
+
+/// A migrated, locally ready Workspace with its original lease but no open
+/// SQLite connection or Store handle. It cannot create a route or namespace.
+#[cfg(target_os = "linux")]
+pub struct MaintainedCatalogRecovery {
+    request: BindRequest,
+    observed: ReadyRecord,
+    source_version: i64,
+    _closed: layerfs_overlay::ClosedFile,
+}
+
+#[cfg(target_os = "linux")]
+impl MaintainedCatalogRecovery {
+    pub fn request(&self) -> &BindRequest {
+        &self.request
+    }
+
+    pub fn observed(&self) -> &ReadyRecord {
+        &self.observed
+    }
+
+    pub fn source_version(&self) -> i64 {
+        self.source_version
+    }
+
+    pub fn verify_original(&self) -> layerfs_overlay::OverlayResult<()> {
+        self._closed.verify_durable_identity()
+    }
+}
 #[cfg(target_os = "linux")]
 impl PreparedLegacyRecovery {
     /// The original namespace while its local lease remains held.
     pub fn previous_namespace(&self) -> i64 {
         self.observed.previous_namespace
+    }
+
+    pub fn verify_original(&self) -> layerfs_overlay::OverlayResult<()> {
+        self.ready.verify_original()
     }
 }
 
@@ -123,6 +156,9 @@ pub enum CatalogMigrationFailure {
     Physical {
         cause: layerfs_storage::port::PersistenceError,
         custody: RetainedCatalogRecovery,
+    },
+    Close {
+        cause: layerfs_overlay::OverlayError,
     },
 }
 impl fmt::Debug for PreparedCatalogRecovery {
@@ -302,18 +338,22 @@ impl PreparedCatalogRecovery {
             }
         };
         if version == 45 {
-            // The old Store is deliberately read-only. A successful observation
-            // checks its authenticated receipt format without claiming that it
-            // can accept a new publication.
-            if let Err(error) = self
+            // Both exact old and receipt-capable Store formats can contain a
+            // locally ready Workspace. An unsupported receipt operation proves
+            // the former only when it is the provider's explicit capability
+            // result; no publication or missing receipt is inferred from it.
+            match self
                 .store
                 .history()
                 .checkpoint_receipt(layerfs_history::CheckpointAttemptId::from_bytes([0; 32]))
             {
-                return Err(Box::new(CatalogMigrationFailure::Refused {
-                    cause: BindError::History(error),
-                    retained: self.retain(),
-                }));
+                Ok(_) | Err(HistoryError::Unsupported("checkpoint receipt")) => {}
+                Err(error) => {
+                    return Err(Box::new(CatalogMigrationFailure::Refused {
+                        cause: BindError::History(error),
+                        retained: self.retain(),
+                    }))
+                }
             }
         }
         let catalog = self.store.history().catalog_id().to_bytes();
@@ -611,6 +651,65 @@ impl Store {
                 },
             })),
         }
+    }
+
+    /// Migrate and checked-close one already authenticated Workspace for a
+    /// full-Store maintenance batch. The caller must retain its original
+    /// Store-wide writer and consumer fence and the original roster throughout.
+    /// This does not advance a namespace, register a Workspace or publish.
+    #[cfg(target_os = "linux")]
+    pub fn migrate_catalog_for_maintenance(
+        self: &Arc<Self>,
+        original: PreparedLegacyRecovery,
+    ) -> Result<MaintainedCatalogRecovery, Box<CatalogMigrationFailure>> {
+        let source_version = original.version;
+        let prepared = self.prepare_migrated_catalog_recovery(original)?;
+        let PreparedCatalogRecovery {
+            pending,
+            record,
+            request,
+            ..
+        } = prepared;
+        let (ready, observed) = match (pending, record) {
+            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed)) => {
+                (ready, observed)
+            }
+            _ => unreachable!("legacy migration prepared a ready Workspace"),
+        };
+        let checked = ready.preflight_upgrade(&observed).and_then(|version| {
+            if version == 45 {
+                Ok(())
+            } else {
+                Err(layerfs_overlay::OverlayError::Invalid(
+                    "maintenance migration schema",
+                ))
+            }
+        });
+        if let Err(cause) = checked {
+            return Err(Box::new(CatalogMigrationFailure::Upgrade {
+                cause: BindError::Owner(OwnerError::Overlay(cause)),
+                custody: RetainedCatalogRecovery {
+                    _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
+                },
+            }));
+        }
+        let db = ready.complete(&observed).map_err(|(cause, ready)| {
+            Box::new(CatalogMigrationFailure::Upgrade {
+                cause: BindError::Owner(OwnerError::Overlay(cause)),
+                custody: RetainedCatalogRecovery {
+                    _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
+                },
+            })
+        })?;
+        let closed = db
+            .close_database_file()
+            .map_err(|cause| Box::new(CatalogMigrationFailure::Close { cause }))?;
+        Ok(MaintainedCatalogRecovery {
+            request,
+            observed,
+            source_version,
+            _closed: closed,
+        })
     }
 }
 

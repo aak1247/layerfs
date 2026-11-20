@@ -1,4 +1,6 @@
 //! One fenced Store and roster transition, retaining every original lease.
+mod cohort;
+
 use super::{durable_root::DurableRoot, CatalogRecoveryFailure, KernelServing, Service};
 use crate::{
     bootstrap::{open_store_observed, OpenedStore},
@@ -8,6 +10,10 @@ use crate::{
         PreparedLegacyRecovery, ReaderFactory, Store, StoreReader,
     },
     Owner, OwnerClient, OwnerError,
+};
+pub use cohort::{
+    CatalogCohortCause, CatalogCohortEntry, CatalogCohortFailure, CatalogCohortProgress,
+    CatalogCohortProgressEntry, CatalogCohortSuccess, PreparedCatalogCohort,
 };
 use layerfs_bridge::control::WorkspaceToken;
 use layerfs_overlay::{OverlayCatalogRecovery, OverlayError, ProfileConfig};
@@ -108,6 +114,12 @@ impl Drop for CatalogTransitionFailure {
 /// The caller must continue holding its original full-Store external fence.
 pub struct PreparedCatalogTransition {
     state: TransitionState,
+}
+
+#[derive(Clone, Copy)]
+enum PreparationPurpose {
+    Recovery,
+    Maintenance,
 }
 
 struct ReadOnlyView {
@@ -378,6 +390,15 @@ impl PreparedCatalogTransition {
         original: File,
         owner: &Owner,
     ) -> Result<Self, Box<CatalogTransitionFailure>> {
+        Self::prepare_for(config, original, owner, PreparationPurpose::Recovery)
+    }
+
+    fn prepare_for(
+        config: CatalogTransitionConfig,
+        original: File,
+        owner: &Owner,
+        purpose: PreparationPurpose,
+    ) -> Result<Self, Box<CatalogTransitionFailure>> {
         let mut state = TransitionState {
             config,
             owner: owner.client(),
@@ -587,8 +608,20 @@ impl PreparedCatalogTransition {
                     }
                 }
             }
-            state.migrate = (legacy && !ordinary && (!recorded || receipts))
-                || (state.records.is_empty() && !receipts);
+            state.migrate = match purpose {
+                PreparationPurpose::Recovery => {
+                    (legacy && !ordinary && (!recorded || receipts))
+                        || (state.records.is_empty() && !receipts)
+                }
+                PreparationPurpose::Maintenance => {
+                    if ordinary {
+                        return Err(CatalogTransitionCause::Invalid(
+                            "catalog maintenance requires ready supported formats",
+                        ));
+                    }
+                    true
+                }
+            };
             if state.migrate {
                 while let Some((record, pending)) = state.original_entries.pop_front() {
                     let request = BindRequest {

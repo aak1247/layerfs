@@ -173,6 +173,21 @@ The full migration remains a separate operation requiring the original
 whole-Store writer, mount and consumer fence. The embedded Native path has not
 yet adopted that transition.
 
+`PreparedCatalogCohort` provides a maintenance transition for multiple
+original rosters on one physical Store. Under the caller's full-Store fence it
+prepares all supported ready schema-41, 42 and 45 members, rechecks each
+database and owner-file identity, transitions the Store once, and converts the
+members under their original leases. It closes the maintenance Store and each
+Overlay connection without admitting a Workspace or advancing a namespace; the
+returned value holds the original roster and Overlay leases until the owner
+records the result. Failure retains the known migrated prefix, the failed
+member and the unprocessed tail. A Store or Overlay outcome that is unknown is
+observed only after the original executor has exited, not reissued. Local
+leases and a caller-provided roster list do not prove that all users of the
+physical Store have stopped; that proof and durable operation accounting remain
+the responsibility of the application owner. Pending operations, active
+conflicts and source schemas 43 and 44 are not migrated by this batch.
+
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it
 when a fresh durable Workspace setup is explicitly supplied. It is not used to

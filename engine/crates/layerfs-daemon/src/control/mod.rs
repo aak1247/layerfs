@@ -43,8 +43,10 @@ mod types;
 mod unmount;
 #[cfg(target_os = "linux")]
 pub use catalog_transition::{
-    CatalogTransitionCause, CatalogTransitionConfig, CatalogTransitionFailure,
-    CatalogTransitionSuccess, PreparedCatalogTransition,
+    CatalogCohortCause, CatalogCohortEntry, CatalogCohortFailure, CatalogCohortProgress,
+    CatalogCohortProgressEntry, CatalogCohortSuccess, CatalogTransitionCause,
+    CatalogTransitionConfig, CatalogTransitionFailure, CatalogTransitionSuccess,
+    PreparedCatalogCohort, PreparedCatalogTransition,
 };
 #[cfg(target_os = "linux")]
 pub use durable_control::{DurableControlCause, DurableControlConfig, DurableControlFailure};

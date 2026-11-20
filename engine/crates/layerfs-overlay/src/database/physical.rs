@@ -53,6 +53,23 @@ impl ClosedFile {
     pub fn allocation_work(&self) -> AllocationWork {
         self.allocation.work()
     }
+
+    /// Recheck a checked-closed durable database and its still-held owner
+    /// lease without reopening SQLite or advancing a Workspace namespace.
+    pub fn verify_durable_identity(&self) -> OverlayResult<()> {
+        let lease = self
+            ._durable
+            .as_ref()
+            .ok_or(OverlayError::Invalid("durable lease is absent"))?;
+        let result = lease
+            .verify()
+            .and_then(|()| self.allocation.state().map(|_| ()))
+            .and_then(|()| lease.verify());
+        if result.is_err() {
+            lease.quarantine();
+        }
+        result
+    }
 }
 impl Allocation {
     #[cfg(target_os = "linux")]
