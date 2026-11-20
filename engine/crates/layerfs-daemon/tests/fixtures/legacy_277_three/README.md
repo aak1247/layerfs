@@ -1,0 +1,1 @@
+Three synthetic Workspaces, their roster and Store were created by the unmodified SDK 277368a810c3edd4d5e5555d846fcf367cb48e0c. Each has an independent acknowledged dirty write and all original owners exited. Tests use private copies.

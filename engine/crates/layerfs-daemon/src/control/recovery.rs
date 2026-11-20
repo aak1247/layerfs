@@ -178,115 +178,138 @@ impl Service {
                         }
                     },
                 };
-            if let Err(cause) = catalog.check_live() {
-                return Err(failed(
-                    CatalogRecoveryCause::PreparedDiscovery {
-                        record,
-                        cause,
-                        retained: prepared.retain(),
-                    },
-                    completed,
-                ));
-            }
-            let (recovered, proof) = match prepared.activate(next) {
-                Ok(value) => value,
-                Err(failure) => {
-                    return Err(failed(
-                        CatalogRecoveryCause::Activate { record, failure },
-                        completed,
-                    ))
-                }
-            };
-            let snapshot = proof.snapshot().clone();
-            let route = match recovered.client().bound_route() {
-                Ok(route) => route,
-                Err(cause) => {
-                    return Err(unadmitted(
-                        record,
-                        "recovered route",
-                        cause,
-                        recovered,
-                        snapshot,
-                        completed,
-                    ))
-                }
-            };
-            let namespace = route.namespace();
-            let Some(after) = namespace.checked_add(1) else {
-                return Err(unadmitted(
-                    record,
-                    "namespace exhausted",
-                    OwnerError::IdentityExhausted,
-                    recovered,
-                    snapshot,
-                    completed,
-                ));
-            };
-            if snapshot.branch.id != record.branch {
-                return Err(unadmitted(
-                    record,
-                    "recorded Branch mismatch",
-                    OwnerError::InvalidAdmission,
-                    recovered,
-                    snapshot,
-                    completed,
-                ));
-            }
-            let client = match owner.adopt_durable(recovered) {
-                Ok(client) => client,
-                Err(failure) => {
-                    return Err(failed(
-                        CatalogRecoveryCause::Unadmitted {
-                            record,
-                            reason: "roster admission",
-                            failure,
-                            snapshot: Box::new(snapshot),
-                        },
-                        completed,
-                    ))
-                }
-            };
-            if let Err(cause) = catalog.check_live() {
-                return Err(failed(
-                    CatalogRecoveryCause::DiscoveryAfterAdmission {
-                        record,
-                        cause,
-                        route,
-                        snapshot: Box::new(snapshot),
-                    },
-                    completed,
-                ));
-            }
-            let binding = match self.store.bind_catalog_recovery(client, request, proof) {
-                Ok(bound) => bound.workspace,
-                Err(failure) => {
-                    return Err(failed(
-                        CatalogRecoveryCause::Bind {
-                            record,
-                            route,
-                            failure: Box::new(failure),
-                        },
-                        completed,
-                    ))
-                }
-            };
-            match self.register_durable_with_recording(binding, true) {
-                Ok(token) => completed.push(token),
-                Err(failure) => {
-                    let DurableRegistrationFailure { cause, workspace } = *failure;
-                    let failure = Box::new(RecordedRegistrationFailure {
-                        cause: RecordedRegistrationError::Control(cause),
-                        workspace,
-                    });
-                    return Err(failed(
-                        CatalogRecoveryCause::Register { record, failure },
-                        completed,
-                    ));
-                }
-            }
-            next = after;
+            next = self.admit_catalog_prepared(
+                catalog,
+                owner,
+                record,
+                prepared,
+                next,
+                &mut completed,
+            )?;
         }
         Ok(completed)
+    }
+
+    pub(super) fn admit_catalog_prepared(
+        &self,
+        catalog: &mut Roster,
+        owner: &Owner,
+        record: WorkspaceRecord,
+        prepared: layerfs_store_service::store::PreparedCatalogRecovery,
+        next: i64,
+        completed: &mut Vec<WorkspaceToken>,
+    ) -> Result<i64, Box<CatalogRecoveryFailure>> {
+        let request = BindRequest {
+            workspace: record.workspace,
+            branch: record.branch,
+        };
+        if let Err(cause) = catalog.check_live() {
+            return Err(failed(
+                CatalogRecoveryCause::PreparedDiscovery {
+                    record,
+                    cause,
+                    retained: prepared.retain(),
+                },
+                std::mem::take(completed),
+            ));
+        }
+        let (recovered, proof) = match prepared.activate(next) {
+            Ok(value) => value,
+            Err(failure) => {
+                return Err(failed(
+                    CatalogRecoveryCause::Activate { record, failure },
+                    std::mem::take(completed),
+                ))
+            }
+        };
+        let snapshot = proof.snapshot().clone();
+        let route = match recovered.client().bound_route() {
+            Ok(route) => route,
+            Err(cause) => {
+                return Err(unadmitted(
+                    record,
+                    "recovered route",
+                    cause,
+                    recovered,
+                    snapshot,
+                    std::mem::take(completed),
+                ))
+            }
+        };
+        let namespace = route.namespace();
+        let Some(after) = namespace.checked_add(1) else {
+            return Err(unadmitted(
+                record,
+                "namespace exhausted",
+                OwnerError::IdentityExhausted,
+                recovered,
+                snapshot,
+                std::mem::take(completed),
+            ));
+        };
+        if snapshot.branch.id != record.branch {
+            return Err(unadmitted(
+                record,
+                "recorded Branch mismatch",
+                OwnerError::InvalidAdmission,
+                recovered,
+                snapshot,
+                std::mem::take(completed),
+            ));
+        }
+        let client = match owner.adopt_durable(recovered) {
+            Ok(client) => client,
+            Err(failure) => {
+                return Err(failed(
+                    CatalogRecoveryCause::Unadmitted {
+                        record,
+                        reason: "roster admission",
+                        failure,
+                        snapshot: Box::new(snapshot),
+                    },
+                    std::mem::take(completed),
+                ))
+            }
+        };
+        if let Err(cause) = catalog.check_live() {
+            return Err(failed(
+                CatalogRecoveryCause::DiscoveryAfterAdmission {
+                    record,
+                    cause,
+                    route,
+                    snapshot: Box::new(snapshot),
+                },
+                std::mem::take(completed),
+            ));
+        }
+        let binding = match self.store.bind_catalog_recovery(client, request, proof) {
+            Ok(bound) => bound.workspace,
+            Err(failure) => {
+                return Err(failed(
+                    CatalogRecoveryCause::Bind {
+                        record,
+                        route,
+                        failure: Box::new(failure),
+                    },
+                    std::mem::take(completed),
+                ))
+            }
+        };
+        match self.register_durable_with_recording(binding, true) {
+            Ok(token) => completed.push(token),
+            Err(failure) => {
+                let DurableRegistrationFailure { cause, workspace } = *failure;
+                let failure = Box::new(RecordedRegistrationFailure {
+                    cause: RecordedRegistrationError::Control(cause),
+                    workspace,
+                });
+                return Err(failed(
+                    CatalogRecoveryCause::Register { record, failure },
+                    std::mem::take(completed),
+                ));
+            }
+        }
+        Ok(after)
     }
 }
 

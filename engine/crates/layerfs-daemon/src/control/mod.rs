@@ -1,6 +1,8 @@
 //! Bounded kernel control over a direct Store and one local overlay owner.
 #[cfg(target_os = "linux")]
 mod attach;
+#[cfg(target_os = "linux")]
+mod catalog_transition;
 mod cleanup;
 #[cfg(target_os = "linux")]
 mod detach;
@@ -39,6 +41,11 @@ mod serving;
 mod status;
 mod types;
 mod unmount;
+#[cfg(target_os = "linux")]
+pub use catalog_transition::{
+    CatalogTransitionCause, CatalogTransitionConfig, CatalogTransitionFailure,
+    CatalogTransitionSuccess, PreparedCatalogTransition,
+};
 #[cfg(target_os = "linux")]
 pub use durable_control::{DurableControlCause, DurableControlConfig, DurableControlFailure};
 #[cfg(target_os = "linux")]

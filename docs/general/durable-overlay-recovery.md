@@ -121,8 +121,8 @@ original Store and roster and fence every old reader, writer, mount and
 consumer; this local handle does not prove that fence. Successful callers close
 the returned original file before reopening the Store, or retain it until all
 new SQLite connections close. A failed or unwound uncertain transaction retains
-the original file and session until process exit. This primitive is not yet
-wired into catalog recovery or an automatic Store/Overlay migration.
+the original file and session until process exit. It is also used by the
+fenced daemon catalog transition described below.
 
 A locally ready schema-41 or schema-42 Overlay can also be upgraded to 45
 under its original lease and namespace. The operation checks the complete
@@ -133,8 +133,8 @@ authenticate the actual Store and roster and fence the original consumers;
 the local Overlay operation does not establish those facts or advance the
 namespace. Component tests use files produced by the original 277 and d144
 SDKs, including a schema-42 kept row and its first write after reopening.
-This does not yet provide a complete Store/Roster migration or establish a
-process-loss, FUSE or physical durability result.
+These local tests do not establish a process-loss, FUSE or physical durability
+result.
 
 For a coordinated transition, a specially opened read-only Store checks the
 original open file and private directory before and after opening. The caller
@@ -144,8 +144,25 @@ Workspace drops the old Store provider while keeping its Overlay lease. A new
 Durable writer must match the recorded physical Store, catalog, incarnation,
 historical binding and root before it can apply the local Overlay transition.
 Already-current ready Workspaces can be reauthenticated without another DDL
-transition. The daemon and application startup paths do not yet orchestrate
-these components automatically.
+transition.
+
+The daemon's `PreparedCatalogTransition` orchestrates this sequence for a
+fenced original Store and roster. It holds each original Overlay lease while
+authenticating every record and its historical binding, closes the old Store
+providers, installs the receipt format when needed, and reopens the same
+physical Store before converting ready schema-41 and schema-42 overlays.
+It then uses the existing catalog admission path and selects fresh namespaces.
+If a transition stops after a committed prefix, the failure retains the
+original outstanding custody; after its owner has actually exited, a new owner
+can observe the original files and continue. Other supported existing states
+retain their ordinary recovery behavior rather than being silently converted.
+The caller must hold the full-Store external fence and retain the actual Owner
+with a failed transition. An empty legacy roster also upgrades the Store before
+new Workspaces are created. Tests cover a real old-SDK Store and three original
+Workspaces, including a failed middle migration and cold reopening of the same
+files; they do not establish a physical crash, FUSE mount or application startup
+result. Application startup and Native integration have not yet adopted this
+transition.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

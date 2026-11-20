@@ -95,6 +95,13 @@ pub struct PreparedLegacyRecovery {
     version: i64,
     physical: layerfs_persistence::StorePhysicalIdentity,
 }
+#[cfg(target_os = "linux")]
+impl PreparedLegacyRecovery {
+    /// The original namespace while its local lease remains held.
+    pub fn previous_namespace(&self) -> i64 {
+        self.observed.previous_namespace
+    }
+}
 
 /// A refusal retains its non-routable local custody and original cause.
 #[cfg(target_os = "linux")]

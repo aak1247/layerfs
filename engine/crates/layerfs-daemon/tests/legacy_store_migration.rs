@@ -1,12 +1,18 @@
 //! Actual legacy Store/Overlay bytes remain usable across a coordinated upgrade.
 #![cfg(target_os = "linux")]
 
+use layerfs_bridge::control::{CommitControl, Reply, Request};
 use layerfs_content::filesystem::PathName;
 use layerfs_daemon::{
     bootstrap::open_store,
-    control::Service,
+    control::{
+        CatalogTransitionConfig, CatalogTransitionSuccess, PreparedCatalogTransition, Service,
+    },
     durable_roster::{Authority, Roster, WorkspaceRecord},
-    store::{BindRequest, BoundWorkspace, CommitOptions, ReaderFactory, Store, StoreReader},
+    store::{
+        BindRequest, BoundWorkspace, CommitOptions, ReaderFactory, Store, StoreOperation,
+        StoreReader,
+    },
     Owner, OwnerConfig,
 };
 use layerfs_history::CheckpointAttemptId;
@@ -20,7 +26,7 @@ use layerfs_workspace::{Operation, Outcome, Position, Time};
 use rusqlite::{Connection, OpenFlags};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -34,6 +40,9 @@ const CURSOR: [u8; 32] = [43; 32];
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        Self::named("legacy_277")
+    }
+    fn named(name: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "layerfs-legacy-catalog-{}-{}",
@@ -44,7 +53,8 @@ impl Fixture {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         copy(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/legacy_277")
+                .join("tests/fixtures")
+                .join(name)
                 .as_path(),
             &dir,
         );
@@ -108,7 +118,10 @@ fn readonly_store(
 }
 fn read(workspace: &BoundWorkspace, name: &str) -> Vec<u8> {
     let operation = workspace.operation().unwrap();
-    let route = workspace.route();
+    read_operation(&operation, name)
+}
+fn read_operation(operation: &StoreOperation, name: &str) -> Vec<u8> {
+    let route = operation.workspace().route();
     let source = operation.overlay().acquire_base_source(route, 7).unwrap();
     let view = operation.workspace().view_for_source(source).unwrap();
     let file = view
@@ -130,7 +143,10 @@ fn read(workspace: &BoundWorkspace, name: &str) -> Vec<u8> {
 }
 fn write(workspace: &BoundWorkspace, name: &str, bytes: &[u8]) {
     let operation = workspace.operation().unwrap();
-    let route = workspace.route();
+    write_operation(&operation, name, bytes);
+}
+fn write_operation(operation: &StoreOperation, name: &str, bytes: &[u8]) {
+    let route = operation.workspace().route();
     let source = operation.overlay().acquire_base_source(route, 7).unwrap();
     let view = operation.workspace().view_for_source(source).unwrap();
     let file = view
@@ -465,4 +481,615 @@ fn legacy_277_store_and_workspace_upgrade_then_reopen_and_commit() {
             .unwrap(),
         2
     );
+}
+
+fn transition_config(fixture: &Fixture) -> CatalogTransitionConfig {
+    CatalogTransitionConfig {
+        store: fixture.config(),
+        binding: BINDING.to_vec(),
+        cursor_key: CURSOR,
+        catalog_directory: fixture.0.join("catalog"),
+        overlay_directory: fixture.0.join("overlays"),
+        sandbox: [8; 32],
+        profile: ProfileConfig::default(),
+        minimum_namespace: 1,
+        workspace_capacity: 2,
+        cache_bytes: 2 * 1024 * 1024,
+        reservations: ReservationBlocks::default(),
+    }
+}
+
+#[test]
+fn catalog_transition_migrates_and_reopens_the_original_workspace() {
+    let fixture = Fixture::new();
+    let config = fixture.config();
+    let original_identity = fs::symlink_metadata(&config.path).unwrap();
+    let owner = Owner::start(
+        &fixture.0.join("transition-template-1.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let original = fs::File::open(&config.path).unwrap();
+    let plan =
+        PreparedCatalogTransition::prepare(transition_config(&fixture), original, &owner).unwrap();
+    assert_eq!(plan.records().len(), 1);
+    let record = plan.records()[0];
+    let recovered = plan.execute(&owner, None, 0).unwrap();
+    assert_eq!(recovered.tokens.len(), 1);
+    let token = recovered.tokens[0];
+    assert_eq!(token.workspace, record.workspace);
+    assert_eq!(token.namespace, 2);
+    let operation = recovered.service.operation(token).unwrap();
+    assert_eq!(
+        read_operation(&operation, "file-000000"),
+        b"Bomplete installed file 000000\n"
+    );
+    assert_eq!(
+        read_operation(&operation, "file-000001"),
+        b"Domplete installed file 000001\n"
+    );
+    drop(operation);
+    let reply = recovered
+        .service
+        .execute_control(&Request::Commit(CommitControl {
+            token,
+            force: false,
+            message: None,
+        }))
+        .unwrap()
+        .reply;
+    assert!(matches!(
+        reply,
+        Reply::Committed(_) | Reply::MergeCommitted(_)
+    ));
+    let first = recovered
+        .opened
+        .store
+        .history()
+        .branch_snapshot(record.branch)
+        .unwrap()
+        .unwrap();
+    let CatalogTransitionSuccess {
+        opened, service, ..
+    } = recovered;
+    drop(service);
+    opened.store.close_reader(record.workspace).unwrap();
+    owner.stop().unwrap();
+    drop(opened);
+    let named = fs::symlink_metadata(&config.path).unwrap();
+    assert_eq!(
+        (named.dev(), named.ino()),
+        (original_identity.dev(), original_identity.ino())
+    );
+    let raw = Connection::open_with_flags(&config.path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let (attempt, digest): (Vec<u8>, Vec<u8>) = raw
+        .query_row(
+            "SELECT attempt_id,request_digest FROM checkpoint_receipt",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM checkpoint_receipt", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(raw);
+
+    let owner = Owner::start(
+        &fixture.0.join("transition-template-2.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let original = fs::File::open(&config.path).unwrap();
+    let plan =
+        PreparedCatalogTransition::prepare(transition_config(&fixture), original, &owner).unwrap();
+    assert_eq!(plan.records(), &[record]);
+    let recovered = plan.execute(&owner, None, 0).unwrap();
+    let next = recovered.tokens[0];
+    assert_eq!(next.namespace, 3);
+    assert!(matches!(
+        recovered.service.operation(token),
+        Err(layerfs_daemon::control::Failure::Rejected(
+            layerfs_bridge::control::ControlCode::Invalid,
+            "stale Workspace namespace"
+        ))
+    ));
+    let receipt = recovered
+        .opened
+        .store
+        .history()
+        .checkpoint_receipt(CheckpointAttemptId::from_bytes(attempt.try_into().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.request_digest.as_slice(), digest);
+    assert_eq!(
+        recovered
+            .opened
+            .store
+            .history()
+            .branch_snapshot(record.branch)
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    let operation = recovered.service.operation(next).unwrap();
+    assert_eq!(
+        read_operation(&operation, "file-000001"),
+        b"Domplete installed file 000001\n"
+    );
+    write_operation(
+        &operation,
+        "file-000001",
+        b"Eomplete installed file 000001\n",
+    );
+    drop(operation);
+    let reply = recovered
+        .service
+        .execute_control(&Request::Commit(CommitControl {
+            token: next,
+            force: false,
+            message: None,
+        }))
+        .unwrap()
+        .reply;
+    assert!(matches!(
+        reply,
+        Reply::Committed(_) | Reply::MergeCommitted(_)
+    ));
+    let operation = recovered.service.operation(next).unwrap();
+    assert_eq!(
+        read_operation(&operation, "file-000001"),
+        b"Eomplete installed file 000001\n"
+    );
+    drop(operation);
+    let CatalogTransitionSuccess {
+        opened, service, ..
+    } = recovered;
+    drop(service);
+    opened.store.close_reader(record.workspace).unwrap();
+    owner.stop().unwrap();
+    drop(opened);
+    let raw = Connection::open_with_flags(&config.path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM checkpoint_receipt", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn empty_legacy_catalog_upgrades_the_store_before_new_workspaces() {
+    let fixture = Fixture::new();
+    let config = fixture.config();
+    let original = fs::File::open(&config.path).unwrap();
+    let (readonly, source) = readonly_store(config.clone(), &original);
+    let authority = Authority::for_catalog([8; 32], readonly.history()).unwrap();
+    drop(readonly);
+    drop(source);
+    drop(original);
+    let catalog = fixture.0.join("empty-catalog");
+    let overlay = fixture.0.join("empty-overlays");
+    for directory in [&catalog, &overlay] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    drop(Roster::create(&catalog, authority).unwrap());
+    let owner = Owner::start(
+        &fixture.0.join("empty-template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let mut transition = transition_config(&fixture);
+    transition.catalog_directory = catalog;
+    transition.overlay_directory = overlay;
+    let plan = PreparedCatalogTransition::prepare(
+        transition,
+        fs::File::open(&config.path).unwrap(),
+        &owner,
+    )
+    .unwrap();
+    assert!(plan.records().is_empty());
+    let recovered = plan.execute(&owner, None, 0).unwrap();
+    assert!(recovered.tokens.is_empty());
+    recovered
+        .opened
+        .store
+        .history()
+        .require_checkpoint_receipts()
+        .unwrap();
+    let CatalogTransitionSuccess {
+        opened, service, ..
+    } = recovered;
+    drop(service);
+    owner.stop().unwrap();
+    drop(opened);
+}
+
+#[test]
+fn ready_current_overlay_keeps_legacy_store_readable_without_receipts() {
+    let fixture = Fixture::new();
+    let config = fixture.config();
+    let original = fs::File::open(&config.path).unwrap();
+    let (readonly, source) = readonly_store(config.clone(), &original);
+    let mut roster = Roster::open(
+        &fixture.0.join("catalog"),
+        Authority::for_catalog([8; 32], readonly.history()).unwrap(),
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    roster.visit(|record| records.push(record)).unwrap();
+    assert_eq!(records.len(), 1);
+    let record = records[0];
+    drop(roster);
+    drop(readonly);
+    drop(source);
+    drop(original);
+    let path = fixture.0.join("overlays").join(record.overlay_name());
+    let ready = match layerfs_overlay::OverlayCatalogRecovery::open(
+        &path,
+        ProfileConfig::default(),
+        record.workspace.to_bytes(),
+    )
+    .unwrap()
+    {
+        layerfs_overlay::OverlayCatalogRecovery::Ready(value) => value,
+        _ => panic!("expected ready legacy fixture"),
+    };
+    let observed = ready.observed().clone();
+    drop(ready.upgrade_legacy(&observed).unwrap());
+    let owner = Owner::start(
+        &fixture.0.join("current-template.sqlite"),
+        ProfileConfig::default(),
+        OwnerConfig { namespaces: 2 },
+    )
+    .unwrap();
+    let plan = PreparedCatalogTransition::prepare(
+        transition_config(&fixture),
+        fs::File::open(&config.path).unwrap(),
+        &owner,
+    )
+    .unwrap();
+    let recovered = plan.execute(&owner, None, 0).unwrap();
+    let token = recovered.tokens[0];
+    let operation = recovered.service.operation(token).unwrap();
+    assert_eq!(
+        read_operation(&operation, "file-000001"),
+        b"Domplete installed file 000001\n"
+    );
+    drop(operation);
+    assert!(matches!(
+        recovered
+            .opened
+            .store
+            .history()
+            .require_checkpoint_receipts(),
+        Err(layerfs_history::HistoryError::Unsupported(
+            "checkpoint receipt"
+        ))
+    ));
+    let CatalogTransitionSuccess {
+        opened, service, ..
+    } = recovered;
+    drop(service);
+    opened.store.close_reader(record.workspace).unwrap();
+    owner.stop().unwrap();
+    drop(opened);
+}
+
+mod interrupted_catalog {
+    use super::*;
+    use layerfs_history::{BranchId, WorkspaceId};
+    use layerfs_overlay::{OverlayCatalogRecovery, OverlayError};
+    use rusqlite::{auto_extension, ffi};
+    use std::{
+        ffi::{c_char, c_int, c_void, CStr},
+        io::{ErrorKind, Write},
+        process::{Command, Stdio},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const CHILD: &str = "LAYERFS_TEST_INTERRUPTED_CATALOG_CHILD";
+    static WATCHED: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    static FIRED: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "C" fn authorize(
+        _: *mut c_void,
+        action: c_int,
+        first: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> c_int {
+        if action == ffi::SQLITE_CREATE_TABLE
+            && !first.is_null()
+            && unsafe { CStr::from_ptr(first) }.to_bytes() == b"durable_owner_counts"
+        {
+            FIRED.fetch_add(1, Ordering::Relaxed);
+            return ffi::SQLITE_DENY;
+        }
+        ffi::SQLITE_OK
+    }
+    fn install(connection: Connection) -> rusqlite::Result<()> {
+        let Some(path) = connection.path() else {
+            return Ok(());
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return Ok(());
+        };
+        if Some((metadata.dev(), metadata.ino())) != *WATCHED.lock().unwrap() {
+            return Ok(());
+        }
+        // SAFETY: SQLite owns this live connection; the callback is static and
+        // does not open, close or retain a pointer to the connection.
+        assert_eq!(
+            unsafe {
+                ffi::sqlite3_set_authorizer(
+                    connection.handle(),
+                    Some(authorize),
+                    std::ptr::null_mut(),
+                )
+            },
+            ffi::SQLITE_OK
+        );
+        Ok(())
+    }
+    unsafe extern "C" fn opened(
+        db: *mut ffi::sqlite3,
+        error: *mut *mut c_char,
+        _: *const ffi::sqlite3_api_routines,
+    ) -> c_int {
+        // SAFETY: SQLite invokes this callback with its own live connection.
+        unsafe { auto_extension::init_auto_extension(db, error, install) }
+    }
+    fn record(byte: u8) -> WorkspaceRecord {
+        WorkspaceRecord {
+            workspace: WorkspaceId::from_authority([byte; 32]).unwrap(),
+            branch: BranchId::from_authority([24; 16]),
+        }
+    }
+    fn overlay(root: &Path, byte: u8) -> PathBuf {
+        root.join("overlays").join(record(byte).overlay_name())
+    }
+    type DirtyRow = (i64, i64, i64, i64, Vec<u8>, Option<Vec<u8>>);
+    fn dirty_rows(path: &Path) -> Vec<DirtyRow> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut query = db
+            .prepare(
+                "SELECT inode,generation,cell_offset,epoch,data,validity FROM fs_data \
+                 ORDER BY inode,generation,cell_offset",
+            )
+            .unwrap();
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+    fn signal(path: &Path) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.write_all(b"ready\n").unwrap();
+        file.sync_all().unwrap();
+    }
+    fn await_file(path: &Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "bounded test handoff expired");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn config(root: &Path) -> CatalogTransitionConfig {
+        CatalogTransitionConfig {
+            store: PersistenceConfig::sqlite(&root.join("store-private/store.sqlite"))
+                .with_sqlite_profile(SqlitePersistenceProfile::Durable)
+                .with_sqlite_acquisition(SqliteAcquisitionSchema::Tables),
+            binding: BINDING.to_vec(),
+            cursor_key: CURSOR,
+            catalog_directory: root.join("catalog"),
+            overlay_directory: root.join("overlays"),
+            sandbox: [8; 32],
+            profile: ProfileConfig::default(),
+            minimum_namespace: 1,
+            workspace_capacity: 3,
+            cache_bytes: 2 * 1024 * 1024,
+            reservations: ReservationBlocks::default(),
+        }
+    }
+    fn child(root: &Path) {
+        let target = fs::metadata(overlay(root, 43)).unwrap();
+        *WATCHED.lock().unwrap() = Some((target.dev(), target.ino()));
+        // SAFETY: this callback is local to this child process and does not
+        // itself open or close any SQLite connection.
+        unsafe { auto_extension::register_auto_extension(opened).unwrap() };
+        let owner = Owner::start(
+            &root.join("failed-template.sqlite"),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 3 },
+        )
+        .unwrap();
+        let original = fs::File::open(root.join("store-private/store.sqlite")).unwrap();
+        let plan = PreparedCatalogTransition::prepare(config(root), original, &owner).unwrap();
+        assert_eq!(plan.records(), &[record(42), record(43), record(44)]);
+        assert!(auto_extension::cancel_auto_extension(opened));
+        let failure = plan.execute(&owner, None, 0).err().unwrap();
+        assert!(matches!(failure.cause(),
+            layerfs_daemon::control::CatalogTransitionCause::Migration { record: failed, failure }
+            if *failed == record(43) && matches!(failure.as_ref(),
+                layerfs_daemon::store::CatalogMigrationFailure::Upgrade {
+                    cause: layerfs_daemon::store::BindError::Owner(layerfs_daemon::OwnerError::Overlay(OverlayError::Sql(rusqlite::Error::SqliteFailure(error,_)))), ..
+                } if error.extended_code == ffi::SQLITE_AUTH)));
+        assert!(FIRED.load(Ordering::Relaxed) > 0);
+        drop(failure);
+        signal(&root.join("failed-owner-held"));
+        await_file(&root.join("release-failed-owner"), Duration::from_secs(30));
+        drop(owner);
+    }
+
+    #[test]
+    fn failed_middle_migration_retains_all_leases_then_resumes_original_prefix() {
+        if let Some(root) = std::env::var_os(CHILD) {
+            child(Path::new(&root));
+            return;
+        }
+        let fixture = Fixture::named("legacy_277_three");
+        let store_path = fixture.0.join("store-private/store.sqlite");
+        let initial_store = fs::symlink_metadata(&store_path).unwrap();
+        let before: Vec<_> = [42_u8, 43, 44]
+            .iter()
+            .map(|byte| fs::symlink_metadata(overlay(&fixture.0, *byte)).unwrap())
+            .collect();
+        let original_dirty: Vec<_> = [42_u8, 43, 44]
+            .iter()
+            .map(|byte| dirty_rows(&overlay(&fixture.0, *byte)))
+            .collect();
+        for (index, rows) in original_dirty.iter().enumerate() {
+            let mut expected = b"complete installed file 000001\n".to_vec();
+            expected[0] = b'X' + index as u8;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].4, expected);
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("interrupted_catalog::failed_middle_migration_retains_all_leases_then_resumes_original_prefix")
+            .arg("--exact").arg("--nocapture").env(CHILD, &fixture.0)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !fixture.0.join("failed-owner-held").exists() {
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "child exited before the held-lease check: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert!(Instant::now() < deadline, "bounded test handoff expired");
+            thread::sleep(Duration::from_millis(20));
+        }
+        for byte in [42_u8, 43, 44] {
+            let result = OverlayCatalogRecovery::open(
+                &overlay(&fixture.0, byte),
+                ProfileConfig::default(),
+                [byte; 32],
+            );
+            assert!(
+                matches!(result, Err(OverlayError::Io(error)) if error.kind() == ErrorKind::WouldBlock)
+            );
+        }
+        signal(&fixture.0.join("release-failed-owner"));
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let store_after = fs::symlink_metadata(&store_path).unwrap();
+        assert_eq!(
+            (store_after.dev(), store_after.ino()),
+            (initial_store.dev(), initial_store.ino())
+        );
+        let raw =
+            Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM checkpoint_receipt", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(raw);
+        for (index, byte) in [42_u8, 43, 44].into_iter().enumerate() {
+            let path = overlay(&fixture.0, byte);
+            let after = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                (after.dev(), after.ino()),
+                (before[index].dev(), before[index].ino())
+            );
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                if index == 0 { 45 } else { 41 }
+            );
+            assert_eq!(
+                db.query_row("SELECT high_namespace FROM durable_route", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                (index + 1) as i64
+            );
+            assert_eq!(
+                db.query_row("SELECT dirty_inodes FROM durable_state", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            drop(db);
+            assert_eq!(
+                dirty_rows(&overlay(&fixture.0, byte)),
+                original_dirty[index]
+            );
+        }
+        let owner = Owner::start(
+            &fixture.0.join("resumed-template.sqlite"),
+            ProfileConfig::default(),
+            OwnerConfig { namespaces: 3 },
+        )
+        .unwrap();
+        let plan = PreparedCatalogTransition::prepare(
+            config(&fixture.0),
+            fs::File::open(&store_path).unwrap(),
+            &owner,
+        )
+        .unwrap();
+        assert_eq!(plan.records(), &[record(42), record(43), record(44)]);
+        let recovered = plan.execute(&owner, None, 0).unwrap();
+        assert_eq!(recovered.tokens.len(), 3);
+        for (index, token) in recovered.tokens.iter().enumerate() {
+            assert_eq!(token.workspace, record(42 + index as u8).workspace);
+            assert_eq!(token.namespace, (index + 2) as i64);
+            let operation = recovered.service.operation(*token).unwrap();
+            let mut expected = b"complete installed file 000001\n".to_vec();
+            expected[0] = b'X' + index as u8;
+            assert_eq!(read_operation(&operation, "file-000001"), expected);
+        }
+        let CatalogTransitionSuccess {
+            opened, service, ..
+        } = recovered;
+        drop(service);
+        for byte in [42_u8, 43, 44] {
+            opened.store.close_reader(record(byte).workspace).unwrap();
+        }
+        owner.stop().unwrap();
+        drop(opened);
+        let raw =
+            Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM checkpoint_receipt", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }

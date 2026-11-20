@@ -99,6 +99,19 @@ impl Store {
         self.durable_writer.is_some()
     }
 
+    /// Compare the actual Durable writer with a previously observed original
+    /// Store identity. External Store fencing remains the caller's duty.
+    #[cfg(target_os = "linux")]
+    pub fn verify_original_physical(
+        &self,
+        original: &layerfs_persistence::StorePhysicalIdentity,
+    ) -> Result<(), layerfs_storage::port::PersistenceError> {
+        self.durable_writer
+            .as_ref()
+            .ok_or(layerfs_storage::port::PersistenceError::Malformed)?
+            .verify_observed_store(original)
+    }
+
     /// Takes the control reader and a mount-time factory under explicit capacity.
     pub fn new(
         writer: Arc<dyn PackPersistence>,

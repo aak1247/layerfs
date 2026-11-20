@@ -122,6 +122,11 @@ impl ReadyRecovery {
         &self.observed
     }
 
+    /// The locally opened schema, before any namespace or route is advanced.
+    pub fn schema_version(&self) -> i64 {
+        self.db.profile().schema_version
+    }
+
     /// Check the exact supported local format without changing its namespace
     /// or database. This does not authenticate the Store or consumer fence.
     #[cfg(target_os = "linux")]
