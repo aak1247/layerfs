@@ -49,6 +49,16 @@ pub(super) fn initialize(db: &Overlay) -> OverlayResult<()> {
         &[],
         0,
     )?;
+    db.execute(
+        StatementKind::Startup,
+        "CREATE TRIGGER durable_checkpoint_attempt_owner_immutable \
+         BEFORE UPDATE OF reader_owner,operation_owner ON durable_checkpoint_attempt \
+         WHEN (OLD.reader_owner IS NOT NULL AND NEW.reader_owner IS NOT OLD.reader_owner) OR \
+              (OLD.operation_owner IS NOT NULL AND NEW.operation_owner IS NOT OLD.operation_owner) \
+         BEGIN SELECT RAISE(ABORT,'checkpoint owner identity is immutable'); END",
+        &[],
+        0,
+    )?;
     Ok(())
 }
 
@@ -148,7 +158,11 @@ pub(crate) fn check_original(db: &Overlay, recorded: RecordedCapture) -> Overlay
     check_context(db, recorded, true)
 }
 
-fn check_context(db: &Overlay, recorded: RecordedCapture, starting: bool) -> OverlayResult<i64> {
+pub(super) fn check_context(
+    db: &Overlay,
+    recorded: RecordedCapture,
+    starting: bool,
+) -> OverlayResult<i64> {
     let capture = recorded.capture;
     let state = db.state()?;
     if starting && state.closed {

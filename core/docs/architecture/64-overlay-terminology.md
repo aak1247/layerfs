@@ -90,6 +90,24 @@ no generic leases or SQL lease family remain. StatementKind also drops the now
 unused Workspace family, leaving twelve SQL families. Telemetry section 36
 records that cardinality so readers preserve historical fourteen-family receipts.
 
+## Recorded checkpoint cleanup in durable schema 43
+
+The experimental durable format records an original checkpoint attempt and its
+reader and operation identities beside the Workspace's durable binding. A caller
+may schedule its captured generation for folding only after establishing that its
+Store publication was not sent. The attempt remains present while the existing
+bounded maintenance processes that generation and its operation records. Fold,
+retire and operation-cleanup completion are recorded in the same transactions as
+the corresponding maintenance steps.
+
+The local cleanup observation and finish operation check that exact attempt,
+original binding and namespace, released owners, positive completion facts and
+the relevant queue keys. They do not drain unrelated work. Finish rechecks and
+removes the original folded attempt in one atomic job; an old token cannot finish
+a later attempt. This local operation does not authenticate a Store outcome or
+authorize recovery after an unknown publication. Installed attempts continue to
+require a verified Store receipt and are not finished by this path.
+
 ## Earlier terminology (schema 16 to 33)
 
 A `directory_entry` is a directory name-to-inode binding, including a recorded

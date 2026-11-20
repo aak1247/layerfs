@@ -509,7 +509,7 @@ fn an_older_generic_reader_can_release_during_a_new_recorded_capture() {
 }
 
 #[test]
-fn changed_operation_link_retains_the_original_owner_and_cleanup() {
+fn changed_operation_link_cannot_replace_the_original_owner() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
@@ -524,24 +524,25 @@ fn changed_operation_link_retains_the_original_owner_and_cleanup() {
     let reader = db
         .acquire_recorded_captured_reader(recorded, request)
         .unwrap();
-    let operation = db
-        .acquire_recorded_captured_operation(recorded, request, reader)
-        .unwrap();
-    db.release_captured_reader(reader).unwrap();
-    assert!(matches!(
-        db.release_operation(operation),
-        Err(OverlayError::Invalid(
-            "checkpoint operation release identity"
-        ))
-    ));
-    assert_eq!(db.retained_operation(request).unwrap(), Some(operation));
+    match db.acquire_recorded_captured_operation(recorded, request, reader) {
+        Err(OverlayError::Sql(rusqlite::Error::SqliteFailure(error, Some(message)))) => {
+            assert_eq!(
+                error.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+            );
+            assert_eq!(message, "checkpoint owner identity is immutable");
+        }
+        other => panic!("unexpected acquisition result: {other:?}"),
+    }
+    assert_eq!(db.retained_captured_reader(request).unwrap(), Some(reader));
+    assert!(db.retained_operation(request).unwrap().is_none());
     drop(db);
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
-    let (released, owners, cleanup): (i64, i64, i64) = sql.query_row(
-        "SELECT operation_released,(SELECT operation_count FROM durable_owner_counts WHERE id=1),(SELECT count(*) FROM cleanup_task WHERE kind=6) FROM durable_checkpoint_attempt WHERE id=1",
+    let (owner, owners, cleanup): (Option<i64>, i64, i64) = sql.query_row(
+        "SELECT operation_owner,(SELECT operation_count FROM durable_owner_counts WHERE id=1),(SELECT count(*) FROM cleanup_task WHERE kind=6) FROM durable_checkpoint_attempt WHERE id=1",
         [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ).unwrap();
-    assert_eq!((released, owners, cleanup), (0, 1, 0));
+    assert_eq!((owner, owners, cleanup), (None, 0, 0));
 }
 
 #[test]
