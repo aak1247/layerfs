@@ -260,14 +260,22 @@ impl Overlay {
                     ..step(1, 0, Next::From(0, -1))
                 });
             }
-            let mut state = self.open.borrow_mut();
-            state.orphans.put(
+            {
+                let mut state = self.open.borrow_mut();
+                state.orphans.put(
+                    serial,
+                    Orphan {
+                        top: orphan.floor,
+                        ..orphan
+                    },
+                );
+            }
+            crate::database::durable_owners::advance_orphan(
+                self,
                 serial,
-                Orphan {
-                    top: orphan.floor,
-                    ..orphan
-                },
-            );
+                orphan.top,
+                orphan.floor,
+            )?;
         }
         Ok(step(0, 0, Next::Held))
     }
@@ -345,6 +353,7 @@ impl Overlay {
             &[&serial],
             16,
         )?;
+        crate::database::durable_owners::remove_orphan(self, serial)?;
         {
             let mut state = self.open.borrow_mut();
             state.orphans.remove(serial);

@@ -73,6 +73,27 @@ impl CapturedReader {
     }
 }
 
+/// The SDK purpose of an operation, recorded without claiming its outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationPurpose {
+    /// A caller that does not provide enough information for reconciliation.
+    Unknown,
+    /// Temporary records owned by the SDK's private copy operation.
+    CopyScratch,
+    /// Temporary records used to construct one captured Workspace frontier.
+    CapturedConstruction,
+}
+
+impl OperationPurpose {
+    pub(crate) const fn record(self) -> i64 {
+        match self {
+            Self::Unknown => 0,
+            Self::CopyScratch => 1,
+            Self::CapturedConstruction => 2,
+        }
+    }
+}
+
 /// One nonrecycled operation owner, independent of command/process lifetime.
 /// Its backed operation_record remains in cleanup custody after exact release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

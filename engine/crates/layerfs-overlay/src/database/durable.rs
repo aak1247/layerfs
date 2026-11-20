@@ -349,7 +349,8 @@ mod linux {
                 &[],
                 0,
             )?;
-            db.execute(StatementKind::Startup, "PRAGMA user_version=42", &[], 0)?;
+            crate::database::durable_owners::initialize(&db)?;
+            db.execute(StatementKind::Startup, "PRAGMA user_version=43", &[], 0)?;
             db.execute(
                 StatementKind::Startup,
                 "PRAGMA application_id=1279676211",
@@ -364,7 +365,7 @@ mod linux {
             )?;
             Ok(())
         })?;
-        db.profile.schema_version = 42;
+        db.profile.schema_version = 43;
         let sync = db.allocation.sync_durable_file().and_then(|_| {
             File::open(
                 path.parent()
@@ -435,7 +436,7 @@ mod linux {
             super::super::profile::readback(&connection, &work, "PRAGMA user_version", |r| {
                 r.get(0)
             })?;
-        if ![39, 40, 41, 42].contains(&profile.schema_version) {
+        if ![39, 40, 41, 42, 43].contains(&profile.schema_version) {
             return Err(OverlayError::Invalid("durable overlay schema version"));
         }
         let integrity: String =
@@ -481,6 +482,25 @@ mod linux {
             )?;
             if held != (orphan || operation) {
                 return Err(OverlayError::Invalid("durable custody record changed"));
+            }
+            if profile.has_recorded_owners() {
+                let (orphan_count, operation_count, orphan_exists, operation_exists):
+                    (i64, i64, bool, bool) = super::super::profile::readback(
+                    &connection,
+                    &work,
+                    "SELECT orphan_count,operation_count,EXISTS(SELECT 1 FROM durable_orphan_owner),\
+                     EXISTS(SELECT 1 FROM durable_operation_owner) FROM durable_owner_counts WHERE id=1",
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                if orphan_count < 0
+                    || operation_count < 0
+                    || (orphan_count > 0) != orphan
+                    || (operation_count > 0) != operation
+                    || orphan_exists != orphan
+                    || operation_exists != operation
+                {
+                    return Err(OverlayError::Invalid("durable owner records changed"));
+                }
             }
             u64::try_from(kept).map_err(|_| OverlayError::Invalid("durable kept count invalid"))?
         } else if held && profile.schema_version == 41 {

@@ -1,14 +1,48 @@
 //! Engine-minted operation ownership and independent bounded operation_record custody.
-use crate::{db::integer, OperationOwner, Overlay, OverlayError, OverlayResult};
+use crate::{
+    contract::custody::OperationPurpose, db::integer, CapturedReader, OperationOwner, Overlay,
+    OverlayError, OverlayResult,
+};
 impl Overlay {
     /// One acquisition attempt. Query retained custody by request after a lost reply.
     pub fn acquire_operation(&self, request: u64) -> OverlayResult<OperationOwner> {
+        self.acquire_operation_for(request, OperationPurpose::Unknown, None)
+    }
+    /// Records private copy scratch; it does not establish an operation outcome.
+    pub fn acquire_copy_operation(&self, request: u64) -> OverlayResult<OperationOwner> {
+        self.acquire_operation_for(request, OperationPurpose::CopyScratch, None)
+    }
+    /// Binds construction scratch to its exact live captured reader.
+    pub fn acquire_captured_operation(
+        &self,
+        request: u64,
+        reader: CapturedReader,
+    ) -> OverlayResult<OperationOwner> {
+        self.acquire_operation_for(
+            request,
+            OperationPurpose::CapturedConstruction,
+            Some(reader),
+        )
+    }
+    fn acquire_operation_for(
+        &self,
+        request: u64,
+        purpose: OperationPurpose,
+        reader: Option<CapturedReader>,
+    ) -> OverlayResult<OperationOwner> {
         let request = integer(request)?;
         if request == 0 {
             return Err(OverlayError::Invalid("zero operation request"));
         }
         self.atomic(|| {
             self.live()?;
+            if let Some(reader) = reader {
+                self.check_captured_reader(reader)?;
+                self.checked_capture(reader.capture)?;
+                if reader.capture.generation.0 != request {
+                    return Err(OverlayError::Invalid("captured operation request differs"));
+                }
+            }
             let owner = self.mint_owner()?;
             let value = OperationOwner {
                 engine: self.identity,
@@ -19,6 +53,9 @@ impl Overlay {
                 request,
                 value,
                 "duplicate operation request",
+            )?;
+            crate::database::durable_owners::acquire_operation(
+                self, owner, request, purpose, reader,
             )?;
             Ok(value)
         })
@@ -60,10 +97,18 @@ impl Overlay {
     pub fn release_operation(&self, owner: OperationOwner) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             self.check_operation(owner)?;
+            let request = self
+                .open
+                .borrow()
+                .operations
+                .get(owner.owner)
+                .ok_or(OverlayError::Stale)?
+                .1;
             self.open
                 .borrow_mut()
                 .operations
                 .remove(owner.owner, |held| *held == owner)?;
+            crate::database::durable_owners::release_operation(self, owner.owner, request)?;
             self.enqueue(
                 crate::maintenance::OPERATION_RECORD,
                 integer(owner.owner)?,

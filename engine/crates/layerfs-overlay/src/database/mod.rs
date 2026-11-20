@@ -4,6 +4,7 @@ pub(crate) mod connection_owner;
 pub(crate) mod durable;
 pub(crate) mod durable_binding;
 pub(crate) mod durable_kept;
+pub(crate) mod durable_owners;
 pub(crate) mod durable_route;
 pub(crate) mod profile;
 pub(crate) mod startup;

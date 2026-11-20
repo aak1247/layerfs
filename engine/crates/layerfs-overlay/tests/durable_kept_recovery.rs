@@ -84,7 +84,7 @@ fn settle_maintenance(db: &Overlay) {
 
 fn with_kept(fixture: &Fixture) -> Overlay {
     let db = Overlay::create_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
-    assert_eq!(db.profile().schema_version, 42);
+    assert_eq!(db.profile().schema_version, 43);
     db.open_workspace(ROOT).unwrap();
     db.initialize_durable_binding(ROOT, b"original snapshot")
         .unwrap();
@@ -233,7 +233,7 @@ fn kept_rows_do_not_hide_unresolved_operation_or_legacy_custody() {
     );
     connection
         .execute_batch(
-            "DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
+            "DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
         )
         .unwrap();
     drop(connection);
@@ -281,7 +281,7 @@ fn clean_legacy_41_reopens_without_implicit_conversion() {
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
+            "DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; DROP TABLE durable_kept_live; DROP TABLE durable_custody; PRAGMA user_version=41;",
         )
         .unwrap();
     drop(connection);
@@ -295,6 +295,38 @@ fn clean_legacy_41_reopens_without_implicit_conversion() {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         41
+    );
+}
+
+#[test]
+fn legacy_42_reconstructs_kept_rows_without_implicit_conversion() {
+    let fixture = Fixture::new();
+    drop(with_kept(&fixture));
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    connection.execute_batch("DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=42;").unwrap();
+    drop(connection);
+    let db = Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
+    assert_eq!(db.profile().schema_version, 42);
+    assert_eq!(db.state().unwrap().dirty_inodes, 0);
+    let mut changed = inode(SERIAL);
+    changed.mode = 0o600;
+    apply(
+        &db,
+        2,
+        &Changes {
+            inodes: vec![changed],
+            ..Changes::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.state().unwrap().dirty_inodes, 1);
+    db.close_database().unwrap();
+    let connection = rusqlite::Connection::open(fixture.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        42
     );
 }
 

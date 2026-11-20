@@ -13,6 +13,25 @@ impl OwnerClient {
             db.acquire_operation(request)
         })
     }
+    pub(crate) fn acquire_copy_operation(
+        &self,
+        route: Route,
+        request: u64,
+    ) -> Result<OperationOwner, OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.acquire_copy_operation(request)
+        })
+    }
+    pub(crate) fn acquire_captured_operation(
+        &self,
+        route: Route,
+        request: u64,
+        reader: CapturedReader,
+    ) -> Result<OperationOwner, OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.acquire_captured_operation(request, reader)
+        })
+    }
     pub fn release_operation(&self, route: Route, owner: OperationOwner) -> Result<(), OwnerError> {
         self.call(route, ServiceClass::General, None, move |db| {
             db.release_operation(owner)

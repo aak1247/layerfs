@@ -78,20 +78,19 @@ impl Overlay {
         // From here an orphan-domain row may exist: inode reads probe for it
         // until the last orphan row of this engine is deleted.
         self.orphan_seen.set(true);
+        let orphan = Orphan {
+            root: state.base_root,
+            top: state.active.0,
+            floor: state.installed,
+        };
         {
             let mut open = self.open.borrow_mut();
             if open.orphans.rows.contains_key(&serial) {
                 return Err(OverlayError::Stale);
             }
-            open.orphans.put(
-                serial,
-                Orphan {
-                    root: state.base_root,
-                    top: state.active.0,
-                    floor: state.installed,
-                },
-            );
+            open.orphans.put(serial, orphan);
         }
+        crate::database::durable_owners::insert_orphan(self, serial, orphan)?;
         self.execute(
             StatementKind::Inode,
             sql::INODE_INSERT,
@@ -141,8 +140,11 @@ impl Overlay {
             .get(&serial)
             .copied()
             .ok_or(OverlayError::Stale)?;
+        let previous = orphan.top;
         orphan.top = next;
         state.orphans.put(serial, orphan);
+        drop(state);
+        crate::database::durable_owners::advance_orphan(self, serial, previous, next)?;
         Ok(())
     }
     /// One current descriptor-read window. Its independent reader/source

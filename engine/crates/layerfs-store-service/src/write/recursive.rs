@@ -128,7 +128,7 @@ impl Mutation<'_> {
         let owner = self
             .op
             .overlay()
-            .acquire_operation(self.workspace.route(), index + 1)
+            .acquire_copy_operation(self.workspace.route(), index + 1)
             .map_err(args::failed)?;
         let scope = IndexedOperationRecordScope {
             owner,

@@ -128,7 +128,7 @@ impl BoundWorkspace {
         held.reader = Some(reader);
         let owner = self
             .job(|job_client: &crate::OwnerClient, job_route| {
-                job_client.acquire_operation(job_route, request)
+                job_client.acquire_captured_operation(job_route, request, reader)
             })
             .map_err(CommitError::Owner)?;
         held.operation = Some(owner);
