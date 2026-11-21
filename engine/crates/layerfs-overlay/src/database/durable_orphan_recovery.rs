@@ -25,6 +25,7 @@ pub struct OrphanRecoveryRecord {
 pub struct PendingOrphanRecovery {
     db: Overlay,
     observed: OrphanRecoveryRecord,
+    conflict: Option<crate::SettledConflict>,
     scheduled: bool,
 }
 impl fmt::Debug for PendingOrphanRecovery {
@@ -556,6 +557,25 @@ impl PendingOrphanRecovery {
                 .durable_binding()?
                 .ok_or(OverlayError::Invalid("orphan recovery binding"))?,
         };
+        let conflict = if super::durable_conflict_stage::active_conflict(&db)?.is_some() {
+            let conflict = super::pending_recovery::observe(&db)?;
+            if conflict.workspace != observed.workspace
+                || conflict.previous_namespace != observed.previous_namespace
+                || conflict.marker_root != observed.root
+                || conflict.target_snapshot != observed.snapshot
+            {
+                return Err(OverlayError::Invalid("mixed conflict orphan binding"));
+            }
+            super::pending_recovery::verify_conflict(
+                &db,
+                &conflict,
+                &conflict,
+                observed.previous_namespace,
+            )?;
+            Some(conflict)
+        } else {
+            None
+        };
         let rows = owners(&db, None)?;
         // Restore only the exact persisted orphan holders. This is an
         // in-memory baseline under the same lease, before any SQL write.
@@ -571,12 +591,26 @@ impl PendingOrphanRecovery {
         Ok(Self {
             db,
             observed,
+            conflict,
             scheduled: false,
         })
     }
 
     pub fn observed(&self) -> &OrphanRecoveryRecord {
         &self.observed
+    }
+
+    /// A local conflict projection requires separate Store authentication.
+    pub fn conflict_record(&self) -> Option<&crate::SettledConflict> {
+        self.conflict.as_ref()
+    }
+
+    pub fn conflict_page(&self, number: u64) -> OverlayResult<Vec<u8>> {
+        let conflict = self
+            .conflict
+            .as_ref()
+            .ok_or(OverlayError::Invalid("mixed conflict recovery absent"))?;
+        super::pending_recovery::conflict_page(&self.db, conflict, number)
     }
 
     /// One bounded page of original orphan roots, for the actual Store check.
@@ -623,6 +657,14 @@ impl PendingOrphanRecovery {
             .map_err(|_| OverlayError::Invalid("orphan recovery root inode"))?;
         if root_serial <= 0 {
             return Err(OverlayError::Invalid("orphan recovery root inode"));
+        }
+        if let Some(conflict) = &self.conflict {
+            super::pending_recovery::verify_conflict(
+                &self.db,
+                conflict,
+                conflict,
+                self.observed.previous_namespace,
+            )?;
         }
         if self.db.durable_namespace()? != Some(self.observed.previous_namespace)
             || self.db.durable_binding()?.as_deref() != Some(self.observed.snapshot.as_slice())
@@ -717,7 +759,26 @@ impl PendingOrphanRecovery {
         if rows.as_slice() != [false] {
             return Ok(false);
         }
-        self.db.require_recorded_recovery_ready()?;
+        if let Some(conflict) = &self.conflict {
+            super::pending_recovery::verify_conflict(
+                &self.db,
+                conflict,
+                conflict,
+                self.observed.previous_namespace,
+            )?;
+            self.db
+                .require_conflict_synchronize_ready(&crate::ConflictSyncIdentity {
+                    workspace: conflict.workspace,
+                    catalog: conflict.catalog,
+                    incarnation: conflict.incarnation,
+                    namespace: conflict.previous_namespace,
+                    marker_root: conflict.marker_root,
+                    target_snapshot: &conflict.target_snapshot,
+                    descriptor: conflict.descriptor,
+                })?;
+        } else {
+            self.db.require_recorded_recovery_ready()?;
+        }
         Ok(true)
     }
 

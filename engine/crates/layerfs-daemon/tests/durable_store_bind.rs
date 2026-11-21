@@ -169,9 +169,103 @@ fn access_operation<T>(
     result
 }
 
-#[test]
-fn settled_conflict_recovers_original_catalog_workspace_and_resolves_once() {
-    let fixture = support::Fixture::new_durable(1, "recorded-cold-conflict");
+fn unlink_with_held_handle(workspace: &BoundWorkspace, name: &str, expected: &[u8]) -> u64 {
+    let operation = workspace.operation().unwrap();
+    let root_serial = operation
+        .workspace()
+        .base()
+        .unwrap()
+        .root()
+        .root_inode()
+        .serial();
+    let client = operation.overlay().clone();
+    let route = workspace.route();
+    let mount = client.kernel_mount(route, root_serial).unwrap();
+    let requests = MountRequests::new(mount);
+    let services = layerfs_daemon::mount_request(workspace, &requests.fence()).unwrap();
+    let lookup = wait(KernelRead::prepare(
+        services.clone(),
+        mount,
+        11,
+        root_serial,
+        None,
+        KernelReadOperation::Lookup {
+            parent: root_serial,
+            name: PathName::new(name).unwrap(),
+        },
+    ))
+    .unwrap();
+    let serial = lookup.value().unwrap().stat.serial;
+    wait(lookup.dispose()).unwrap();
+    let opened = wait(KernelRead::prepare(
+        services.clone(),
+        mount,
+        12,
+        serial,
+        None,
+        KernelReadOperation::Open {
+            serial,
+            writable: true,
+        },
+    ))
+    .unwrap();
+    let handle = opened.value().unwrap().file.unwrap().owner_id();
+    wait(opened.dispose()).unwrap();
+    access(workspace, |operation, view| {
+        let result = operation
+            .workspace()
+            .mutate(
+                operation.overlay(),
+                operation.ports(),
+                view,
+                Operation::Unlink {
+                    parent: view.root_serial(),
+                    name: PathName::new(name).unwrap(),
+                },
+                Time {
+                    seconds: 1,
+                    nanoseconds: 2,
+                },
+            )
+            .unwrap();
+        let Outcome::Applied { publication, .. } = result else {
+            panic!("unlink was not applied")
+        };
+        operation.overlay().reply_attempted(publication).unwrap();
+        assert!(matches!(
+            view.lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new(name).unwrap()
+            ),
+            Err(WorkspaceError::Content(ContentError::PathNotFound))
+        ));
+    });
+    let bytes = wait(KernelData::read(
+        services.clone(),
+        mount,
+        13,
+        serial,
+        Some(handle),
+        ReadDataInput::File {
+            offset: 0,
+            length: 1024,
+        },
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(bytes.bytes(), expected);
+    drop(bytes);
+    drop(services);
+    drop(requests);
+    drop(client);
+    drop(operation);
+    serial
+}
+
+fn settled_conflict_recovery(mixed_orphan: bool) {
+    let fixture =
+        support::Fixture::new_durable(if mixed_orphan { 3 } else { 1 }, "recorded-cold-conflict");
     let store = open_store(
         fixture.config.clone(),
         support::BINDING,
@@ -253,12 +347,40 @@ fn settled_conflict_recovers_original_catalog_workspace_and_resolves_once() {
     assert!(String::from_utf8(marker.clone())
         .unwrap()
         .contains("<<<<<<< workspace"));
+    let orphan = if mixed_orphan {
+        let serial = unlink_with_held_handle(&second, "file-000001", &support::bytes(1));
+        let mut later = support::bytes(2);
+        later[0] = b'Z';
+        write(&second, "file-000002", &later);
+        Some((serial, later))
+    } else {
+        None
+    };
     drop(first);
     drop(second);
     store.close_reader(id1).unwrap();
     store.close_reader(id2).unwrap();
     owner1.stop().unwrap();
     owner2.stop().unwrap();
+
+    let original_root = if let Some((serial, _)) = &orphan {
+        let db = rusqlite::Connection::open(&second_path).unwrap();
+        let (root, nlink): (Vec<u8>, i64) = db.query_row(
+            "SELECT o.root,i.nlink FROM durable_orphan_owner o JOIN fs_inode i ON i.inode=o.serial AND i.generation=-1 WHERE o.serial=?1",
+            [i64::try_from(*serial).unwrap()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(nlink, 0);
+        let bogus = [0xff_u8; 32];
+        assert_ne!(root, bogus);
+        db.execute(
+            "UPDATE durable_orphan_owner SET root=?1 WHERE serial=?2",
+            rusqlite::params![bogus.as_slice(), i64::try_from(*serial).unwrap()],
+        )
+        .unwrap();
+        Some(root)
+    } else {
+        None
+    };
 
     let recovered_owner = Owner::start(
         &fixture.directory.join("cold-conflict-template.sqlite"),
@@ -267,6 +389,55 @@ fn settled_conflict_recovers_original_catalog_workspace_and_resolves_once() {
     )
     .unwrap();
     let service = Service::new(store.clone(), &recovered_owner);
+    if let (Some((serial, _)), Some(root)) = (&orphan, &original_root) {
+        let refused = service
+            .recover_catalog(
+                &mut roster,
+                &recovered_owner,
+                &overlays,
+                [8; 32],
+                ProfileConfig::default(),
+                3,
+            )
+            .unwrap_err();
+        let CatalogRecoveryCause::Prepare { failure, .. } = &refused.cause else {
+            panic!(
+                "expected orphan content authentication failure: {:?}",
+                refused.cause
+            )
+        };
+        assert!(matches!(
+            failure.as_ref(),
+            layerfs_daemon::store::CatalogPreparationFailure::Retained {
+                cause: BindError::Content { .. },
+                ..
+            }
+        ));
+        assert_eq!(service.workspaces(), Some(0));
+        assert_eq!(
+            store
+                .history()
+                .branch_snapshot(fixture.branch)
+                .unwrap()
+                .unwrap(),
+            winning
+        );
+        drop(refused);
+        let db = rusqlite::Connection::open(&second_path).unwrap();
+        let (namespace, corrupt, nlink, active): (i64, Vec<u8>, i64, i64) = db.query_row(
+            "SELECT r.high_namespace,o.root,i.nlink,(SELECT count(*) FROM durable_conflict_plan WHERE state=1) FROM durable_route r,durable_orphan_owner o JOIN fs_inode i ON i.inode=o.serial AND i.generation=-1 WHERE r.id=1 AND o.serial=?1",
+            [i64::try_from(*serial).unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            (namespace, corrupt, nlink, active),
+            (2, vec![0xff; 32], 0, 1)
+        );
+        db.execute(
+            "UPDATE durable_orphan_owner SET root=?1 WHERE serial=?2",
+            rusqlite::params![root, i64::try_from(*serial).unwrap()],
+        )
+        .unwrap();
+    }
     let recovered = service
         .recover_catalog(
             &mut roster,
@@ -281,13 +452,40 @@ fn settled_conflict_recovers_original_catalog_workspace_and_resolves_once() {
     let token = recovered[0];
     assert_eq!(token.workspace, id2);
     assert!(token.namespace > 2);
-    assert!(service
-        .operation(WorkspaceToken {
+    assert!(matches!(
+        service.operation(WorkspaceToken {
             workspace: id2,
             namespace: 2
-        })
-        .is_err());
+        }),
+        Err(Failure::Rejected(
+            ControlCode::Invalid,
+            "stale Workspace namespace"
+        ))
+    ));
     let operation = service.operation(token).unwrap();
+    if let Some((_, later)) = &orphan {
+        access_operation(&operation, |operation, view| {
+            assert!(matches!(
+                view.lookup(
+                    operation.overlay(),
+                    view.root_serial(),
+                    &PathName::new("file-000001").unwrap()
+                ),
+                Err(WorkspaceError::Content(ContentError::PathNotFound))
+            ));
+            let file = view
+                .lookup(
+                    operation.overlay(),
+                    view.root_serial(),
+                    &PathName::new("file-000002").unwrap(),
+                )
+                .unwrap();
+            let mut bytes = Vec::new();
+            view.read(operation.overlay(), file.serial, 0, 1024, &mut bytes)
+                .unwrap();
+            assert_eq!(&bytes, later);
+        });
+    }
     let readback = access_operation(&operation, |operation, view| {
         let file = view
             .lookup(
@@ -398,6 +596,16 @@ fn settled_conflict_recovers_original_catalog_workspace_and_resolves_once() {
     assert_eq!(receipts, (2, 2));
     drop(history);
     fixture.cleanup();
+}
+
+#[test]
+fn settled_conflict_recovers_original_catalog_workspace_and_resolves_once() {
+    settled_conflict_recovery(false);
+}
+
+#[test]
+fn settled_conflict_and_unlinked_open_file_recover_together() {
+    settled_conflict_recovery(true);
 }
 
 #[test]
@@ -714,100 +922,8 @@ fn checkpoint_recovery_after_original_commit(published: bool, mixed_orphan: bool
             initial
         );
     }
-    let mut orphan_serial = None;
-    if mixed_orphan {
-        let operation = old.operation().unwrap();
-        let root_serial = operation
-            .workspace()
-            .base()
-            .unwrap()
-            .root()
-            .root_inode()
-            .serial();
-        let client = operation.overlay().clone();
-        let route = old.route();
-        let mount = client.kernel_mount(route, root_serial).unwrap();
-        let requests = MountRequests::new(mount);
-        let services = layerfs_daemon::mount_request(&old, &requests.fence()).unwrap();
-        let lookup = wait(KernelRead::prepare(
-            services.clone(),
-            mount,
-            11,
-            root_serial,
-            None,
-            KernelReadOperation::Lookup {
-                parent: root_serial,
-                name: PathName::new("file-000002").unwrap(),
-            },
-        ))
-        .unwrap();
-        let serial = lookup.value().unwrap().stat.serial;
-        wait(lookup.dispose()).unwrap();
-        let opened = wait(KernelRead::prepare(
-            services.clone(),
-            mount,
-            12,
-            serial,
-            None,
-            KernelReadOperation::Open {
-                serial,
-                writable: true,
-            },
-        ))
-        .unwrap();
-        let handle = opened.value().unwrap().file.unwrap().owner_id();
-        wait(opened.dispose()).unwrap();
-        access(&old, |operation, view| {
-            let result = operation
-                .workspace()
-                .mutate(
-                    operation.overlay(),
-                    operation.ports(),
-                    view,
-                    Operation::Unlink {
-                        parent: view.root_serial(),
-                        name: PathName::new("file-000002").unwrap(),
-                    },
-                    Time {
-                        seconds: 1,
-                        nanoseconds: 2,
-                    },
-                )
-                .unwrap();
-            let Outcome::Applied { publication, .. } = result else {
-                panic!("unlink was not applied")
-            };
-            operation.overlay().reply_attempted(publication).unwrap();
-            assert!(matches!(
-                view.lookup(
-                    operation.overlay(),
-                    view.root_serial(),
-                    &PathName::new("file-000002").unwrap()
-                ),
-                Err(WorkspaceError::Content(ContentError::PathNotFound))
-            ));
-        });
-        let bytes = wait(KernelData::read(
-            services.clone(),
-            mount,
-            13,
-            serial,
-            Some(handle),
-            ReadDataInput::File {
-                offset: 0,
-                length: 1024,
-            },
-        ))
-        .unwrap()
-        .unwrap();
-        assert_eq!(bytes.bytes(), support::bytes(2));
-        drop(bytes);
-        drop(services);
-        drop(requests);
-        drop(client);
-        drop(operation);
-        orphan_serial = Some(serial);
-    }
+    let orphan_serial =
+        mixed_orphan.then(|| unlink_with_held_handle(&old, "file-000002", &support::bytes(2)));
     let mut later = support::bytes(1);
     later[0] = b'Y';
     write(&old, "file-000001", &later);

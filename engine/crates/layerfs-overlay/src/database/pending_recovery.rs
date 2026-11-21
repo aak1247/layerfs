@@ -243,6 +243,75 @@ impl Overlay {
     }
 }
 
+pub(super) fn conflict_page(
+    db: &Overlay,
+    observed: &SettledConflict,
+    number: u64,
+) -> OverlayResult<Vec<u8>> {
+    if number >= observed.page_count {
+        return Err(OverlayError::Invalid("settled conflict page"));
+    }
+    let offset = number
+        .checked_mul(CONFLICT_PAGE_BYTES as u64)
+        .ok_or(OverlayError::Invalid("settled conflict page"))?;
+    let size = observed
+        .byte_count
+        .checked_sub(offset)
+        .ok_or(OverlayError::Invalid("settled conflict page"))?
+        .min(CONFLICT_PAGE_BYTES as u64);
+    let number =
+        i64::try_from(number).map_err(|_| OverlayError::Invalid("settled conflict page"))?;
+    let rows: Vec<Vec<u8>> = db.query(
+        StatementKind::Frontier,
+        "SELECT data FROM durable_conflict_page WHERE generation=?1 AND page_no=?2",
+        &[&observed.generation, &number],
+        CONFLICT_PAGE_BYTES as u64 + 16,
+        |r| r.get(0),
+    )?;
+    let [data] = rows.as_slice() else {
+        return Err(OverlayError::Invalid("settled conflict page"));
+    };
+    if size == 0 || u64::try_from(data.len()).ok() != Some(size) {
+        return Err(OverlayError::Invalid("settled conflict page"));
+    }
+    Ok(data.clone())
+}
+
+pub(super) fn verify_conflict(
+    db: &Overlay,
+    observed: &SettledConflict,
+    expected: &SettledConflict,
+    old_namespace: i64,
+) -> OverlayResult<()> {
+    if observed != expected
+        || observe(db)? != *expected
+        || old_namespace != expected.previous_namespace
+    {
+        return Err(OverlayError::Invalid("settled conflict predecessor"));
+    }
+    let mut digest = [0; 32];
+    let mut bytes = 0_u64;
+    for page in 0..expected.page_count {
+        let data = conflict_page(db, observed, page)?;
+        digest = conflict_page_digest(digest, page, &data)?;
+        bytes = bytes
+            .checked_add(data.len() as u64)
+            .ok_or(OverlayError::Invalid("settled conflict size"))?;
+    }
+    let pages = i64::try_from(expected.page_count)
+        .map_err(|_| OverlayError::Invalid("settled conflict pages"))?;
+    let extra:Vec<bool>=db.query(StatementKind::Frontier,
+            "SELECT EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation<?1) OR EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation>?1) OR EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1 AND page_no>=?2) OR EXISTS(SELECT 1 FROM durable_conflict_plan WHERE state<>1) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13) OR EXISTS(SELECT 1 FROM durable_checkpoint_attempt)",
+            &[&expected.generation,&pages],16,|r|r.get(0))?;
+    if digest != expected.final_digest
+        || bytes != expected.byte_count
+        || extra.as_slice() != [false]
+    {
+        return Err(OverlayError::Invalid("settled conflict contents"));
+    }
+    Ok(())
+}
+
 impl SettledConflictRecovery {
     pub fn observed(&self) -> &SettledConflict {
         &self.observed
@@ -304,64 +373,11 @@ impl SettledConflictRecovery {
 
     /// Reads exactly one original bounded page; no row is modified.
     pub fn page(&self, number: u64) -> OverlayResult<Vec<u8>> {
-        if number >= self.observed.page_count {
-            return Err(OverlayError::Invalid("settled conflict page"));
-        }
-        let offset = number
-            .checked_mul(CONFLICT_PAGE_BYTES as u64)
-            .ok_or(OverlayError::Invalid("settled conflict page"))?;
-        let size = self
-            .observed
-            .byte_count
-            .checked_sub(offset)
-            .ok_or(OverlayError::Invalid("settled conflict page"))?
-            .min(CONFLICT_PAGE_BYTES as u64);
-        let number =
-            i64::try_from(number).map_err(|_| OverlayError::Invalid("settled conflict page"))?;
-        let rows: Vec<Vec<u8>> = self.db.query(
-            StatementKind::Frontier,
-            "SELECT data FROM durable_conflict_page WHERE generation=?1 AND page_no=?2",
-            &[&self.observed.generation, &number],
-            CONFLICT_PAGE_BYTES as u64 + 16,
-            |r| r.get(0),
-        )?;
-        let [data] = rows.as_slice() else {
-            return Err(OverlayError::Invalid("settled conflict page"));
-        };
-        if size == 0 || u64::try_from(data.len()).ok() != Some(size) {
-            return Err(OverlayError::Invalid("settled conflict page"));
-        }
-        Ok(data.clone())
+        conflict_page(&self.db, &self.observed, number)
     }
 
     fn verify(&self, expected: &SettledConflict, old_namespace: i64) -> OverlayResult<()> {
-        if &self.observed != expected
-            || observe(&self.db)? != *expected
-            || old_namespace != expected.previous_namespace
-        {
-            return Err(OverlayError::Invalid("settled conflict predecessor"));
-        }
-        let mut digest = [0; 32];
-        let mut bytes = 0_u64;
-        for page in 0..expected.page_count {
-            let data = self.page(page)?;
-            digest = conflict_page_digest(digest, page, &data)?;
-            bytes = bytes
-                .checked_add(data.len() as u64)
-                .ok_or(OverlayError::Invalid("settled conflict size"))?;
-        }
-        let pages = i64::try_from(expected.page_count)
-            .map_err(|_| OverlayError::Invalid("settled conflict pages"))?;
-        let extra:Vec<bool>=self.db.query(StatementKind::Frontier,
-            "SELECT EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation<?1) OR EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation>?1) OR EXISTS(SELECT 1 FROM durable_conflict_page WHERE generation=?1 AND page_no>=?2) OR EXISTS(SELECT 1 FROM durable_conflict_plan WHERE state<>1) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind=13) OR EXISTS(SELECT 1 FROM durable_checkpoint_attempt)",
-            &[&expected.generation,&pages],16,|r|r.get(0))?;
-        if digest != expected.final_digest
-            || bytes != expected.byte_count
-            || extra.as_slice() != [false]
-        {
-            return Err(OverlayError::Invalid("settled conflict contents"));
-        }
-        Ok(())
+        verify_conflict(&self.db, &self.observed, expected, old_namespace)
     }
 
     /// Completes local structural checks only, retaining the same lease and

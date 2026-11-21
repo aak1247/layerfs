@@ -100,9 +100,10 @@ event. Its Workspace, namespace, generation, original root and layer frontier
 are immutable while the item remains queued. An absent namespace remains an
 unqualified local fact. This record does not by itself authorize recovery.
 After the caller fences the original writer, mount, consumers and handles,
-catalog recovery can settle schema-45 orphan custody alone or with one
-authenticated recorded checkpoint, without a local conflict or unknown work.
-Under the original lease it validates owner counts, orphan-domain rows, queued origin identities,
+catalog recovery can settle schema-45 orphan custody alone, with one
+authenticated recorded checkpoint, or with one settled active conflict.
+Unknown work still blocks recovery. Under the original lease it validates
+owner counts, orphan-domain rows, queued origin identities,
 visible tombstones and the actual Store's original binding and content roots
 before bounded cleanup. Old file handles are not recreated; a new namespace is
 selected only after strict recorded readiness. Interrupted ownerless retirement
@@ -111,8 +112,10 @@ the real Workspace unlink and request adapter with a retained file handle,
 including an injected interruption after the owner is removed. A separate
 test combines an already published checkpoint with an open-unlinked file,
 interrupts the original owner release and verifies recovery without resending
-the checkpoint. These tests do not establish actual FUSE mount, process-crash
-or full Store-restart behavior.
+the checkpoint. Another recovers a settled conflict with a separate
+open-unlinked file and retains its marker until explicit resolution. These
+tests do not establish actual FUSE mount, process-crash or full Store-restart
+behavior.
 Ordinary Overlay reopen remains conservative. Schema 44 remains readable with
 its original behavior and is not silently upgraded; its older queue items
 cannot be assigned a new origin after the fact.

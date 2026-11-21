@@ -64,11 +64,12 @@ impl fmt::Debug for CatalogActivationFailure {
     }
 }
 
-enum LocalRecord {
+pub(super) enum LocalRecord {
     Ready(ReadyRecord),
     Conflict(SettledConflict),
     Checkpoint(Box<super::checkpoint_recovery::PreparedCheckpoint>),
     Orphans(OrphanRecoveryRecord, u64),
+    ConflictOrphans(OrphanRecoveryRecord, u64, SettledConflict),
 }
 
 /// Private fields can only be produced from the actual Store and the original
@@ -284,10 +285,7 @@ impl Store {
                     (LocalRecord::Checkpoint(Box::new(plan)), snapshot, None)
                 })
         } else if let OverlayCatalogRecovery::PendingOrphans(value) = &mut pending {
-            self.prepare_orphan_recovery(value, &request)
-                .map(|(record, snapshot, serial)| {
-                    (LocalRecord::Orphans(record, serial), snapshot, None)
-                })
+            self.prepare_orphans(value, &request)
         } else {
             (|| -> Result<(LocalRecord,BranchSnapshot,Option<Arc<super::commit_merge::PendingProjection>>),BindError> {
             let (bytes,root,record)=match &pending {
@@ -508,6 +506,7 @@ impl PreparedCatalogRecovery {
             LocalRecord::Conflict(value) => value.previous_namespace,
             LocalRecord::Checkpoint(value) => value.previous_namespace(),
             LocalRecord::Orphans(value, _) => value.previous_namespace,
+            LocalRecord::ConflictOrphans(value, _, _) => value.previous_namespace,
         };
         let namespace = match previous.checked_add(1) {
             Some(value) if minimum > 0 && value.max(minimum) < i64::MAX => value.max(minimum),
@@ -597,7 +596,8 @@ impl PreparedCatalogRecovery {
             }
             (
                 OverlayCatalogRecovery::PendingOrphans(mut value),
-                LocalRecord::Orphans(expected, root_serial),
+                LocalRecord::Orphans(expected, root_serial)
+                | LocalRecord::ConflictOrphans(expected, root_serial, _),
             ) => {
                 if let Err(cause) = store.settle_orphan_recovery(&mut value, *root_serial) {
                     return Err(Box::new(CatalogActivationFailure {
@@ -652,6 +652,7 @@ impl PreparedCatalogRecovery {
             (LocalRecord::Conflict(record), Some(value)) => Some((record, value)),
             (LocalRecord::Checkpoint(_), None) => None,
             (LocalRecord::Orphans(_, _), None) => None,
+            (LocalRecord::ConflictOrphans(_, _, record), Some(value)) => Some((record, value)),
             _ => unreachable!("prepared recovery projection"),
         };
         let exact_owner = owner.client();

@@ -572,7 +572,6 @@ mod linux {
             && profile.has_serial_retirement_origin()
             && bound
             && !pending_attempt
-            && !pending_conflict
             && state.captured.is_none()
             && state.consolidating.is_none()
         {
