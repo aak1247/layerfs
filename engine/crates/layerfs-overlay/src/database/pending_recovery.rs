@@ -78,8 +78,12 @@ impl OverlayCatalogRecovery {
     pub fn open(path: &Path, config: ProfileConfig, workspace: [u8; 32]) -> OverlayResult<Self> {
         let db = super::durable::recover_for_catalog(path, config, workspace)?;
         if super::durable_attempt::pending(&db)? {
-            return super::checkpoint_recovery::PendingCheckpointRecovery::open(db)
-                .map(Self::PendingCheckpoint);
+            return if super::durable_orphan_recovery::pending(&db)? {
+                super::checkpoint_recovery::PendingCheckpointRecovery::open_mixed(db)
+            } else {
+                super::checkpoint_recovery::PendingCheckpointRecovery::open(db)
+            }
+            .map(Self::PendingCheckpoint);
         }
         if super::durable_orphan_recovery::pending(&db)? {
             return super::durable_orphan_recovery::PendingOrphanRecovery::open(db, workspace)

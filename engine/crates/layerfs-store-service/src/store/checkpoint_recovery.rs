@@ -6,7 +6,8 @@ use layerfs_history::{
     BranchSnapshot, CatalogId, CheckpointAttemptId, CheckpointReceipt, HistoryError,
 };
 use layerfs_overlay::{
-    CheckpointOutcome, CheckpointRecord, MaintenanceCursor, PendingCheckpointRecovery,
+    CheckpointOutcome, CheckpointRecord, MaintenanceCursor, OrphanRecoveryRecord,
+    PendingCheckpointRecovery,
 };
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ pub(super) struct PreparedCheckpoint {
     target: Option<BranchSnapshot>,
     candidate: Option<ObjectId>,
     request: Option<Vec<u8>>,
+    orphan: Option<(OrphanRecoveryRecord, u64)>,
 }
 
 pub(super) struct SettledCheckpoint {
@@ -183,12 +185,39 @@ impl Store {
             }
             _ => return Err(invalid("checkpoint recovery phase")),
         };
+        let orphan = if pending.orphan_record().is_some() {
+            let (orphan, current, root_serial) =
+                self.prepare_mixed_orphan_recovery(pending, binding)?;
+            let expected_snapshot = if record.phase == 4 {
+                record.installed_snapshot.as_deref()
+            } else {
+                Some(record.snapshot.as_slice())
+            };
+            let expected_root = if record.phase == 4 {
+                record.candidate_root
+            } else {
+                Some(record.base_root)
+            };
+            if orphan.workspace != record.workspace
+                || orphan.previous_namespace != record.namespace
+                || Some(orphan.snapshot.as_slice()) != expected_snapshot
+                || Some(orphan.root) != expected_root
+                || current.branch.id != binding.branch
+                || root_serial != original.root().root_inode().serial()
+            {
+                return Err(invalid("mixed checkpoint orphan binding"));
+            }
+            Some((orphan, root_serial))
+        } else {
+            None
+        };
         Ok(PreparedCheckpoint {
             record,
             snapshot,
             target,
             candidate,
             request,
+            orphan,
         })
     }
 
@@ -243,11 +272,31 @@ impl Store {
             snapshot = observed.installed;
             installed = Some((bytes, outcome));
         }
+        let current_orphan = if let Some((original, root_serial)) = &plan.orphan {
+            let bytes = layerfs_bridge::snapshot::encode(&snapshot)
+                .map_err(|error| BindError::Owner(OwnerError::BindingCodec(error)))?;
+            let current = OrphanRecoveryRecord {
+                workspace: original.workspace,
+                previous_namespace: original.previous_namespace,
+                root: snapshot.effective_root.to_bytes(),
+                snapshot: bytes,
+            };
+            pending.verify_mixed_orphans(&current).map_err(local)?;
+            Some((current, *root_serial))
+        } else {
+            None
+        };
         pending.release_original_owners().map_err(local)?;
+        if let Some((current, root_serial)) = &current_orphan {
+            pending
+                .schedule_mixed_orphans(current, *root_serial)
+                .map_err(local)?;
+        }
         let mut cursor = MaintenanceCursor::default();
         while !pending
             .cleanup_ready(plan.request.as_deref())
             .map_err(local)?
+            || (current_orphan.is_some() && !pending.mixed_orphans_drained().map_err(local)?)
         {
             cursor = pending
                 .maintain(cursor)

@@ -603,13 +603,13 @@ fn write(workspace: &BoundWorkspace, name: &str, bytes: &[u8]) {
     });
 }
 
-fn checkpoint_recovery_after_original_commit(published: bool) {
+fn checkpoint_recovery_after_original_commit(published: bool, mixed_orphan: bool) {
     let label = if published {
         "checkpoint-published-cold"
     } else {
         "checkpoint-absent-cold"
     };
-    let fixture = support::Fixture::new_durable(2, label);
+    let fixture = support::Fixture::new_durable(if mixed_orphan { 3 } else { 2 }, label);
     let store = open_store(
         fixture.config.clone(),
         support::BINDING,
@@ -714,6 +714,100 @@ fn checkpoint_recovery_after_original_commit(published: bool) {
             initial
         );
     }
+    let mut orphan_serial = None;
+    if mixed_orphan {
+        let operation = old.operation().unwrap();
+        let root_serial = operation
+            .workspace()
+            .base()
+            .unwrap()
+            .root()
+            .root_inode()
+            .serial();
+        let client = operation.overlay().clone();
+        let route = old.route();
+        let mount = client.kernel_mount(route, root_serial).unwrap();
+        let requests = MountRequests::new(mount);
+        let services = layerfs_daemon::mount_request(&old, &requests.fence()).unwrap();
+        let lookup = wait(KernelRead::prepare(
+            services.clone(),
+            mount,
+            11,
+            root_serial,
+            None,
+            KernelReadOperation::Lookup {
+                parent: root_serial,
+                name: PathName::new("file-000002").unwrap(),
+            },
+        ))
+        .unwrap();
+        let serial = lookup.value().unwrap().stat.serial;
+        wait(lookup.dispose()).unwrap();
+        let opened = wait(KernelRead::prepare(
+            services.clone(),
+            mount,
+            12,
+            serial,
+            None,
+            KernelReadOperation::Open {
+                serial,
+                writable: true,
+            },
+        ))
+        .unwrap();
+        let handle = opened.value().unwrap().file.unwrap().owner_id();
+        wait(opened.dispose()).unwrap();
+        access(&old, |operation, view| {
+            let result = operation
+                .workspace()
+                .mutate(
+                    operation.overlay(),
+                    operation.ports(),
+                    view,
+                    Operation::Unlink {
+                        parent: view.root_serial(),
+                        name: PathName::new("file-000002").unwrap(),
+                    },
+                    Time {
+                        seconds: 1,
+                        nanoseconds: 2,
+                    },
+                )
+                .unwrap();
+            let Outcome::Applied { publication, .. } = result else {
+                panic!("unlink was not applied")
+            };
+            operation.overlay().reply_attempted(publication).unwrap();
+            assert!(matches!(
+                view.lookup(
+                    operation.overlay(),
+                    view.root_serial(),
+                    &PathName::new("file-000002").unwrap()
+                ),
+                Err(WorkspaceError::Content(ContentError::PathNotFound))
+            ));
+        });
+        let bytes = wait(KernelData::read(
+            services.clone(),
+            mount,
+            13,
+            serial,
+            Some(handle),
+            ReadDataInput::File {
+                offset: 0,
+                length: 1024,
+            },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes.bytes(), support::bytes(2));
+        drop(bytes);
+        drop(services);
+        drop(requests);
+        drop(client);
+        drop(operation);
+        orphan_serial = Some(serial);
+    }
     let mut later = support::bytes(1);
     later[0] = b'Y';
     write(&old, "file-000001", &later);
@@ -732,7 +826,30 @@ fn checkpoint_recovery_after_original_commit(published: bool) {
         [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     ).unwrap();
     assert_eq!(before, (2, 2, attempt.to_bytes().to_vec(), 0, 0));
-    sql.execute_batch("CREATE TRIGGER fail_recovery_release BEFORE UPDATE OF reader_released ON durable_checkpoint_attempt WHEN NEW.reader_released=1 BEGIN SELECT RAISE(ABORT,'recovery release fault'); END;").unwrap();
+    let mut corrupted_orphan = None;
+    if let Some(serial) = orphan_serial {
+        let rows: (i64, i64) = sql.query_row(
+            "SELECT (SELECT count(*) FROM durable_orphan_owner WHERE serial=?1), (SELECT count(*) FROM fs_inode WHERE inode=?1 AND generation=-1)",
+            [i64::try_from(serial).unwrap()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(rows, (1, 1));
+        let nlink: i64 = sql
+            .query_row(
+                "SELECT nlink FROM fs_inode WHERE inode=?1 AND generation=-1",
+                [i64::try_from(serial).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nlink, 0);
+        sql.execute(
+            "UPDATE fs_inode SET nlink=1 WHERE inode=?1 AND generation=-1",
+            [i64::try_from(serial).unwrap()],
+        )
+        .unwrap();
+        corrupted_orphan = Some(serial);
+    }
+    if !mixed_orphan {
+        sql.execute_batch("CREATE TRIGGER fail_recovery_release BEFORE UPDATE OF reader_released ON durable_checkpoint_attempt WHEN NEW.reader_released=1 BEGIN SELECT RAISE(ABORT,'recovery release fault'); END;").unwrap();
+    }
     drop(sql);
     if !published {
         let sql = rusqlite::Connection::open(&fixture.config.path).unwrap();
@@ -747,6 +864,48 @@ fn checkpoint_recovery_after_original_commit(published: bool) {
     )
     .unwrap();
     let service = Service::new(store.clone(), &owner);
+    if let Some(serial) = corrupted_orphan {
+        let failure = service
+            .recover_catalog(
+                &mut roster,
+                &owner,
+                &overlays,
+                [8; 32],
+                ProfileConfig::default(),
+                3,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            &failure.cause,
+            CatalogRecoveryCause::Open {
+                cause: OwnerError::Overlay(OverlayError::Invalid("orphan recovery owner")),
+                ..
+            }
+        ));
+        assert_eq!(service.workspaces(), Some(0));
+        assert_eq!(
+            store.history().checkpoint_receipt(attempt).unwrap(),
+            original_receipt
+        );
+        drop(failure);
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        let preserved: (i64, i64, Vec<u8>, i64, i64) = sql.query_row(
+            "SELECT a.phase,r.high_namespace,a.attempt,a.reader_released,a.operation_released FROM durable_checkpoint_attempt a,durable_route r WHERE a.id=1 AND r.id=1",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).unwrap();
+        assert_eq!(preserved, before);
+        let rows: (i64, i64) = sql.query_row(
+            "SELECT (SELECT count(*) FROM durable_orphan_owner WHERE serial=?1), (SELECT count(*) FROM fs_inode WHERE inode=?1 AND generation=-1 AND nlink=1)",
+            [i64::try_from(serial).unwrap()], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert_eq!(rows, (1, 1));
+        sql.execute(
+            "UPDATE fs_inode SET nlink=0 WHERE inode=?1 AND generation=-1",
+            [i64::try_from(serial).unwrap()],
+        )
+        .unwrap();
+        sql.execute_batch("CREATE TRIGGER fail_recovery_release BEFORE UPDATE OF reader_released ON durable_checkpoint_attempt WHEN NEW.reader_released=1 BEGIN SELECT RAISE(ABORT,'recovery release fault'); END;").unwrap();
+    }
     let refused = service
         .recover_catalog(
             &mut roster,
@@ -810,17 +969,33 @@ fn checkpoint_recovery_after_original_commit(published: bool) {
     let token = recovered[0];
     assert_eq!(token.workspace, id);
     assert!(token.namespace > 2);
-    assert!(service
-        .operation(WorkspaceToken {
+    assert!(matches!(
+        service.operation(WorkspaceToken {
             workspace: id,
             namespace: 2
-        })
-        .is_err());
+        }),
+        Err(Failure::Rejected(
+            ControlCode::Invalid,
+            "stale Workspace namespace"
+        ))
+    ));
     assert_eq!(
         store.history().checkpoint_receipt(attempt).unwrap(),
         original_receipt
     );
     let operation = service.operation(token).unwrap();
+    if mixed_orphan {
+        access_operation(&operation, |operation, view| {
+            assert!(matches!(
+                view.lookup(
+                    operation.overlay(),
+                    view.root_serial(),
+                    &PathName::new("file-000002").unwrap()
+                ),
+                Err(WorkspaceError::Content(ContentError::PathNotFound))
+            ));
+        });
+    }
     for (name, expected) in [("file-000000", &captured), ("file-000001", &later)] {
         let readback = access_operation(&operation, |operation, view| {
             let file = view
@@ -902,12 +1077,17 @@ fn checkpoint_recovery_after_original_commit(published: bool) {
 
 #[test]
 fn checkpoint_published_receipt_recovers_without_resending() {
-    checkpoint_recovery_after_original_commit(true);
+    checkpoint_recovery_after_original_commit(true, false);
 }
 
 #[test]
 fn checkpoint_absent_receipt_folds_without_resending() {
-    checkpoint_recovery_after_original_commit(false);
+    checkpoint_recovery_after_original_commit(false, false);
+}
+
+#[test]
+fn checkpoint_and_unlinked_open_file_recover_together_without_resending() {
+    checkpoint_recovery_after_original_commit(true, true);
 }
 
 #[test]

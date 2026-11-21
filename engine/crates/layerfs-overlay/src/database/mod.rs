@@ -15,6 +15,7 @@ pub(crate) mod durable_route;
 pub(crate) mod durable_serial_retirement;
 #[cfg(target_os = "linux")]
 pub(crate) mod legacy_upgrade;
+mod mixed_checkpoint_queue;
 pub(crate) mod profile;
 pub(crate) mod startup;
 pub(crate) mod statements;

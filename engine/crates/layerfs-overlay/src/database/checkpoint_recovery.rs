@@ -47,6 +47,7 @@ pub struct PendingCheckpointRecovery {
     phase: i64,
     installed: Option<(Vec<u8>, CheckpointOutcome)>,
     request_verified: bool,
+    orphans: Option<super::durable_orphan_recovery::MixedOrphans>,
 }
 
 impl fmt::Debug for PendingCheckpointRecovery {
@@ -114,6 +115,14 @@ fn commit_id(value: Vec<u8>) -> OverlayResult<[u8; 33]> {
 
 impl PendingCheckpointRecovery {
     pub(super) fn open(db: Overlay) -> OverlayResult<Self> {
+        Self::open_with_orphans(db, false)
+    }
+
+    pub(super) fn open_mixed(db: Overlay) -> OverlayResult<Self> {
+        Self::open_with_orphans(db, true)
+    }
+
+    fn open_with_orphans(db: Overlay, mixed: bool) -> OverlayResult<Self> {
         let state = db.state()?;
         let rows: Vec<Row> = db.query(
             StatementKind::Frontier,
@@ -279,7 +288,17 @@ impl PendingCheckpointRecovery {
             }
             _ => return Err(OverlayError::Invalid("checkpoint recovery operation")),
         };
-        validate_custody(&db, row, reader_held, operation_held)?;
+        let (orphans, orphan_rows) = if mixed {
+            let (orphans, rows) = super::durable_orphan_recovery::MixedOrphans::inspect(
+                &db,
+                workspace,
+                operation_held,
+            )?;
+            (Some(orphans), rows)
+        } else {
+            (None, Default::default())
+        };
+        validate_custody(&db, row, reader_held, operation_held, mixed)?;
         {
             let mut open = db.open.borrow_mut();
             if reader_held {
@@ -302,7 +321,20 @@ impl PendingCheckpointRecovery {
                     "checkpoint recovery operation",
                 )?;
             }
+            for (serial, orphan) in orphan_rows {
+                open.orphans.put(serial, orphan);
+            }
+            db.orphan_seen.set(!open.orphans.rows.is_empty());
             open.commit();
+        }
+        if let Some(orphans) = &orphans {
+            super::mixed_checkpoint_queue::check_mixed_queue(
+                &db,
+                orphans,
+                recorded,
+                row.phase,
+                row.operation,
+            )?;
         }
         let installed = installed_snapshot.clone().zip(outcome);
         Ok(Self {
@@ -335,11 +367,84 @@ impl PendingCheckpointRecovery {
             phase: row.phase,
             installed,
             request_verified: false,
+            orphans,
         })
     }
 
     pub fn observed(&self) -> &CheckpointRecord {
         &self.observed
+    }
+
+    /// The original orphan facts, when this same leased capture has them.
+    pub fn orphan_record(&self) -> Option<&crate::OrphanRecoveryRecord> {
+        self.orphans.as_ref().map(|value| &value.observed)
+    }
+
+    pub fn orphan_owner_roots(&self, after: i64) -> OverlayResult<Vec<(i64, [u8; 32])>> {
+        self.orphans
+            .as_ref()
+            .ok_or(OverlayError::Invalid("mixed orphan recovery absent"))?
+            .owner_roots(&self.db, after)
+    }
+
+    pub fn orphan_retirement_roots(
+        &self,
+        after: (i64, i64),
+    ) -> OverlayResult<Vec<(i64, i64, [u8; 32])>> {
+        self.orphans
+            .as_ref()
+            .ok_or(OverlayError::Invalid("mixed orphan recovery absent"))?
+            .retirement_roots(&self.db, after)
+    }
+
+    fn operation_id(&self) -> OverlayResult<Option<i64>> {
+        self.operation
+            .map(|owner| {
+                i64::try_from(owner.owner)
+                    .map_err(|_| OverlayError::Invalid("checkpoint recovery operation"))
+            })
+            .transpose()
+    }
+
+    /// Recheck both local domains against the current binding. The caller
+    /// authenticates that binding and the original roots against the Store.
+    pub fn verify_mixed_orphans(&self, current: &crate::OrphanRecoveryRecord) -> OverlayResult<()> {
+        let orphans = self
+            .orphans
+            .as_ref()
+            .ok_or(OverlayError::Invalid("mixed orphan recovery absent"))?;
+        orphans.verify_current(&self.db, current, self.operation_held)?;
+        super::mixed_checkpoint_queue::check_mixed_queue(
+            &self.db,
+            orphans,
+            self.recorded,
+            self.phase,
+            self.operation_id()?,
+        )
+    }
+
+    /// Schedule only the previously authenticated orphan records, after the
+    /// original checkpoint owners have been released.
+    pub fn schedule_mixed_orphans(
+        &mut self,
+        current: &crate::OrphanRecoveryRecord,
+        root_serial: u64,
+    ) -> OverlayResult<()> {
+        if self.reader_held || self.operation_held || !matches!(self.phase, 3 | 4 | 6) {
+            return Err(OverlayError::Invalid("mixed recovery owners held"));
+        }
+        self.verify_mixed_orphans(current)?;
+        self.orphans
+            .as_mut()
+            .ok_or(OverlayError::Invalid("mixed orphan recovery absent"))?
+            .schedule(&self.db, current, root_serial)
+    }
+
+    pub fn mixed_orphans_drained(&self) -> OverlayResult<bool> {
+        self.orphans
+            .as_ref()
+            .ok_or(OverlayError::Invalid("mixed orphan recovery absent"))?
+            .drained(&self.db)
     }
 
     /// Reads one bounded segment of the frozen request under the same lease.
@@ -573,7 +678,27 @@ impl PendingCheckpointRecovery {
                 "checkpoint recovery maintenance phase",
             ));
         }
-        self.db.maintain(cursor)
+        if let Some(orphans) = &self.orphans {
+            if !orphans.scheduled {
+                return Err(OverlayError::Invalid(
+                    "mixed orphan recovery is not scheduled",
+                ));
+            }
+            let operation = self.operation_id()?;
+            self.db.maintain_checked(cursor, |db, item| {
+                super::mixed_checkpoint_queue::check_mixed_item(
+                    db,
+                    orphans,
+                    self.recorded,
+                    self.phase,
+                    operation,
+                    item,
+                    true,
+                )
+            })
+        } else {
+            self.db.maintain(cursor)
+        }
     }
 
     /// Completes local settlement without advancing the namespace. The caller
@@ -587,6 +712,20 @@ impl PendingCheckpointRecovery {
         let result = (|| {
             if self.reader_held || self.operation_held {
                 return Err(OverlayError::Invalid("checkpoint recovery owners held"));
+            }
+            if self
+                .orphans
+                .as_ref()
+                .is_some_and(|orphans| !orphans.scheduled)
+            {
+                return Err(OverlayError::Invalid(
+                    "mixed orphan recovery is not scheduled",
+                ));
+            }
+            if let Some(orphans) = &self.orphans {
+                if !orphans.drained(&self.db)? {
+                    return Err(OverlayError::Invalid("mixed orphan recovery pending"));
+                }
             }
             let completion = match self.phase {
                 3 if request.is_none() && installed.is_none() => None,
@@ -639,11 +778,22 @@ fn validate_custody(
     row: &Row,
     reader_held: bool,
     operation_held: bool,
+    mixed: bool,
 ) -> OverlayResult<()> {
     let count:Vec<(i64,i64,bool,bool)> = db.query(StatementKind::Frontier,
         "SELECT c.operation_count,c.orphan_count,d.operation_owners,d.orphan_owners FROM durable_owner_counts c,durable_custody d WHERE c.id=1 AND d.id=1",
         &[], 32, |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    if count.as_slice() != [(i64::from(operation_held), 0, operation_held, false)] {
+    let counts_valid = match count.as_slice() {
+        [(operation, orphan, operation_bit, orphan_bit)] => {
+            *operation == i64::from(operation_held)
+                && *operation_bit == operation_held
+                && *orphan >= 0
+                && *orphan_bit == (*orphan > 0)
+                && (mixed || *orphan == 0)
+        }
+        _ => false,
+    };
+    if !counts_valid {
         return Err(OverlayError::Invalid("checkpoint recovery custody count"));
     }
     let owner = row.operation.unwrap_or(0);
@@ -678,11 +828,9 @@ fn validate_custody(
     else {
         return Err(OverlayError::Invalid("checkpoint recovery custody"));
     };
-    if *orphan
-        || *orphan_rows
+    if (!mixed && (*orphan || *orphan_rows || *other_cleanup))
         || *other_owner
         || *other_records
-        || *other_cleanup
         || *exact_owner != operation_held
     {
         return Err(OverlayError::Invalid("checkpoint recovery custody"));

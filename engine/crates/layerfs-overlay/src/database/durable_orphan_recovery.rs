@@ -61,7 +61,199 @@ fn root(bytes: Vec<u8>) -> OverlayResult<[u8; 32]> {
 type OwnerRow = (i64, Vec<u8>, i64, i64, bool);
 type QueueRow = (i64, i64, i64, i64, i64, i64, Vec<u8>, bool);
 
-fn owners(db: &Overlay) -> OverlayResult<BTreeMap<i64, Orphan>> {
+/// The orphan side of a mixed recovery. The Overlay and lease remain owned
+/// by the checkpoint side; no file handles or routes are reconstructed.
+pub(super) struct MixedOrphans {
+    pub(super) observed: OrphanRecoveryRecord,
+    pub(super) scheduled: bool,
+}
+
+impl MixedOrphans {
+    pub(super) fn inspect(
+        db: &Overlay,
+        workspace: [u8; 32],
+        operation_held: bool,
+    ) -> OverlayResult<(Self, BTreeMap<i64, Orphan>)> {
+        let state = db.state()?;
+        if !db.profile().has_serial_retirement_origin() || state.closed {
+            return Err(OverlayError::Invalid("orphan recovery predecessor"));
+        }
+        let observed = OrphanRecoveryRecord {
+            workspace,
+            previous_namespace: db
+                .durable_namespace()?
+                .filter(|namespace| *namespace > 0)
+                .ok_or(OverlayError::Invalid("orphan recovery namespace"))?,
+            root: state.base_root,
+            snapshot: db
+                .durable_binding()?
+                .ok_or(OverlayError::Invalid("orphan recovery binding"))?,
+        };
+        let rows = owners(db, Some(operation_held))?;
+        Ok((
+            Self {
+                observed,
+                scheduled: false,
+            },
+            rows,
+        ))
+    }
+
+    pub(super) fn owner_roots(
+        &self,
+        db: &Overlay,
+        after: i64,
+    ) -> OverlayResult<Vec<(i64, [u8; 32])>> {
+        if after < 0 {
+            return Err(OverlayError::Invalid("orphan recovery cursor"));
+        }
+        Ok(db
+            .open
+            .borrow()
+            .orphans
+            .rows
+            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+            .take(PAGE)
+            .map(|(serial, orphan)| (*serial, orphan.root))
+            .collect())
+    }
+
+    pub(super) fn verify_current(
+        &self,
+        db: &Overlay,
+        current: &OrphanRecoveryRecord,
+        operation_held: bool,
+    ) -> OverlayResult<()> {
+        if current.workspace != self.observed.workspace
+            || current.previous_namespace != self.observed.previous_namespace
+            || db.durable_namespace()? != Some(current.previous_namespace)
+            || db.durable_binding()?.as_deref() != Some(current.snapshot.as_slice())
+            || db.state()?.base_root != current.root
+            || owners(db, Some(operation_held))? != db.open.borrow().orphans.rows
+        {
+            return Err(OverlayError::Invalid("orphan recovery predecessor"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn retirement_roots(
+        &self,
+        db: &Overlay,
+        after: (i64, i64),
+    ) -> OverlayResult<Vec<(i64, i64, [u8; 32])>> {
+        if after.0 < 0 || after.1 < 0 {
+            return Err(OverlayError::Invalid("retirement recovery cursor"));
+        }
+        let rows: Vec<(i64, i64, Vec<u8>)> = db.query(StatementKind::Startup,
+            "SELECT resource,target,name FROM cleanup_task WHERE kind=7 AND (resource,target)>(?1,?2) ORDER BY resource,target LIMIT 64",
+            &[&after.0,&after.1], 192 * 64, |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        rows.into_iter()
+            .map(|(serial, generation, bytes)| {
+                Ok((
+                    serial,
+                    generation,
+                    check_retirement(db, &self.observed, serial, generation, &bytes)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub(super) fn schedule(
+        &mut self,
+        db: &Overlay,
+        current: &OrphanRecoveryRecord,
+        root_serial: u64,
+    ) -> OverlayResult<()> {
+        let root_serial = i64::try_from(root_serial)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(OverlayError::Invalid("orphan recovery root inode"))?;
+        self.verify_current(db, current, false)?;
+        let mut owner_cursor = 0;
+        loop {
+            let rows = self.owner_roots(db, owner_cursor)?;
+            if rows.is_empty() {
+                break;
+            }
+            for (serial, _) in rows {
+                if serial == root_serial {
+                    return Err(OverlayError::Invalid("orphan recovery root inode"));
+                }
+                owner_cursor = serial;
+            }
+        }
+        let mut task_cursor = (0, 0);
+        loop {
+            let rows = self.retirement_roots(db, task_cursor)?;
+            if rows.is_empty() {
+                break;
+            }
+            for (serial, generation, _) in rows {
+                if serial == root_serial {
+                    return Err(OverlayError::Invalid("orphan recovery root inode"));
+                }
+                task_cursor = (serial, generation);
+            }
+        }
+        let mut after = 0;
+        loop {
+            let rows = self.owner_roots(db, after)?;
+            if rows.is_empty() {
+                break;
+            }
+            for (serial, _) in rows {
+                db.atomic_cleanup(|| {
+                    if db.orphan(serial)?.is_none() {
+                        return Err(OverlayError::Invalid("orphan recovery owner changed"));
+                    }
+                    db.enqueue(ORPHAN, serial, -1)?;
+                    db.wake_orphan(serial)
+                })?;
+                after = serial;
+            }
+        }
+        let mut cursor = (0, 0);
+        loop {
+            let rows = self.retirement_roots(db, cursor)?;
+            if rows.is_empty() {
+                break;
+            }
+            for (serial, generation, _) in rows {
+                db.atomic_cleanup(|| {
+                    let changed = db.execute(StatementKind::Reclaim,
+                        "UPDATE cleanup_task SET ready=1 WHERE kind=7 AND resource=?1 AND target=?2",
+                        &[&serial,&generation],16)?;
+                    if changed != 1 { return Err(OverlayError::Invalid("serial retirement recovery changed")); }
+                    db.maintenance_ready.set(true);
+                    Ok(())
+                })?;
+                cursor = (serial, generation);
+            }
+        }
+        self.scheduled = true;
+        Ok(())
+    }
+
+    pub(super) fn drained(&self, db: &Overlay) -> OverlayResult<bool> {
+        if !self.scheduled {
+            return Ok(false);
+        }
+        let rows: Vec<bool> = db.query(StatementKind::Frontier,
+            "SELECT EXISTS(SELECT 1 FROM durable_orphan_owner) OR EXISTS(SELECT 1 FROM cleanup_task WHERE kind IN(2,7,8,9))",
+            &[],8,|row| row.get(0))?;
+        match rows.as_slice() {
+            [pending] => Ok(!pending),
+            _ => Err(OverlayError::Invalid("orphan recovery state")),
+        }
+    }
+}
+
+// A mixed checkpoint supplies the independently checked operation count;
+// ordinary orphan recovery still requires that no operation exists.
+fn owners(
+    db: &Overlay,
+    checkpoint_operation: Option<bool>,
+) -> OverlayResult<BTreeMap<i64, Orphan>> {
     let state = db.state()?;
     let counts: Vec<(i64, i64, bool, bool)> = db.query(
         StatementKind::Startup,
@@ -74,7 +266,12 @@ fn owners(db: &Overlay) -> OverlayResult<BTreeMap<i64, Orphan>> {
     let [(expected, operations, orphan_bit, operation_bit)] = counts.as_slice() else {
         return Err(OverlayError::Invalid("orphan recovery custody"));
     };
-    if *expected < 0 || *operations != 0 || *operation_bit || *orphan_bit != (*expected > 0) {
+    let expected_operations = i64::from(checkpoint_operation.unwrap_or(false));
+    if *expected < 0
+        || *operations != expected_operations
+        || *operation_bit != (expected_operations != 0)
+        || *orphan_bit != (*expected > 0)
+    {
         return Err(OverlayError::Invalid("orphan recovery custody"));
     }
     let other: Vec<bool> = db.query(
@@ -84,7 +281,7 @@ fn owners(db: &Overlay) -> OverlayResult<BTreeMap<i64, Orphan>> {
         8,
         |row| row.get(0),
     )?;
-    if other.as_slice() != [false] {
+    if checkpoint_operation.is_none() && other.as_slice() != [false] {
         return Err(OverlayError::Invalid("orphan recovery other custody"));
     }
     let mut after = 0_i64;
@@ -225,7 +422,7 @@ fn empty_orphan_domain(db: &Overlay, serial: i64) -> OverlayResult<bool> {
     }
 }
 
-fn check_item(
+pub(super) fn check_item(
     db: &Overlay,
     expected: &OrphanRecoveryRecord,
     item: &Item,
@@ -359,7 +556,7 @@ impl PendingOrphanRecovery {
                 .durable_binding()?
                 .ok_or(OverlayError::Invalid("orphan recovery binding"))?,
         };
-        let rows = owners(&db)?;
+        let rows = owners(&db, None)?;
         // Restore only the exact persisted orphan holders. This is an
         // in-memory baseline under the same lease, before any SQL write.
         {
@@ -430,7 +627,7 @@ impl PendingOrphanRecovery {
         if self.db.durable_namespace()? != Some(self.observed.previous_namespace)
             || self.db.durable_binding()?.as_deref() != Some(self.observed.snapshot.as_slice())
             || self.db.state()?.base_root != self.observed.root
-            || owners(&self.db)? != self.db.open.borrow().orphans.rows
+            || owners(&self.db, None)? != self.db.open.borrow().orphans.rows
         {
             return Err(OverlayError::Invalid("orphan recovery predecessor"));
         }

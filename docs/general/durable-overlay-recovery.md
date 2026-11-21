@@ -80,6 +80,8 @@ cold conflict; a physical FUSE mount and Sandbox recovery remain unverified.
 The catalog opening path can also reconcile a schema-44 or schema-45 recorded checkpoint
 under its original lease when its capture and classified reader and operation
 ownership match exactly and no conflict or other unknown custody is present.
+Schema 45 can also reconcile this checkpoint together with independently
+authenticated orphan custody under the same original Overlay lease.
 It authenticates the original Store, Workspace, Branch and frozen request; an
 original atomic Store receipt determines the installed result. When the fenced
 original writer cannot publish later and the Store lane confirms no committed
@@ -98,16 +100,19 @@ event. Its Workspace, namespace, generation, original root and layer frontier
 are immutable while the item remains queued. An absent namespace remains an
 unqualified local fact. This record does not by itself authorize recovery.
 After the caller fences the original writer, mount, consumers and handles,
-catalog recovery can settle schema-45 orphan custody with no concurrent
-checkpoint, local conflict, operation owner or unknown work. Under the original
-lease it validates owner counts, orphan-domain rows, queued origin identities,
+catalog recovery can settle schema-45 orphan custody alone or with one
+authenticated recorded checkpoint, without a local conflict or unknown work.
+Under the original lease it validates owner counts, orphan-domain rows, queued origin identities,
 visible tombstones and the actual Store's original binding and content roots
 before bounded cleanup. Old file handles are not recreated; a new namespace is
 selected only after strict recorded readiness. Interrupted ownerless retirement
 and wake work continue from the original queue. Nonprivileged tests exercise
 the real Workspace unlink and request adapter with a retained file handle,
-including an injected interruption after the owner is removed; they do not
-establish actual FUSE mount, process-crash or full Store-restart behavior.
+including an injected interruption after the owner is removed. A separate
+test combines an already published checkpoint with an open-unlinked file,
+interrupts the original owner release and verifies recovery without resending
+the checkpoint. These tests do not establish actual FUSE mount, process-crash
+or full Store-restart behavior.
 Ordinary Overlay reopen remains conservative. Schema 44 remains readable with
 its original behavior and is not silently upgraded; its older queue items
 cannot be assigned a new origin after the fact.

@@ -4,7 +4,8 @@ use crate::OwnerError;
 use layerfs_content::ObjectId;
 use layerfs_history::{BranchSnapshot, HistoryError};
 use layerfs_overlay::{
-    MaintenanceCursor, OrphanRecoveryRecord, OverlayError, PendingOrphanRecovery,
+    MaintenanceCursor, OrphanRecoveryRecord, OverlayError, PendingCheckpointRecovery,
+    PendingOrphanRecovery,
 };
 
 fn invalid(message: &'static str) -> BindError {
@@ -22,7 +23,38 @@ impl Store {
         pending: &PendingOrphanRecovery,
         request: &BindRequest,
     ) -> Result<(OrphanRecoveryRecord, BranchSnapshot, u64), BindError> {
-        let record = pending.observed().clone();
+        self.prepare_orphan_source(
+            pending.observed().clone(),
+            request,
+            |after| pending.owner_roots(after),
+            |after| pending.retirement_roots(after),
+        )
+    }
+
+    pub(super) fn prepare_mixed_orphan_recovery(
+        self: &std::sync::Arc<Self>,
+        pending: &PendingCheckpointRecovery,
+        request: &BindRequest,
+    ) -> Result<(OrphanRecoveryRecord, BranchSnapshot, u64), BindError> {
+        let record = pending
+            .orphan_record()
+            .cloned()
+            .ok_or_else(|| invalid("mixed orphan recovery absent"))?;
+        self.prepare_orphan_source(
+            record,
+            request,
+            |after| pending.orphan_owner_roots(after),
+            |after| pending.orphan_retirement_roots(after),
+        )
+    }
+
+    fn prepare_orphan_source(
+        self: &std::sync::Arc<Self>,
+        record: OrphanRecoveryRecord,
+        request: &BindRequest,
+        owner_roots: impl Fn(i64) -> Result<Vec<(i64, [u8; 32])>, OverlayError>,
+        retirement_roots: impl Fn((i64, i64)) -> Result<Vec<(i64, i64, [u8; 32])>, OverlayError>,
+    ) -> Result<(OrphanRecoveryRecord, BranchSnapshot, u64), BindError> {
         if !self.has_durable_writer() || record.workspace != request.workspace.to_bytes() {
             return Err(invalid("orphan recovery identity"));
         }
@@ -67,7 +99,7 @@ impl Store {
         };
         let mut after = 0;
         loop {
-            let rows = pending.owner_roots(after).map_err(local)?;
+            let rows = owner_roots(after).map_err(local)?;
             if rows.is_empty() {
                 break;
             }
@@ -78,7 +110,7 @@ impl Store {
         }
         let mut cursor = (0, 0);
         loop {
-            let rows = pending.retirement_roots(cursor).map_err(local)?;
+            let rows = retirement_roots(cursor).map_err(local)?;
             if rows.is_empty() {
                 break;
             }
