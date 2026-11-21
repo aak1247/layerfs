@@ -606,6 +606,13 @@ impl PreparedCatalogTransition {
                             ))
                         }
                     },
+                    OverlayCatalogRecovery::SettledConflict(conflict)
+                        if matches!(purpose, PreparationPurpose::Maintenance)
+                            && matches!(conflict.schema_version(), 44 | 45) =>
+                    {
+                        legacy = true;
+                        recorded = true;
+                    }
                     _ => {
                         ordinary = true;
                         recorded = true;
@@ -632,15 +639,30 @@ impl PreparedCatalogTransition {
                         workspace: record.workspace,
                         branch: record.branch,
                     };
-                    let prepared = store
-                        .prepare_opened_catalog_recovery(pending, request)
-                        .map_err(|failure| CatalogTransitionCause::Preparation {
-                            record,
-                            failure,
-                        })?;
-                    let plan = prepared
-                        .into_legacy(source, view.original.as_ref().unwrap())
-                        .map_err(|failure| CatalogTransitionCause::Migration { record, failure })?;
+                    let plan = match purpose {
+                        PreparationPurpose::Maintenance => store
+                            .prepare_catalog_for_maintenance(
+                                pending,
+                                request,
+                                source,
+                                view.original.as_ref().unwrap(),
+                            )
+                            .map_err(|failure| CatalogTransitionCause::Migration {
+                                record,
+                                failure,
+                            })?,
+                        PreparationPurpose::Recovery => store
+                            .prepare_opened_catalog_recovery(pending, request)
+                            .map_err(|failure| CatalogTransitionCause::Preparation {
+                                record,
+                                failure,
+                            })?
+                            .into_legacy(source, view.original.as_ref().unwrap())
+                            .map_err(|failure| CatalogTransitionCause::Migration {
+                                record,
+                                failure,
+                            })?,
+                    };
                     state.legacy_entries.push_back((record, plan));
                 }
                 state.check_legacy_namespaces(floor)?;

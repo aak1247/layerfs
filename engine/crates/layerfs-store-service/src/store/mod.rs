@@ -35,7 +35,8 @@ pub use catalog_recovery::{
 };
 #[cfg(target_os = "linux")]
 pub use catalog_recovery::{
-    CatalogMigrationFailure, MaintainedCatalogRecovery, PreparedLegacyRecovery,
+    CatalogMigrationFailure, MaintainedCatalogRecovery, MaintainedDisposition,
+    PreparedLegacyRecovery,
 };
 pub use checkpoint_receipt::{check_checkpoint_outcome, CheckpointObservation, OriginalCheckpoint};
 pub use commit_types::{

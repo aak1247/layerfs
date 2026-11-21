@@ -7,12 +7,12 @@ use super::{
 use crate::{Owner, OwnerClient, OwnerError, ServiceClass};
 use layerfs_content::ObjectId;
 use layerfs_history::{BranchSnapshot, HistoryError};
-#[cfg(target_os = "linux")]
-use layerfs_overlay::ReadyRecovery;
 use layerfs_overlay::{
     OrphanRecoveryRecord, Overlay, OverlayCatalogRecovery, ProfileConfig, ReadyRecord,
     SettledConflict,
 };
+#[cfg(target_os = "linux")]
+use layerfs_overlay::{ReadyRecovery, SettledConflictRecovery};
 use layerfs_workspace::Workspace;
 use std::{
     fmt,
@@ -87,8 +87,7 @@ pub struct PreparedCatalogRecovery {
 #[cfg(target_os = "linux")]
 pub struct PreparedLegacyRecovery {
     request: BindRequest,
-    ready: ReadyRecovery,
-    observed: ReadyRecord,
+    local: PreparedLegacyLocal,
     snapshot: BranchSnapshot,
     catalog: [u8; 32],
     incarnation: u64,
@@ -96,13 +95,32 @@ pub struct PreparedLegacyRecovery {
     physical: layerfs_persistence::StorePhysicalIdentity,
 }
 
+#[cfg(target_os = "linux")]
+enum PreparedLegacyLocal {
+    Ready(ReadyRecovery, ReadyRecord),
+    Conflict(
+        SettledConflictRecovery,
+        SettledConflict,
+        Arc<super::commit_merge::PendingProjection>,
+    ),
+}
+
+/// The original locally settled binding retained by maintenance.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintainedDisposition {
+    Ready,
+    SettledConflict,
+}
+
 /// A migrated, locally ready Workspace with its original lease but no open
 /// SQLite connection or Store handle. It cannot create a route or namespace.
 #[cfg(target_os = "linux")]
 pub struct MaintainedCatalogRecovery {
     request: BindRequest,
-    observed: ReadyRecord,
+    previous_namespace: i64,
     source_version: i64,
+    disposition: MaintainedDisposition,
     _closed: layerfs_overlay::ClosedFile,
 }
 
@@ -112,12 +130,16 @@ impl MaintainedCatalogRecovery {
         &self.request
     }
 
-    pub fn observed(&self) -> &ReadyRecord {
-        &self.observed
+    pub fn previous_namespace(&self) -> i64 {
+        self.previous_namespace
     }
 
     pub fn source_version(&self) -> i64 {
         self.source_version
+    }
+
+    pub fn disposition(&self) -> MaintainedDisposition {
+        self.disposition
     }
 
     pub fn verify_original(&self) -> layerfs_overlay::OverlayResult<()> {
@@ -128,11 +150,17 @@ impl MaintainedCatalogRecovery {
 impl PreparedLegacyRecovery {
     /// The original namespace while its local lease remains held.
     pub fn previous_namespace(&self) -> i64 {
-        self.observed.previous_namespace
+        match &self.local {
+            PreparedLegacyLocal::Ready(_, observed) => observed.previous_namespace,
+            PreparedLegacyLocal::Conflict(_, observed, _) => observed.previous_namespace,
+        }
     }
 
     pub fn verify_original(&self) -> layerfs_overlay::OverlayResult<()> {
-        self.ready.verify_original()
+        match &self.local {
+            PreparedLegacyLocal::Ready(ready, _) => ready.verify_original(),
+            PreparedLegacyLocal::Conflict(conflict, _, _) => conflict.verify_original(),
+        }
     }
 }
 
@@ -188,6 +216,22 @@ fn identity_error() -> BindError {
     BindError::History(HistoryError::Integrity("catalog recovery identity"))
 }
 
+#[derive(Clone, Copy)]
+enum CatalogPreparationPurpose {
+    Recovery,
+    #[cfg(target_os = "linux")]
+    Maintenance,
+}
+impl CatalogPreparationPurpose {
+    fn permits_readonly_conflict(self) -> bool {
+        match self {
+            Self::Recovery => false,
+            #[cfg(target_os = "linux")]
+            Self::Maintenance => true,
+        }
+    }
+}
+
 impl Store {
     /// Prepare one recorded catalog entry on the control reader while retaining
     /// the original Overlay lease. The trusted caller fences old consumers.
@@ -208,9 +252,31 @@ impl Store {
     /// Store. The trusted caller retains its original roster and fence.
     pub fn prepare_opened_catalog_recovery(
         self: &Arc<Self>,
-        mut pending: OverlayCatalogRecovery,
+        pending: OverlayCatalogRecovery,
         request: BindRequest,
     ) -> Result<PreparedCatalogRecovery, Box<CatalogPreparationFailure>> {
+        self.prepare_opened_for(pending, request, CatalogPreparationPurpose::Recovery)
+    }
+
+    fn prepare_opened_for(
+        self: &Arc<Self>,
+        mut pending: OverlayCatalogRecovery,
+        request: BindRequest,
+        purpose: CatalogPreparationPurpose,
+    ) -> Result<PreparedCatalogRecovery, Box<CatalogPreparationFailure>> {
+        if purpose.permits_readonly_conflict()
+            && !matches!(
+                &pending,
+                OverlayCatalogRecovery::Ready(_) | OverlayCatalogRecovery::SettledConflict(_)
+            )
+        {
+            return Err(Box::new(CatalogPreparationFailure::Retained {
+                cause: identity_error(),
+                custody: RetainedCatalogRecovery {
+                    _pending: Box::new(pending),
+                },
+            }));
+        }
         let prepared = if let OverlayCatalogRecovery::PendingCheckpoint(value) = &mut pending {
             self.prepare_checkpoint_recovery(value, &request)
                 .map(|plan| {
@@ -232,11 +298,15 @@ impl Store {
                 }
                 OverlayCatalogRecovery::SettledConflict(value)=>{
                     let observed=value.observed().clone();
-                    if !self.has_durable_writer() || observed.catalog!=self.history().catalog_id().to_bytes()
+                    if (!purpose.permits_readonly_conflict() && !self.has_durable_writer()) || observed.catalog!=self.history().catalog_id().to_bytes()
                         || observed.incarnation!=self.history().incarnation() {
                         return Err(identity_error());
                     }
-                    self.history().require_checkpoint_receipts().map_err(BindError::History)?;
+                    if purpose.permits_readonly_conflict() {
+                        self.history().checkpoint_receipt(layerfs_history::CheckpointAttemptId::from_bytes([0; 32])).map_err(BindError::History)?;
+                    } else {
+                        self.history().require_checkpoint_receipts().map_err(BindError::History)?;
+                    }
                     (observed.target_snapshot.clone(),observed.marker_root,LocalRecord::Conflict(observed))
                 }
                 OverlayCatalogRecovery::PendingCheckpoint(_) => unreachable!("checkpoint prepared separately"),
@@ -292,10 +362,25 @@ impl Store {
             })),
         }
     }
+
+    /// Prepare an opaque maintenance-only local binding against the original
+    /// read-only Store. The caller retains the Store-wide external fence.
+    #[cfg(target_os = "linux")]
+    pub fn prepare_catalog_for_maintenance(
+        self: &Arc<Self>,
+        pending: OverlayCatalogRecovery,
+        request: BindRequest,
+        source: &Arc<layerfs_persistence::StorageProvider>,
+        original: &std::fs::File,
+    ) -> Result<PreparedLegacyRecovery, Box<CatalogMigrationFailure>> {
+        self.prepare_opened_for(pending, request, CatalogPreparationPurpose::Maintenance)
+            .map_err(|failure| Box::new(CatalogMigrationFailure::Preparation(failure)))?
+            .into_legacy(source, original)
+    }
 }
 
 impl PreparedCatalogRecovery {
-    /// Retain an authenticated ready predecessor without retaining the old
+    /// Retain an authenticated settled predecessor without retaining the old
     /// Store. The caller must still hold the original roster and full fence.
     #[cfg(target_os = "linux")]
     pub fn into_legacy(
@@ -319,16 +404,24 @@ impl PreparedCatalogRecovery {
                 }))
             }
         };
-        let local = match (&self.pending, &self.record) {
-            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed)) => ready
+        let local = match (&self.pending, &self.record, &self.conflict) {
+            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed), None) => ready
                 .preflight_upgrade(observed)
-                .map(|version| (observed.clone(), version))
+                .map(|version| (version, false))
+                .map_err(|error| BindError::Owner(OwnerError::Overlay(error))),
+            (
+                OverlayCatalogRecovery::SettledConflict(conflict),
+                LocalRecord::Conflict(observed),
+                Some(_),
+            ) => conflict
+                .preflight_upgrade(observed)
+                .map(|version| (version, true))
                 .map_err(|error| BindError::Owner(OwnerError::Overlay(error))),
             _ => Err(BindError::History(HistoryError::Integrity(
-                "legacy migration requires a ready Workspace",
+                "legacy migration requires a settled Workspace",
             ))),
         };
-        let (observed, version) = match local {
+        let (version, has_conflict) = match local {
             Ok(value) => value,
             Err(cause) => {
                 return Err(Box::new(CatalogMigrationFailure::Refused {
@@ -337,7 +430,7 @@ impl PreparedCatalogRecovery {
                 }))
             }
         };
-        if version == 45 {
+        if version == 45 || has_conflict {
             // Both exact old and receipt-capable Store formats can contain a
             // locally ready Workspace. An unsupported receipt operation proves
             // the former only when it is the provider's explicit capability
@@ -347,7 +440,8 @@ impl PreparedCatalogRecovery {
                 .history()
                 .checkpoint_receipt(layerfs_history::CheckpointAttemptId::from_bytes([0; 32]))
             {
-                Ok(_) | Err(HistoryError::Unsupported("checkpoint receipt")) => {}
+                Ok(_) => {}
+                Err(HistoryError::Unsupported("checkpoint receipt")) if !has_conflict => {}
                 Err(error) => {
                     return Err(Box::new(CatalogMigrationFailure::Refused {
                         cause: BindError::History(error),
@@ -361,16 +455,25 @@ impl PreparedCatalogRecovery {
         let Self {
             request,
             pending,
+            record,
             snapshot,
+            conflict,
             ..
         } = self;
-        let OverlayCatalogRecovery::Ready(ready) = pending else {
-            unreachable!("legacy readiness checked")
+        let local = match (pending, record, conflict) {
+            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed), None) => {
+                PreparedLegacyLocal::Ready(ready, observed)
+            }
+            (
+                OverlayCatalogRecovery::SettledConflict(value),
+                LocalRecord::Conflict(observed),
+                Some(projection),
+            ) => PreparedLegacyLocal::Conflict(value, observed, projection),
+            _ => unreachable!("legacy settled state checked"),
         };
         Ok(PreparedLegacyRecovery {
             request,
-            ready,
-            observed,
+            local,
             snapshot,
             catalog,
             incarnation,
@@ -576,20 +679,31 @@ impl Store {
     ) -> Result<PreparedCatalogRecovery, Box<CatalogMigrationFailure>> {
         let PreparedLegacyRecovery {
             request,
-            ready,
-            observed,
+            local,
             snapshot,
             catalog,
             incarnation,
             version,
             physical,
         } = original;
+        let (pending, expected, expected_conflict) = match local {
+            PreparedLegacyLocal::Ready(ready, observed) => (
+                OverlayCatalogRecovery::Ready(ready),
+                LocalRecord::Ready(observed),
+                None,
+            ),
+            PreparedLegacyLocal::Conflict(value, observed, projection) => (
+                OverlayCatalogRecovery::SettledConflict(value),
+                LocalRecord::Conflict(observed),
+                Some(projection),
+            ),
+        };
         if let Some(writer) = &self.durable_writer {
             if let Err(cause) = writer.verify_observed_store(&physical) {
                 return Err(Box::new(CatalogMigrationFailure::Physical {
                     cause,
                     custody: RetainedCatalogRecovery {
-                        _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
+                        _pending: Box::new(pending),
                     },
                 }));
             }
@@ -606,15 +720,28 @@ impl Store {
                     identity_error()
                 },
                 custody: RetainedCatalogRecovery {
-                    _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
+                    _pending: Box::new(pending),
                 },
             }));
         }
         let prepared = self
-            .prepare_opened_catalog_recovery(OverlayCatalogRecovery::Ready(ready), request)
+            .prepare_opened_catalog_recovery(pending, request)
             .map_err(|failure| Box::new(CatalogMigrationFailure::Preparation(failure)))?;
-        let matches = matches!(&prepared.record, LocalRecord::Ready(value) if value == &observed)
-            && prepared.snapshot == snapshot;
+        let records_match = match (&prepared.record, &expected) {
+            (LocalRecord::Ready(actual), LocalRecord::Ready(original)) => actual == original,
+            (LocalRecord::Conflict(actual), LocalRecord::Conflict(original)) => actual == original,
+            _ => false,
+        };
+        let conflicts_match = match (&prepared.conflict, &expected_conflict) {
+            (None, None) => true,
+            (Some(actual), Some(original)) => {
+                actual.descriptor == original.descriptor
+                    && actual.merge.local_root == original.merge.local_root
+                    && actual.merge.conflicted == original.merge.conflicted
+            }
+            _ => false,
+        };
+        let matches = records_match && conflicts_match && prepared.snapshot == snapshot;
         if !matches {
             return Err(Box::new(CatalogMigrationFailure::Refused {
                 cause: identity_error(),
@@ -632,25 +759,41 @@ impl Store {
             snapshot,
             conflict,
         } = prepared;
-        let OverlayCatalogRecovery::Ready(ready) = pending else {
-            unreachable!("legacy readiness checked")
+        let pending = match (pending, &record) {
+            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed)) => ready
+                .upgrade_legacy(observed)
+                .map(OverlayCatalogRecovery::Ready)
+                .map_err(|(error, ready)| {
+                    Box::new(CatalogMigrationFailure::Upgrade {
+                        cause: BindError::Owner(OwnerError::Overlay(error)),
+                        custody: RetainedCatalogRecovery {
+                            _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
+                        },
+                    })
+                })?,
+            (OverlayCatalogRecovery::SettledConflict(value), LocalRecord::Conflict(observed)) => {
+                value
+                    .upgrade_legacy(observed)
+                    .map(OverlayCatalogRecovery::SettledConflict)
+                    .map_err(|(error, value)| {
+                        Box::new(CatalogMigrationFailure::Upgrade {
+                            cause: BindError::Owner(OwnerError::Overlay(error)),
+                            custody: RetainedCatalogRecovery {
+                                _pending: Box::new(OverlayCatalogRecovery::SettledConflict(value)),
+                            },
+                        })
+                    })?
+            }
+            _ => unreachable!("legacy settled state checked"),
         };
-        match ready.upgrade_legacy(&observed) {
-            Ok(ready) => Ok(PreparedCatalogRecovery {
-                store,
-                request,
-                pending: OverlayCatalogRecovery::Ready(ready),
-                record,
-                snapshot,
-                conflict,
-            }),
-            Err((error, ready)) => Err(Box::new(CatalogMigrationFailure::Upgrade {
-                cause: BindError::Owner(OwnerError::Overlay(error)),
-                custody: RetainedCatalogRecovery {
-                    _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
-                },
-            })),
-        }
+        Ok(PreparedCatalogRecovery {
+            store,
+            request,
+            pending,
+            record,
+            snapshot,
+            conflict,
+        })
     }
 
     /// Migrate and checked-close one already authenticated Workspace for a
@@ -670,44 +813,73 @@ impl Store {
             request,
             ..
         } = prepared;
-        let (ready, observed) = match (pending, record) {
-            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed)) => {
-                (ready, observed)
-            }
-            _ => unreachable!("legacy migration prepared a ready Workspace"),
-        };
-        let checked = ready.preflight_upgrade(&observed).and_then(|version| {
-            if version == 45 {
-                Ok(())
-            } else {
-                Err(layerfs_overlay::OverlayError::Invalid(
-                    "maintenance migration schema",
-                ))
-            }
-        });
-        if let Err(cause) = checked {
-            return Err(Box::new(CatalogMigrationFailure::Upgrade {
-                cause: BindError::Owner(OwnerError::Overlay(cause)),
-                custody: RetainedCatalogRecovery {
-                    _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
-                },
-            }));
-        }
-        let db = ready.complete(&observed).map_err(|(cause, ready)| {
-            Box::new(CatalogMigrationFailure::Upgrade {
-                cause: BindError::Owner(OwnerError::Overlay(cause)),
-                custody: RetainedCatalogRecovery {
-                    _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
-                },
+        let verify_version = |result: layerfs_overlay::OverlayResult<i64>| {
+            result.and_then(|version| {
+                if version == 45 {
+                    Ok(())
+                } else {
+                    Err(layerfs_overlay::OverlayError::Invalid(
+                        "maintenance migration schema",
+                    ))
+                }
             })
-        })?;
+        };
+        let (db, previous_namespace, disposition) = match (pending, record) {
+            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed)) => {
+                if let Err(cause) = verify_version(ready.preflight_upgrade(&observed)) {
+                    return Err(Box::new(CatalogMigrationFailure::Upgrade {
+                        cause: BindError::Owner(OwnerError::Overlay(cause)),
+                        custody: RetainedCatalogRecovery {
+                            _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
+                        },
+                    }));
+                }
+                let db = ready.complete(&observed).map_err(|(cause, ready)| {
+                    Box::new(CatalogMigrationFailure::Upgrade {
+                        cause: BindError::Owner(OwnerError::Overlay(cause)),
+                        custody: RetainedCatalogRecovery {
+                            _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
+                        },
+                    })
+                })?;
+                (
+                    db,
+                    observed.previous_namespace,
+                    MaintainedDisposition::Ready,
+                )
+            }
+            (OverlayCatalogRecovery::SettledConflict(value), LocalRecord::Conflict(observed)) => {
+                if let Err(cause) = verify_version(value.preflight_upgrade(&observed)) {
+                    return Err(Box::new(CatalogMigrationFailure::Upgrade {
+                        cause: BindError::Owner(OwnerError::Overlay(cause)),
+                        custody: RetainedCatalogRecovery {
+                            _pending: Box::new(OverlayCatalogRecovery::SettledConflict(value)),
+                        },
+                    }));
+                }
+                let namespace = observed.previous_namespace;
+                let db = value
+                    .complete_settled_active(&observed, namespace)
+                    .map_err(|(cause, value)| {
+                        Box::new(CatalogMigrationFailure::Upgrade {
+                            cause: BindError::Owner(OwnerError::Overlay(cause)),
+                            custody: RetainedCatalogRecovery {
+                                _pending: Box::new(OverlayCatalogRecovery::SettledConflict(value)),
+                            },
+                        })
+                    })?;
+                (db, namespace, MaintainedDisposition::SettledConflict)
+            }
+            _ => unreachable!("legacy migration prepared a settled Workspace"),
+        };
         let closed = db
             .close_database_file()
             .map_err(|cause| Box::new(CatalogMigrationFailure::Close { cause }))?;
         Ok(MaintainedCatalogRecovery {
             request,
-            observed,
+            previous_namespace,
             source_version,
+            disposition,
             _closed: closed,
         })
     }

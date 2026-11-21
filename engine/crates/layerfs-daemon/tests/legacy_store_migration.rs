@@ -805,7 +805,7 @@ mod interrupted_catalog {
     use layerfs_daemon::control::{
         CatalogCohortCause, PreparedCatalogCohort, RecoverControlConfig,
     };
-    use layerfs_history::{BranchId, WorkspaceId};
+    use layerfs_history::{BranchId, HistoryCatalog, WorkspaceId};
     use layerfs_overlay::{OverlayCatalogRecovery, OverlayError};
     use rusqlite::{auto_extension, ffi};
     use std::{
@@ -1767,6 +1767,300 @@ mod interrupted_catalog {
             1
         );
         assert_eq!(cohort_receipts(root), 0);
+    }
+
+    fn conflict_rows(path: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut result = Vec::new();
+        for sql in [
+            "SELECT * FROM durable_binding",
+            "SELECT * FROM durable_conflict_plan ORDER BY generation",
+            "SELECT * FROM durable_conflict_page ORDER BY generation,page_no",
+            "SELECT * FROM durable_state",
+            "SELECT * FROM durable_route",
+            "SELECT * FROM cleanup_task ORDER BY kind,resource,target",
+        ] {
+            let mut statement = db.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            result.extend(rows.map(Result::unwrap));
+        }
+        result
+    }
+
+    fn receipt_rows(root: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+        let db = Connection::open_with_flags(
+            root.join("store-private/store.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = db
+            .prepare("SELECT * FROM checkpoint_receipt ORDER BY attempt_id")
+            .unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn cohort_migrates_original_schema44_active_conflict_and_resolves_once() {
+        use layerfs_daemon::store::MaintainedDisposition;
+
+        let fixture = Fixture::named("legacy_44_active_conflict");
+        let root = &fixture.0;
+        let store_path = root.join("store-private/store.sqlite");
+        let path = root.join("overlays").join(record(43).overlay_name());
+        let marker = fs::read(root.join("expected-marker.bin")).unwrap();
+        let store_before = fs::metadata(&store_path).unwrap();
+        let overlay_before = fs::metadata(&path).unwrap();
+        let before = conflict_rows(&path);
+        let original_receipts = receipt_rows(root);
+        assert_eq!(original_receipts.len(), 1);
+        let original_head = {
+            let handles = Handles::open_read_only(fixture.config(), BINDING, CURSOR).unwrap();
+            handles
+                .history
+                .branch_snapshot(record(43).branch)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(cohort_receipts(root), 1);
+        let owner = cohort_owner(root, "conflict-maintenance.sqlite");
+        let result = PreparedCatalogCohort::prepare(
+            vec![transition_config(&fixture)],
+            fs::File::open(&store_path).unwrap(),
+            &owner,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert!(!result.store_upgraded());
+        assert_eq!(result.completed().len(), 1);
+        assert_eq!(result.completed()[0].record, record(43));
+        assert_eq!(result.completed()[0].previous_namespace(), 2);
+        assert_eq!(result.completed()[0].source_version(), 44);
+        assert_eq!(
+            result.completed()[0].disposition(),
+            MaintainedDisposition::SettledConflict
+        );
+        assert!(
+            matches!(OverlayCatalogRecovery::open(&path, ProfileConfig::default(), [43; 32]),
+            Err(OverlayError::Io(error)) if error.kind() == ErrorKind::WouldBlock)
+        );
+        assert_eq!(receipt_rows(root), original_receipts);
+        drop(result);
+        owner.stop().unwrap();
+        assert_eq!(fs::metadata(&store_path).unwrap().ino(), store_before.ino());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), overlay_before.ino());
+        assert_eq!(conflict_rows(&path), before);
+        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            45
+        );
+        drop(db);
+
+        let store = open_current(fixture.config());
+        assert_eq!(
+            store
+                .history()
+                .branch_snapshot(record(43).branch)
+                .unwrap()
+                .unwrap(),
+            original_head
+        );
+        let owner = cohort_owner(root, "conflict-recovery.sqlite");
+        let mut service = Service::new(store.clone(), &owner);
+        let tokens = service
+            .recover_durable_control(
+                &owner,
+                RecoverControlConfig {
+                    catalog_directory: root.join("catalog"),
+                    overlay_directory: root.join("overlays"),
+                    sandbox: [8; 32],
+                    profile: ProfileConfig::default(),
+                    minimum_namespace: 1,
+                    store_device: store_before.dev(),
+                },
+            )
+            .unwrap();
+        assert_eq!(tokens.len(), 1);
+        let token = tokens[0];
+        assert_eq!(token.workspace, record(43).workspace);
+        assert_eq!(token.namespace, 3);
+        let operation = service.operation(token).unwrap();
+        assert_eq!(read_operation(&operation, "file-000000"), marker);
+        drop(operation);
+        let refused = service
+            .execute_control(&Request::Commit(CommitControl {
+                token,
+                force: false,
+                message: None,
+            }))
+            .unwrap()
+            .reply;
+        assert!(
+            matches!(refused, Reply::Conflict(report) if report.markers && report.conflicts.iter().any(|item| item.path == "/file-000000"))
+        );
+        assert_eq!(
+            store
+                .history()
+                .branch_snapshot(record(43).branch)
+                .unwrap()
+                .unwrap(),
+            original_head
+        );
+        let operation = service.operation(token).unwrap();
+        let resolution = vec![b'R'; marker.len()];
+        write_operation(&operation, "file-000000", &resolution);
+        drop(operation);
+        let resolved = service
+            .execute_control(&Request::Commit(CommitControl {
+                token,
+                force: false,
+                message: None,
+            }))
+            .unwrap()
+            .reply;
+        assert!(matches!(
+            resolved,
+            Reply::Committed(_) | Reply::MergeCommitted(_)
+        ));
+        assert_ne!(
+            store
+                .history()
+                .branch_snapshot(record(43).branch)
+                .unwrap()
+                .unwrap(),
+            original_head
+        );
+        drop(service);
+        store.close_reader(token.workspace).unwrap();
+        owner.stop().unwrap();
+        drop(store);
+        let final_receipts = receipt_rows(root);
+        assert_eq!(final_receipts.len(), 2);
+        assert!(final_receipts.contains(&original_receipts[0]));
+    }
+
+    #[test]
+    fn cohort_rejects_extra_conflict_page_before_any_migration() {
+        let fixture = Fixture::named("legacy_44_active_conflict");
+        let root = &fixture.0;
+        let path = root.join("overlays").join(record(43).overlay_name());
+        let db = Connection::open(&path).unwrap();
+        let trigger: String = db.query_row("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='durable_conflict_page_insert'", [], |row| row.get(0)).unwrap();
+        let (generation, page_count): (i64, i64) = db
+            .query_row(
+                "SELECT generation,page_count FROM durable_conflict_plan WHERE state=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        db.execute_batch("DROP TRIGGER durable_conflict_page_insert")
+            .unwrap();
+        db.execute(
+            "INSERT INTO durable_conflict_page(generation,page_no,data) VALUES(?1,?2,X'00')",
+            (generation, page_count),
+        )
+        .unwrap();
+        db.execute_batch(&trigger).unwrap();
+        drop(db);
+        let before = conflict_rows(&path);
+        let owner = cohort_owner(root, "extra-page-maintenance.sqlite");
+        let failure = PreparedCatalogCohort::prepare(
+            vec![transition_config(&fixture)],
+            fs::File::open(root.join("store-private/store.sqlite")).unwrap(),
+            &owner,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(failure.cause(), CatalogCohortCause::Group { index: 0, failure }
+            if matches!(failure.cause(), layerfs_daemon::control::CatalogTransitionCause::Migration { record: failed, failure }
+                if *failed == record(43) && matches!(failure.as_ref(),
+                    layerfs_daemon::store::CatalogMigrationFailure::Refused {
+                        cause: layerfs_daemon::store::BindError::Owner(layerfs_daemon::OwnerError::Overlay(OverlayError::Invalid("settled conflict contents"))), ..
+                    })))
+        );
+        assert_eq!(failure.progress().store_upgraded, None);
+        drop(failure);
+        owner.stop().unwrap();
+        assert_eq!(conflict_rows(&path), before);
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            44
+        );
+        assert_eq!(
+            db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(cohort_receipts(root), 1);
+    }
+
+    #[test]
+    fn ordinary_conflict_preparation_still_requires_the_durable_writer() {
+        let fixture = Fixture::named("legacy_44_active_conflict");
+        let root = &fixture.0;
+        let path = root.join("overlays").join(record(43).overlay_name());
+        let original = fs::File::open(root.join("store-private/store.sqlite")).unwrap();
+        let (readonly, source) = readonly_store(fixture.config(), &original);
+        let pending =
+            OverlayCatalogRecovery::open(&path, ProfileConfig::default(), [43; 32]).unwrap();
+        let failure = readonly
+            .prepare_opened_catalog_recovery(
+                pending,
+                BindRequest {
+                    workspace: record(43).workspace,
+                    branch: record(43).branch,
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(
+            failure.as_ref(),
+            layerfs_daemon::store::CatalogPreparationFailure::Retained {
+                cause: layerfs_daemon::store::BindError::History(
+                    layerfs_history::HistoryError::Integrity("catalog recovery identity")
+                ),
+                ..
+            }
+        ));
+        drop(failure);
+        drop(readonly);
+        drop(source);
+        drop(original);
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            44
+        );
+        assert_eq!(
+            db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 }
 

@@ -1,5 +1,8 @@
 //! Locally verified, same-lease transition of ready durable predecessors.
-use crate::{Overlay, OverlayError, OverlayResult, ReadyRecord, StatementKind};
+use crate::{
+    ConflictSyncIdentity, Overlay, OverlayError, OverlayResult, ReadyRecord, SettledConflict,
+    StatementKind,
+};
 use rusqlite::Connection;
 
 const SCHEMA_41: &str = include_str!("../../sql/legacy_schema_41.sql");
@@ -207,6 +210,79 @@ pub(super) fn upgrade(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<(
         db.execute(StatementKind::Startup, "PRAGMA user_version=45", &[], 0)?;
         let actual: Vec<i64> = db.query(StatementKind::Startup, "PRAGMA user_version", &[], 0, |row|row.get(0))?;
         if actual.as_slice() != [45] { return Err(OverlayError::Invalid("legacy migration version")); }
+        Ok(())
+    })?;
+    db.profile.schema_version = 45;
+    Ok(())
+}
+
+fn conflict_identity(record: &SettledConflict) -> ConflictSyncIdentity<'_> {
+    ConflictSyncIdentity {
+        workspace: record.workspace,
+        catalog: record.catalog,
+        incarnation: record.incarnation,
+        namespace: record.previous_namespace,
+        marker_root: record.marker_root,
+        target_snapshot: &record.target_snapshot,
+        descriptor: record.descriptor,
+    }
+}
+
+/// Authenticate the local schema and exact settled disposition; the Store
+/// and the old consumers remain the caller's separate responsibility.
+pub(super) fn preflight_conflict(db: &Overlay, record: &SettledConflict) -> OverlayResult<i64> {
+    let version = db.profile.schema_version;
+    if !matches!(version, 44 | 45)
+        || super::pending_recovery::observe(db)? != *record
+        || stored_state(db)?.len() != 1
+    {
+        return Err(OverlayError::Invalid("legacy conflict predecessor"));
+    }
+    db.require_conflict_synchronize_ready(&conflict_identity(record))?;
+    if version == 44 {
+        verify_predecessor(db, version)?;
+    } else {
+        verify_current(db)?;
+    }
+    Ok(version)
+}
+
+pub(super) fn upgrade_conflict(db: &mut Overlay, record: &SettledConflict) -> OverlayResult<()> {
+    if preflight_conflict(db, record)? != 44 {
+        return Err(OverlayError::Invalid("unsupported legacy conflict schema"));
+    }
+    let original = db.state()?;
+    let stored = stored_state(db)?;
+    db.atomic_cleanup(|| {
+        db.begin()?;
+        db.require_conflict_ready_in_cleanup(&conflict_identity(record))?;
+        if db.state()? != original
+            || stored_state(db)? != stored
+            || super::pending_recovery::observe(db)? != *record
+        {
+            return Err(OverlayError::Invalid("legacy conflict predecessor"));
+        }
+        verify_predecessor(db, 44)?;
+        super::durable_serial_retirement::initialize(db)?;
+        super::durable_serial_retirement::verify_schema(db)?;
+        verify_current(db)?;
+        if db.state()? != original
+            || stored_state(db)? != stored
+            || super::pending_recovery::observe(db)? != *record
+        {
+            return Err(OverlayError::Invalid("legacy conflict result changed"));
+        }
+        db.execute(StatementKind::Startup, "PRAGMA user_version=45", &[], 0)?;
+        let actual: Vec<i64> = db.query(
+            StatementKind::Startup,
+            "PRAGMA user_version",
+            &[],
+            0,
+            |row| row.get(0),
+        )?;
+        if actual.as_slice() != [45] {
+            return Err(OverlayError::Invalid("legacy conflict migration version"));
+        }
         Ok(())
     })?;
     db.profile.schema_version = 45;

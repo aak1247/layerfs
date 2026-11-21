@@ -187,8 +187,14 @@ leases and a caller-provided roster list do not prove that all users of the
 physical Store have stopped; that proof and durable operation accounting remain
 the responsibility of the application owner. Schema 43 and 44 predecessors
 must match the complete definitions from their explicitly supported original
-SDKs; an unproven legacy serial-retirement item remains unresolved. Pending
-operations and active conflicts are not migrated by this batch.
+SDKs; an unproven legacy serial-retirement item remains unresolved. A settled
+schema-44 conflict may be migrated after authenticating its original Store,
+historical snapshot, marker root and complete path pages under the same lease.
+The transition preserves the pending conflict and namespace; ordinary recovery
+can then reopen it for an explicit resolution. Tests use a conflict produced by
+the original schema-44 SDK and check its original receipt, marker and paths.
+Pending checkpoints, orphan custody and unclassified work are not migrated by
+this batch.
 
 The separate [durable discovery catalog](durable-roster.md) can retain the
 identities and original Branches of multiple Workspaces. The daemon uses it

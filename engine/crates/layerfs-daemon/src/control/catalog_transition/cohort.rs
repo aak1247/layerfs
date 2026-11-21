@@ -4,7 +4,10 @@ use super::{
     CheckpointUpgradeFailure, File, OpenedStore, Owner, PreparationPurpose,
     PreparedCatalogTransition, PreparedCheckpointUpgrade, TransitionState, WorkspaceRecord,
 };
-use crate::{bootstrap::open_existing_store_observed, store::MaintainedCatalogRecovery};
+use crate::{
+    bootstrap::open_existing_store_observed,
+    store::{MaintainedCatalogRecovery, MaintainedDisposition},
+};
 use layerfs_storage::{port::PersistenceError, StorageError};
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -69,6 +72,7 @@ impl CatalogCohortFailure {
                 record: entry.record,
                 previous_namespace: entry.previous_namespace(),
                 source_version: entry.source_version(),
+                disposition: entry.disposition(),
             })
             .collect::<Vec<_>>();
         let pending = state
@@ -112,6 +116,7 @@ pub struct CatalogCohortProgressEntry {
     pub record: WorkspaceRecord,
     pub previous_namespace: i64,
     pub source_version: i64,
+    pub disposition: MaintainedDisposition,
 }
 
 /// Facts available while the failure still owns its original custody.
@@ -308,10 +313,13 @@ pub struct CatalogCohortEntry {
 }
 impl CatalogCohortEntry {
     pub fn previous_namespace(&self) -> i64 {
-        self.maintained.observed().previous_namespace
+        self.maintained.previous_namespace()
     }
     pub fn source_version(&self) -> i64 {
         self.maintained.source_version()
+    }
+    pub fn disposition(&self) -> MaintainedDisposition {
+        self.maintained.disposition()
     }
 }
 

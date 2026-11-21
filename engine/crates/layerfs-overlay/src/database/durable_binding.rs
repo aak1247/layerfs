@@ -121,6 +121,27 @@ impl Overlay {
         expected: &ConflictSyncIdentity<'_>,
     ) -> OverlayResult<()> {
         self.require_bound_ready()?;
+        self.require_conflict_ready_details(expected)
+    }
+
+    pub(super) fn require_conflict_ready_in_cleanup(
+        &self,
+        expected: &ConflictSyncIdentity<'_>,
+    ) -> OverlayResult<()> {
+        self.available()?;
+        if self.transaction.get() != super::connection::Transaction::Begun {
+            return Err(OverlayError::Invalid(
+                "conflict migration transaction absent",
+            ));
+        }
+        self.require_bound_state_ready()?;
+        self.require_conflict_ready_details(expected)
+    }
+
+    fn require_conflict_ready_details(
+        &self,
+        expected: &ConflictSyncIdentity<'_>,
+    ) -> OverlayResult<()> {
         if !self.profile.has_durable_conflict() {
             return Err(OverlayError::Invalid(
                 "durable conflict synchronization identity",

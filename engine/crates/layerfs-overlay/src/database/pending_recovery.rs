@@ -201,7 +201,7 @@ fn fixed(bytes: Vec<u8>) -> OverlayResult<[u8; 32]> {
         .try_into()
         .map_err(|_| OverlayError::Invalid("settled conflict identity"))
 }
-fn observe(db: &Overlay) -> OverlayResult<SettledConflict> {
+pub(super) fn observe(db: &Overlay) -> OverlayResult<SettledConflict> {
     let active = super::durable_conflict_stage::active_conflict(db)?
         .ok_or(OverlayError::Invalid("settled conflict binding is absent"))?;
     Ok(SettledConflict {
@@ -242,6 +242,60 @@ impl Overlay {
 impl SettledConflictRecovery {
     pub fn observed(&self) -> &SettledConflict {
         &self.observed
+    }
+
+    pub fn schema_version(&self) -> i64 {
+        self.db.profile().schema_version
+    }
+
+    /// Check the original file and owner lease without opening another SQLite
+    /// connection. A changed identity quarantines the retained lease.
+    pub fn verify_original(&self) -> OverlayResult<()> {
+        let lease = self
+            .db
+            .durable
+            .as_ref()
+            .ok_or(OverlayError::Invalid("durable lease is absent"))?;
+        let result = lease
+            .verify()
+            .and_then(|()| self.db.allocation.state().map(|_| ()))
+            .and_then(|()| lease.verify());
+        if result.is_err() {
+            lease.quarantine();
+        }
+        result
+    }
+
+    /// Check the original settled conflict and complete page chain without
+    /// acquiring a route or claiming external Store authority.
+    #[cfg(target_os = "linux")]
+    pub fn preflight_upgrade(&self, expected: &SettledConflict) -> OverlayResult<i64> {
+        self.verify_original()?;
+        self.verify(expected, expected.previous_namespace)?;
+        super::legacy_upgrade::preflight_conflict(&self.db, expected)
+    }
+
+    /// Change only the supported settled schema-44 format under this lease.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::result_large_err)]
+    pub fn upgrade_legacy(
+        mut self,
+        expected: &SettledConflict,
+    ) -> Result<Self, (OverlayError, Self)> {
+        if let Err(error) = self.preflight_upgrade(expected) {
+            return Err((error, self));
+        }
+        if let Err(error) = super::legacy_upgrade::upgrade_conflict(&mut self.db, expected) {
+            return Err((error, self));
+        }
+        match self.preflight_upgrade(expected) {
+            Ok(45) => Ok(self),
+            Ok(_) => Err((
+                OverlayError::Invalid("legacy conflict migration schema"),
+                self,
+            )),
+            Err(error) => Err((error, self)),
+        }
     }
 
     /// Reads exactly one original bounded page; no row is modified.
