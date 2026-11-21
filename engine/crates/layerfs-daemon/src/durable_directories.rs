@@ -1,6 +1,6 @@
 //! One-shot creation of private durable directories on an authenticated volume.
 use nix::{
-    fcntl::{openat, OFlag},
+    fcntl::{openat, Flock, FlockArg, OFlag},
     sys::{
         stat::{mkdirat, Mode},
         statfs,
@@ -90,6 +90,98 @@ pub struct FreshDirectories {
     overlays: File,
     name: String,
     device: u64,
+}
+
+/// Shared use of one original volume directory while a Store reader or
+/// writer is alive. This cooperative lock does not establish that old
+/// consumers exited or authorize any maintenance operation.
+#[derive(Debug)]
+pub struct SharedStoreUse {
+    path: PathBuf,
+    root: Flock<File>,
+    device: u64,
+}
+
+impl SharedStoreUse {
+    /// Pins and locks the actual named volume directory. A maintenance owner
+    /// holding its exclusive lock causes this attempt to fail without waiting
+    /// or opening the Store.
+    pub fn acquire(volume: &Path) -> io::Result<Self> {
+        let root = Self::open(volume)?;
+        Self::lock(volume, root)
+    }
+
+    /// Preserve ordinary access when existing permissions do not permit a
+    /// readable directory descriptor or the old placement is a symbolic
+    /// link. `None` is not a maintenance fence: callers must separately rule
+    /// out every such potential Store user.
+    pub fn acquire_if_accessible(volume: &Path) -> io::Result<Option<Self>> {
+        match Self::open(volume) {
+            Ok(root) => Self::lock(volume, root).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(None),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(nix::libc::ENOTDIR) | Some(nix::libc::ELOOP)
+                ) && fs::symlink_metadata(volume)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open(volume: &Path) -> io::Result<File> {
+        if !volume.is_absolute() {
+            return Err(invalid(
+                "durable volume requires its original absolute path",
+            ));
+        }
+        OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(volume)
+    }
+
+    fn lock(volume: &Path, root: File) -> io::Result<Self> {
+        let opened = root.metadata()?;
+        let named = fs::symlink_metadata(volume)?;
+        if !opened.is_dir()
+            || !named.is_dir()
+            || named.file_type().is_symlink()
+            || opened.dev() != named.dev()
+            || opened.ino() != named.ino()
+        {
+            return Err(invalid("shared Store volume identity changed"));
+        }
+        let device = opened.dev();
+        let root =
+            Flock::lock(root, FlockArg::LockSharedNonblock).map_err(|(_, error)| errno(error))?;
+        let guard = Self {
+            path: volume.to_owned(),
+            root,
+            device,
+        };
+        guard.verify()?;
+        Ok(guard)
+    }
+
+    /// Confirms the held directory still has its original named identity.
+    pub fn verify(&self) -> io::Result<()> {
+        let opened = self.root.metadata()?;
+        let named = fs::symlink_metadata(&self.path)?;
+        if !opened.is_dir()
+            || !named.is_dir()
+            || named.file_type().is_symlink()
+            || opened.dev() != self.device
+            || named.dev() != self.device
+            || opened.ino() != named.ino()
+        {
+            return Err(invalid("shared Store volume identity changed"));
+        }
+        Ok(())
+    }
 }
 impl FreshDirectories {
     pub fn catalog_path(&self) -> PathBuf {

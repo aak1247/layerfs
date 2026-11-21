@@ -37,6 +37,16 @@ fn run() -> Result<(), ApplicationError> {
         )));
     }
     let setup = config::read(Path::new(&path)).map_err(ApplicationError::Io)?;
+    #[cfg(target_os = "linux")]
+    let mut setup = setup;
+    #[cfg(target_os = "linux")]
+    if let Some(guard) = setup.store_use.take() {
+        guard.verify().map_err(ApplicationError::Io)?;
+        // The application may return before detached connection or idle
+        // threads finish. Keep this single CLI guard until the OS closes the
+        // descriptor at actual process exit, including startup error paths.
+        std::mem::forget(guard);
+    }
     let listener = TcpListener::bind(&setup.daemon.listen).map_err(ApplicationError::Io)?;
     let application = Application::start(setup.daemon, setup.recovery, setup.recovery_anchor)?;
     println!(

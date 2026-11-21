@@ -15,6 +15,8 @@ pub(super) struct StartupConfig {
     pub daemon: DaemonSetup,
     pub recovery: Option<RecoveryWorkspaceSetup>,
     pub recovery_anchor: Option<File>,
+    #[cfg(target_os = "linux")]
+    pub store_use: Option<crate::durable_directories::SharedStoreUse>,
 }
 
 pub(super) fn read(path: &Path) -> io::Result<StartupConfig> {
@@ -66,6 +68,14 @@ pub(super) fn read(path: &Path) -> io::Result<StartupConfig> {
     {
         return Err(invalid("separate protected backing and mount paths"));
     }
+    #[cfg(target_os = "linux")]
+    let store_use = if store == Path::new("/layerfs-store/global/store.sqlite") {
+        crate::durable_directories::SharedStoreUse::acquire_if_accessible(Path::new(
+            "/layerfs-store",
+        ))?
+    } else {
+        None
+    };
     private_directory(
         overlay.parent().ok_or_else(|| invalid("Overlay parent"))?,
         true,
@@ -121,6 +131,8 @@ pub(super) fn read(path: &Path) -> io::Result<StartupConfig> {
         daemon: config,
         recovery,
         recovery_anchor,
+        #[cfg(target_os = "linux")]
+        store_use,
     })
 }
 
