@@ -1,6 +1,9 @@
 //! New durable retirement provenance records facts without admitting recovery.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 mod payload_support;
 
 use layerfs_overlay::{
@@ -37,7 +40,7 @@ impl Fixture {
     fn create(&self) -> Overlay {
         let db =
             Overlay::create_durable(&self.path(), ProfileConfig::default(), WORKSPACE).unwrap();
-        assert_eq!(db.profile().schema_version, 45);
+        assert_eq!(db.profile().schema_version, 46);
         db.open_workspace(ROOT).unwrap();
         db.initialize_durable_binding(ROOT, SNAPSHOT).unwrap();
         db.initialize_durable_namespace(7).unwrap();
@@ -270,6 +273,7 @@ fn origin_without_namespace_is_not_promoted_to_a_recovery_identity() {
 fn failed_origin_insert_rolls_back_the_unlink() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER fail_retirement BEFORE INSERT ON cleanup_task WHEN NEW.kind=7 BEGIN SELECT RAISE(ABORT,'injected origin failure'); END;").unwrap();
     drop(sql);
@@ -313,6 +317,7 @@ fn failed_origin_insert_rolls_back_the_unlink() {
 fn different_origin_for_the_same_serial_layer_rolls_back_the_unlink() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch(
         "CREATE TRIGGER conflicting_retirement BEFORE INSERT ON cleanup_task \
@@ -487,6 +492,7 @@ fn inconsistent_orphan_domain_or_floor_is_refused_before_any_write() {
 fn reconstructed_schema44_keeps_legacy_behavior_without_silent_upgrade() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("DROP TRIGGER durable_serial_retirement_insert; DROP TRIGGER durable_serial_retirement_identity; PRAGMA user_version=44;").unwrap();
     drop(sql);

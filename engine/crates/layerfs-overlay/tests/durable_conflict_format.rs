@@ -1,6 +1,9 @@
 //! New durable conflict backing preserves old schema and does not grant recovery.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 #[path = "support/durable_schema43.rs"]
 mod durable_schema43;
 
@@ -69,7 +72,7 @@ fn drain(db: &Overlay) {
 fn current_schema_records_clean_checkpoint_and_reopens_without_conflict() {
     let fixture = Fixture::new();
     let db = fixture.create();
-    assert_eq!(db.profile().schema_version, 45);
+    assert_eq!(db.profile().schema_version, 46);
     let capture = db
         .capture_recorded(WORKSPACE, [0; 32], 1, SNAPSHOT)
         .unwrap();
@@ -80,7 +83,7 @@ fn current_schema_records_clean_checkpoint_and_reopens_without_conflict() {
     db.close_database().unwrap();
     let db =
         Overlay::recover_durable(&fixture.path(), ProfileConfig::default(), WORKSPACE).unwrap();
-    assert_eq!(db.profile().schema_version, 45);
+    assert_eq!(db.profile().schema_version, 46);
     assert_eq!(db.durable_binding().unwrap().as_deref(), Some(SNAPSHOT));
     db.close_database().unwrap();
 }
@@ -159,6 +162,7 @@ fn altered_required_trigger_blocks_open_without_changing_original_database() {
 fn schema44_reader_floor_cannot_change_after_acquisition() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch(
         "CREATE TRIGGER alter_floor AFTER UPDATE OF phase ON durable_checkpoint_attempt \

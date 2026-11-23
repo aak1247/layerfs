@@ -357,7 +357,8 @@ mod linux {
             crate::database::durable_attempt::initialize(&db)?;
             crate::database::durable_conflict::initialize(&db)?;
             crate::database::durable_serial_retirement::initialize(&db)?;
-            db.execute(StatementKind::Startup, "PRAGMA user_version=45", &[], 0)?;
+            crate::database::durable_capture::initialize(&db)?;
+            db.execute(StatementKind::Startup, "PRAGMA user_version=46", &[], 0)?;
             db.execute(
                 StatementKind::Startup,
                 "PRAGMA application_id=1279676211",
@@ -372,7 +373,7 @@ mod linux {
             )?;
             Ok(())
         })?;
-        db.profile.schema_version = 45;
+        db.profile.schema_version = 46;
         let sync = db.allocation.sync_durable_file().and_then(|_| {
             File::open(
                 path.parent()
@@ -460,7 +461,7 @@ mod linux {
             super::super::profile::readback(&connection, &work, "PRAGMA user_version", |r| {
                 r.get(0)
             })?;
-        if ![39, 40, 41, 42, 43, 44, 45].contains(&profile.schema_version) {
+        if ![39, 40, 41, 42, 43, 44, 45, 46].contains(&profile.schema_version) {
             return Err(OverlayError::Invalid("durable overlay schema version"));
         }
         let integrity: String =
@@ -637,6 +638,9 @@ mod linux {
         };
         if db.profile.has_durable_conflict() {
             super::super::durable_conflict::verify_schema(&db)?;
+        }
+        if db.profile.has_external_captures() {
+            super::super::legacy_upgrade::verify_capture_schema(&db)?;
         }
         if db.profile.has_classified_custody() {
             super::super::durable_kept::restore(&db, state.active.0, bound, kept_count)?;

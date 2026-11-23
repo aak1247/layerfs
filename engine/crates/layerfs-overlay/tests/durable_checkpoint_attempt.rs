@@ -1,6 +1,9 @@
 //! The original capture and its prepublication identity share one transaction.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 #[path = "support/durable_schema43.rs"]
 mod durable_schema43;
 
@@ -156,6 +159,7 @@ fn bad_identity_or_failed_attempt_insert_rolls_back_the_capture() {
     assert_eq!(db.state().unwrap(), before);
     db.close_database().unwrap();
 
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_attempt BEFORE INSERT ON durable_checkpoint_attempt BEGIN SELECT RAISE(ABORT, 'injected attempt failure'); END;").unwrap();
     drop(connection);
@@ -281,6 +285,7 @@ fn publication_intent_is_frozen_once_for_the_original_capture() {
 fn failed_publication_intent_write_keeps_original_capture_and_phase() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER fail_publication_intent BEFORE UPDATE ON durable_checkpoint_attempt BEGIN SELECT RAISE(ABORT, 'intent failure'); END;").unwrap();
     drop(sql);
@@ -317,6 +322,7 @@ fn failed_publication_intent_write_keeps_original_capture_and_phase() {
 fn changed_original_attempt_context_cannot_be_frozen_for_publication() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER alter_capture_context AFTER INSERT ON durable_checkpoint_attempt BEGIN UPDATE durable_checkpoint_attempt SET catalog=zeroblob(32) WHERE id=1; END;").unwrap();
     drop(sql);
@@ -439,6 +445,7 @@ fn failed_recorded_acquisitions_roll_back_original_owner_maps() {
     for operation_failure in [false, true] {
         let fixture = Fixture::new();
         fixture.create().close_database().unwrap();
+        durable_schema45::convert(&fixture.path());
         let sql = rusqlite::Connection::open(fixture.path()).unwrap();
         let guard = if operation_failure {
             "NEW.operation_owner IS NOT NULL AND OLD.operation_owner IS NULL"
@@ -515,6 +522,7 @@ fn an_older_generic_reader_can_release_during_a_new_recorded_capture() {
 fn changed_operation_link_cannot_replace_the_original_owner() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER alter_operation_link AFTER UPDATE ON durable_checkpoint_attempt WHEN NEW.operation_owner IS NOT NULL AND OLD.operation_owner IS NULL BEGIN UPDATE durable_checkpoint_attempt SET operation_owner=NEW.operation_owner+100 WHERE id=1; END;").unwrap();
     drop(sql);
@@ -627,6 +635,7 @@ fn prepublication_fold_retains_later_writes_and_original_custody() {
 fn failed_fold_schedule_rolls_back_phase_and_original_capture() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER fail_checkpoint_fold BEFORE INSERT ON cleanup_task WHEN NEW.kind=1 BEGIN SELECT RAISE(ABORT, 'fold failure'); END;").unwrap();
     drop(sql);
@@ -808,6 +817,7 @@ fn known_checkpoint_install_retains_original_outcome_and_later_writes() {
 fn failed_checkpoint_install_retains_original_pending_attempt_and_binding() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER fail_checkpoint_retire BEFORE INSERT ON cleanup_task WHEN NEW.kind=3 BEGIN SELECT RAISE(ABORT, 'retire failure'); END;").unwrap();
     drop(sql);
@@ -880,6 +890,7 @@ fn maintenance_completion_failure_retains_the_exact_original_item() {
     for kind in ["fold", "retire", "operation"] {
         let fixture = Fixture::new();
         fixture.create().close_database().unwrap();
+        durable_schema45::convert(&fixture.path());
         let sql = rusqlite::Connection::open(fixture.path()).unwrap();
         let column = match kind {
             "fold" => "fold_completed",
@@ -958,6 +969,7 @@ fn maintenance_completion_failure_retains_the_exact_original_item() {
 fn operation_cleanup_cannot_complete_before_owner_release() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER forge_early_cleanup AFTER UPDATE OF operation_owner ON durable_checkpoint_attempt WHEN NEW.operation_owner IS NOT NULL BEGIN UPDATE durable_checkpoint_attempt SET operation_cleanup_completed=1 WHERE id=1; END;").unwrap();
     drop(sql);

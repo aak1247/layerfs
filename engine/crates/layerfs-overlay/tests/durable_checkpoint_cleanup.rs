@@ -1,6 +1,9 @@
 //! Exact local cleanup after a definitely unpublished durable checkpoint.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 #[path = "support/durable_schema43.rs"]
 mod durable_schema43;
 
@@ -281,6 +284,7 @@ fn operation_cleanup_completed_before_fold_remains_part_of_that_attempt() {
 fn failed_attempt_deletion_retains_all_original_completion_facts() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER fail_checkpoint_finish BEFORE DELETE ON durable_checkpoint_attempt BEGIN SELECT RAISE(ABORT, 'finish failure'); END;").unwrap();
     drop(sql);
@@ -397,6 +401,7 @@ fn missing_operation_link_cannot_hide_the_original_live_owner() {
 fn released_operation_identity_cannot_disappear_during_cleanup() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER erase_released_owner AFTER UPDATE OF operation_cleanup_completed ON durable_checkpoint_attempt WHEN NEW.operation_cleanup_completed=1 BEGIN UPDATE durable_checkpoint_attempt SET operation_owner=NULL,operation_released=NULL,operation_cleanup_completed=NULL WHERE id=1; END;").unwrap();
     drop(sql);

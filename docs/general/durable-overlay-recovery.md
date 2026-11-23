@@ -65,7 +65,20 @@ schema-41-and-newer high-water mark while holding the original file lease. Its c
 supplies a minimum and must serialize it with all other live Workspace routes;
 legacy schemas lack this evidence and are refused by that method.
 
-New durable overlays use schema 45. An explicitly fenced `Service::recover_catalog`
+New durable overlays use schema 46. It retains the complete schema-45 recovery
+contract and records an externally identified capture alongside its original
+checkpoint attempt in the same Overlay transaction. The frozen publication
+request and candidate are retained after local checkpoint cleanup. A local
+unpublished disposition can only follow the original fold transition; observing
+no receipt alone does not establish it. The caller must authenticate the Store,
+scope and old writer fence independently, and the record is not a read grant or
+a Store receipt. Normal opening does not upgrade older overlays. Explicit
+local schema-45 maintenance preserves the original binding and state under the
+same lease; production use still requires the existing whole-Store roster and
+consumer fence. Store capture, authenticated immutable reading and the full
+maintenance coordinator are not provided by this local association alone.
+
+An explicitly fenced `Service::recover_catalog`
 can reopen a settled active local conflict while retaining the original Overlay
 lease and namespace. It checks the original roster record, Store catalog and
 incarnation, historical Branch snapshot, marker root and complete ordered path

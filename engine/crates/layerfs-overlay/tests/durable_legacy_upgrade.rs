@@ -253,7 +253,10 @@ fn genuine_277_ready_workspace_upgrades_without_losing_dirty_bytes_or_queue() {
     fs::set_permissions(&newdir, fs::Permissions::from_mode(0o700)).unwrap();
     let fresh = newdir.join("fresh.sqlite");
     drop(Overlay::create_durable(&fresh, ProfileConfig::default(), [43; 32]).unwrap());
-    let canonical = schema(&fresh);
+    let canonical: Vec<_> = schema(&fresh)
+        .into_iter()
+        .filter(|(_, _, table, _)| table != "durable_external_capture")
+        .collect();
     println!(
         "FRESH_SCHEMA45_COUNT={} BLAKE3={}",
         canonical.len(),

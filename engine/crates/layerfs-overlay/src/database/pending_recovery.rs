@@ -173,6 +173,23 @@ impl ReadyRecovery {
             Err(error) => Err((error, self)),
         }
     }
+
+    /// Local schema step only. The caller must hold the authenticated
+    /// whole-Store roster and fence every prior writer and consumer.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::result_large_err)]
+    pub fn upgrade_external_capture(
+        mut self,
+        expected: &ReadyRecord,
+    ) -> Result<Self, (OverlayError, Self)> {
+        if &self.observed != expected {
+            return Err((OverlayError::Invalid("external capture predecessor"), self));
+        }
+        match super::legacy_upgrade::upgrade_capture_ready(&mut self.db, expected) {
+            Ok(()) => Ok(self),
+            Err(error) => Err((error, self)),
+        }
+    }
     /// Locally rechecks the original ready state, without advancing namespace.
     #[allow(clippy::result_large_err)]
     pub fn complete(self, expected: &ReadyRecord) -> Result<Overlay, (OverlayError, Self)> {
@@ -367,6 +384,22 @@ impl SettledConflictRecovery {
                 OverlayError::Invalid("legacy conflict migration schema"),
                 self,
             )),
+            Err(error) => Err((error, self)),
+        }
+    }
+
+    /// Local settled-conflict schema step under the caller's whole-Store fence.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::result_large_err)]
+    pub fn upgrade_external_capture(
+        mut self,
+        expected: &SettledConflict,
+    ) -> Result<Self, (OverlayError, Self)> {
+        if let Err(error) = self.preflight_upgrade(expected) {
+            return Err((error, self));
+        }
+        match super::legacy_upgrade::upgrade_capture_conflict(&mut self.db, expected) {
+            Ok(()) => Ok(self),
             Err(error) => Err((error, self)),
         }
     }

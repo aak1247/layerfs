@@ -37,6 +37,10 @@ pub use contract::conflict::{
     CONFLICT_PAGE_BYTES,
 };
 pub use contract::custody::{CapturedReader, FileRead, LookupOwner, OpenFile, OperationOwner};
+pub use contract::external_capture::{
+    CapturePurpose, ExternalCapture, ExternalCaptureDisposition, ExternalCapturePublication,
+    ExternalCaptureRecord,
+};
 pub use contract::indexed_operation_record::{
     indexed_operation_record_changes_bytes, IndexedOperationRecordApply,
     IndexedOperationRecordChange, IndexedOperationRecordKey, IndexedOperationRecordScope,

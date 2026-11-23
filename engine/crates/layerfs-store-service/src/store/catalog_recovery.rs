@@ -428,7 +428,7 @@ impl PreparedCatalogRecovery {
                 }))
             }
         };
-        if version == 45 || has_conflict {
+        if matches!(version, 45 | 46) || has_conflict {
             // Both exact old and receipt-capable Store formats can contain a
             // locally ready Workspace. An unsupported receipt operation proves
             // the former only when it is the provider's explicit capability
@@ -749,7 +749,7 @@ impl Store {
                 retained: prepared.retain(),
             }));
         }
-        if version == 45 {
+        if matches!(version, 45 | 46) {
             return Ok(prepared);
         }
         let PreparedCatalogRecovery {
@@ -816,7 +816,7 @@ impl Store {
         } = prepared;
         let verify_version = |result: layerfs_overlay::OverlayResult<i64>| {
             result.and_then(|version| {
-                if version == 45 {
+                if matches!(version, 45 | 46) {
                     Ok(())
                 } else {
                     Err(layerfs_overlay::OverlayError::Invalid(

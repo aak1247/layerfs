@@ -1,6 +1,8 @@
 //! Durable service binding keeps the original Branch even after it moves.
 #![cfg(target_os = "linux")]
 
+#[path = "../../layerfs-overlay/tests/support/durable_schema45.rs"]
+mod durable_schema45;
 #[path = "support/installed_store.rs"]
 mod support;
 
@@ -858,6 +860,8 @@ fn checkpoint_recovery_after_original_commit(published: bool, mixed_orphan: bool
     db.initialize_durable_namespace(1).unwrap();
     drop(db);
 
+    durable_schema45::convert(&path);
+
     if published {
         let sql = rusqlite::Connection::open(&path).unwrap();
         sql.execute_batch("CREATE TRIGGER fail_original_install BEFORE UPDATE OF phase ON durable_checkpoint_attempt WHEN OLD.phase=2 AND NEW.phase=4 BEGIN SELECT RAISE(ABORT,'original install fault'); END;").unwrap();
@@ -1248,6 +1252,7 @@ fn unlinked_open_file_recovers_original_workspace_after_ownerless_retirement() {
         .unwrap();
     db.initialize_durable_namespace(1).unwrap();
     drop(db);
+    durable_schema45::convert(&path);
     let sql = rusqlite::Connection::open(&path).unwrap();
     sql.execute_batch("CREATE TRIGGER pause_original_migration BEFORE UPDATE OF generation ON fs_data WHEN NEW.generation=-1 BEGIN SELECT RAISE(ABORT,'original orphan migration fault'); END;").unwrap();
     drop(sql);
@@ -2114,6 +2119,7 @@ fn installed_merge_with_failed_settlement_keeps_original_control_projection() {
     drop(original);
     store.close_reader(identity).unwrap();
     owner.stop().unwrap();
+    durable_schema45::convert(&path);
     let overlay = rusqlite::Connection::open(&path).unwrap();
     overlay
         .execute_batch(
@@ -2343,6 +2349,7 @@ fn legacy_binding_requires_external_namespace_freshness() {
     store.close_reader(identity).unwrap();
     owner.stop().unwrap();
 
+    durable_schema45::convert(&path);
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection
         .execute_batch("DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=40;")

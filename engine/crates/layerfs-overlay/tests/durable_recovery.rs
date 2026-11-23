@@ -1,6 +1,9 @@
 //! Durable overlay transaction and owner-fence proofs through the public API.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 mod payload_support;
 
 use layerfs_overlay::{
@@ -202,6 +205,7 @@ fn legacy_durable_database_reopens_without_implicit_conversion() {
     let db = create(&fixture.path());
     put(&db);
     db.close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
         .execute_batch(
@@ -230,6 +234,7 @@ fn legacy_schema_40_keeps_its_binding_without_a_namespace_conversion() {
     db.initialize_durable_binding(ROOT, b"legacy snapshot")
         .unwrap();
     db.close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
         .execute_batch("DROP TABLE durable_route; DROP TABLE durable_kept_live; DROP TABLE durable_custody; DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=40;")
@@ -254,7 +259,7 @@ fn legacy_schema_40_keeps_its_binding_without_a_namespace_conversion() {
 fn namespace_requires_initialization_and_strictly_increases() {
     let fixture = Fixture::new();
     let db = create(&fixture.path());
-    assert_eq!(db.profile().schema_version, 45);
+    assert_eq!(db.profile().schema_version, 46);
     assert_eq!(db.durable_namespace().unwrap(), None);
     assert!(db.advance_durable_namespace(1).is_err());
     db.initialize_durable_namespace(7).unwrap();

@@ -87,8 +87,7 @@ fn verify_predecessor(db: &Overlay, version: i64) -> OverlayResult<()> {
     Ok(())
 }
 
-fn verify_current(db: &Overlay) -> OverlayResult<()> {
-    let objects = schema_objects(db, 49, "durable migration schema identity")?;
+fn verify_schema_45(objects: Vec<SchemaObject>) -> OverlayResult<()> {
     let mut hash = blake3::Hasher::new();
     hash.update(b"layerfs:durable-schema:v1\0");
     for (kind, name, table, sql) in objects {
@@ -109,6 +108,45 @@ fn verify_current(db: &Overlay) -> OverlayResult<()> {
     }
     if hash.finalize().as_bytes() != &SCHEMA_45_DIGEST {
         return Err(OverlayError::Invalid("durable migration schema identity"));
+    }
+    Ok(())
+}
+
+fn verify_current(db: &Overlay) -> OverlayResult<()> {
+    verify_schema_45(schema_objects(db, 49, "durable migration schema identity")?)
+}
+
+fn expected_capture_objects() -> OverlayResult<Vec<SchemaObject>> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(&format!(
+        "{};{};{};",
+        super::durable_capture::SCHEMA,
+        super::durable_capture::IMMUTABLE,
+        super::durable_capture::NO_DELETE,
+    ))?;
+    let mut statement =
+        expected.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(objects)
+}
+
+/// Reject extra triggers and altered tables before capture can use the
+/// checkpoint transaction. The complete old schema is part of the format.
+pub(super) fn verify_capture_schema(db: &Overlay) -> OverlayResult<()> {
+    let objects = schema_objects(db, 54, "external capture schema identity")?;
+    let (capture, predecessor): (Vec<_>, Vec<_>) = objects
+        .into_iter()
+        .partition(|(_, _, table, _)| table == "durable_external_capture");
+    if predecessor.len() != 49 {
+        return Err(OverlayError::Invalid("external capture predecessor schema"));
+    }
+    verify_schema_45(predecessor)?;
+    if capture != expected_capture_objects()? {
+        return Err(OverlayError::Invalid("external capture schema identity"));
     }
     Ok(())
 }
@@ -147,7 +185,7 @@ fn replace_binding(db: &Overlay) -> OverlayResult<()> {
 /// Store and old-consumer authority are established separately by the caller.
 pub(super) fn preflight(db: &Overlay, record: &ReadyRecord) -> OverlayResult<i64> {
     let version = db.profile.schema_version;
-    if !matches!(version, 41..=45) {
+    if !matches!(version, 41..=46) {
         return Err(OverlayError::Invalid("unsupported legacy migration schema"));
     }
     let original = db.state()?;
@@ -161,10 +199,10 @@ pub(super) fn preflight(db: &Overlay, record: &ReadyRecord) -> OverlayResult<i64
         return Err(OverlayError::Invalid("legacy migration predecessor"));
     }
     db.require_recorded_recovery_ready()?;
-    if version == 45 {
-        verify_current(db)?;
-    } else {
-        verify_predecessor(db, version)?;
+    match version {
+        45 => verify_current(db)?,
+        46 => verify_capture_schema(db)?,
+        _ => verify_predecessor(db, version)?,
     }
     Ok(version)
 }
@@ -173,7 +211,7 @@ pub(super) fn preflight(db: &Overlay, record: &ReadyRecord) -> OverlayResult<i64
 /// lease must authenticate the Store, roster and old consumer fence first.
 pub(super) fn upgrade(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<()> {
     let version = preflight(db, record)?;
-    if version == 45 {
+    if matches!(version, 45 | 46) {
         return Err(OverlayError::Invalid("unsupported legacy migration schema"));
     }
     let original = db.state()?;
@@ -216,6 +254,57 @@ pub(super) fn upgrade(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<(
     Ok(())
 }
 
+/// Local step of a separately fenced, whole-Store maintenance operation.
+/// This does not establish the Store, roster or old-consumer authority.
+pub(super) fn upgrade_capture_ready(db: &mut Overlay, record: &ReadyRecord) -> OverlayResult<()> {
+    if preflight(db, record)? != 45 {
+        return Err(OverlayError::Invalid(
+            "external capture predecessor version",
+        ));
+    }
+    let original = db.state()?;
+    let stored = stored_state(db)?;
+    db.atomic_cleanup(|| {
+        db.begin()?;
+        db.require_recorded_ready_in_cleanup()?;
+        if db.state()? != original
+            || stored_state(db)? != stored
+            || db.durable_namespace()? != Some(record.previous_namespace)
+            || db.durable_binding()?.as_deref() != Some(record.snapshot.as_slice())
+        {
+            return Err(OverlayError::Invalid(
+                "external capture predecessor changed",
+            ));
+        }
+        verify_current(db)?;
+        super::durable_capture::initialize(db)?;
+        verify_capture_schema(db)?;
+        if db.state()? != original
+            || stored_state(db)? != stored
+            || db.durable_namespace()? != Some(record.previous_namespace)
+            || db.durable_binding()?.as_deref() != Some(record.snapshot.as_slice())
+        {
+            return Err(OverlayError::Invalid(
+                "external capture migration changed state",
+            ));
+        }
+        db.execute(StatementKind::Startup, "PRAGMA user_version=46", &[], 0)?;
+        let actual: Vec<i64> = db.query(
+            StatementKind::Startup,
+            "PRAGMA user_version",
+            &[],
+            0,
+            |row| row.get(0),
+        )?;
+        if actual.as_slice() != [46] {
+            return Err(OverlayError::Invalid("external capture migration version"));
+        }
+        Ok(())
+    })?;
+    db.profile.schema_version = 46;
+    Ok(())
+}
+
 fn conflict_identity(record: &SettledConflict) -> ConflictSyncIdentity<'_> {
     ConflictSyncIdentity {
         workspace: record.workspace,
@@ -232,17 +321,18 @@ fn conflict_identity(record: &SettledConflict) -> ConflictSyncIdentity<'_> {
 /// and the old consumers remain the caller's separate responsibility.
 pub(super) fn preflight_conflict(db: &Overlay, record: &SettledConflict) -> OverlayResult<i64> {
     let version = db.profile.schema_version;
-    if !matches!(version, 44 | 45)
+    if !matches!(version, 44..=46)
         || super::pending_recovery::observe(db)? != *record
         || stored_state(db)?.len() != 1
     {
         return Err(OverlayError::Invalid("legacy conflict predecessor"));
     }
     db.require_conflict_synchronize_ready(&conflict_identity(record))?;
-    if version == 44 {
-        verify_predecessor(db, version)?;
-    } else {
-        verify_current(db)?;
+    match version {
+        44 => verify_predecessor(db, version)?,
+        45 => verify_current(db)?,
+        46 => verify_capture_schema(db)?,
+        _ => unreachable!("schema version checked"),
     }
     Ok(version)
 }
@@ -286,5 +376,53 @@ pub(super) fn upgrade_conflict(db: &mut Overlay, record: &SettledConflict) -> Ov
         Ok(())
     })?;
     db.profile.schema_version = 45;
+    Ok(())
+}
+
+pub(super) fn upgrade_capture_conflict(
+    db: &mut Overlay,
+    record: &SettledConflict,
+) -> OverlayResult<()> {
+    if preflight_conflict(db, record)? != 45 {
+        return Err(OverlayError::Invalid("external capture conflict version"));
+    }
+    let original = db.state()?;
+    let stored = stored_state(db)?;
+    db.atomic_cleanup(|| {
+        db.begin()?;
+        db.require_conflict_ready_in_cleanup(&conflict_identity(record))?;
+        if db.state()? != original
+            || stored_state(db)? != stored
+            || super::pending_recovery::observe(db)? != *record
+        {
+            return Err(OverlayError::Invalid("external capture conflict changed"));
+        }
+        verify_current(db)?;
+        super::durable_capture::initialize(db)?;
+        verify_capture_schema(db)?;
+        if db.state()? != original
+            || stored_state(db)? != stored
+            || super::pending_recovery::observe(db)? != *record
+        {
+            return Err(OverlayError::Invalid(
+                "external capture conflict migration changed",
+            ));
+        }
+        db.execute(StatementKind::Startup, "PRAGMA user_version=46", &[], 0)?;
+        let actual: Vec<i64> = db.query(
+            StatementKind::Startup,
+            "PRAGMA user_version",
+            &[],
+            0,
+            |row| row.get(0),
+        )?;
+        if actual.as_slice() != [46] {
+            return Err(OverlayError::Invalid(
+                "external capture conflict migration version",
+            ));
+        }
+        Ok(())
+    })?;
+    db.profile.schema_version = 46;
     Ok(())
 }

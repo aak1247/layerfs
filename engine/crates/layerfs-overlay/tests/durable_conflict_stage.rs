@@ -1,6 +1,9 @@
 //! Original conflict staging is bounded and mutually exclusive with sending.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 use layerfs_overlay::{
     conflict_page_digest, Changes, CheckpointCompletion, CheckpointOutcome, ConflictCompletion,
     ConflictStageInput, Inode, InodeKind, MaintenanceCursor, Overlay, OverlayCatalogRecovery,
@@ -284,6 +287,7 @@ fn checkpoint_cleanup_rolls_back_when_post_delete_readiness_fails() {
         .unwrap();
     let attempt = recorded.attempt();
     drop(db);
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch(
         "CREATE TRIGGER inject_post_delete_work AFTER DELETE ON durable_checkpoint_attempt \
@@ -462,6 +466,7 @@ fn empty_staging_is_retired_without_a_page() {
 fn a_missing_written_page_keeps_the_attempt_and_cleanup_pending() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch(
         "CREATE TRIGGER lose_staged_page AFTER UPDATE OF state ON durable_conflict_plan \
@@ -532,6 +537,7 @@ fn invalid_target_is_rejected_before_the_capture_changes() {
 fn an_unowned_cleanup_item_blocks_stage_and_publication() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER orphan_cleanup AFTER INSERT ON durable_checkpoint_attempt \
         BEGIN INSERT INTO cleanup_task(kind,resource,target,cursor) VALUES(13,0,NEW.generation,1); END;").unwrap();
@@ -572,6 +578,7 @@ fn an_unowned_cleanup_item_blocks_stage_and_publication() {
 fn retiring_a_stage_does_not_adopt_an_existing_cleanup_cursor() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER competing_cleanup AFTER UPDATE OF conflict_generation ON durable_checkpoint_attempt \
         WHEN NEW.conflict_generation IS NOT NULL BEGIN \
@@ -754,6 +761,7 @@ fn a_successor_conflict_retires_only_the_previous_active_plan() {
 fn conflict_install_rejects_a_newly_occupied_cleanup_key_before_switching() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER occupied_install AFTER UPDATE OF next_page ON durable_conflict_plan \
        WHEN NEW.next_page=NEW.page_count BEGIN INSERT INTO cleanup_task(kind,resource,target,cursor) VALUES(13,0,NEW.generation,1); END;").unwrap();
@@ -791,6 +799,7 @@ fn conflict_install_rejects_a_newly_occupied_cleanup_key_before_switching() {
 fn retired_conflict_rejects_a_different_successor_without_deleting_pages() {
     let fixture = Fixture::new();
     fixture.create().close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let sql = rusqlite::Connection::open(fixture.path()).unwrap();
     sql.execute_batch("CREATE TRIGGER corrupt_successor AFTER INSERT ON cleanup_task WHEN NEW.kind=13 AND NEW.phase=1 BEGIN \
        UPDATE cleanup_task SET name=CAST(substr(name,1,32)||zeroblob(32) AS BLOB) \

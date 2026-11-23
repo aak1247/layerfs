@@ -1,7 +1,11 @@
 //! Reconstruct the immediately previous empty schema for compatibility tests.
 use std::path::Path;
 
+#[path = "durable_schema45.rs"]
+mod durable_schema45;
+
 pub fn convert(path: &Path) {
+    durable_schema45::convert(path);
     let sql = rusqlite::Connection::open(path).unwrap();
     let schema: String = sql.query_row(
         "SELECT sql FROM sqlite_schema WHERE type='table' AND name='durable_checkpoint_attempt'",

@@ -1,6 +1,9 @@
 //! Durable carried rows remain distinct from unsafe process-local custody.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 use layerfs_overlay::{
     Changes, Inode, InodeKind, MaintenanceCursor, Overlay, OverlayError, ProfileConfig,
 };
@@ -84,7 +87,7 @@ fn settle_maintenance(db: &Overlay) {
 
 fn with_kept(fixture: &Fixture) -> Overlay {
     let db = Overlay::create_durable(&fixture.path(), ProfileConfig::default(), IDENTITY).unwrap();
-    assert_eq!(db.profile().schema_version, 45);
+    assert_eq!(db.profile().schema_version, 46);
     db.open_workspace(ROOT).unwrap();
     db.initialize_durable_binding(ROOT, b"original snapshot")
         .unwrap();
@@ -215,6 +218,7 @@ fn kept_rows_do_not_hide_unresolved_operation_or_legacy_custody() {
             "durable overlay requires reconciliation"
         ))
     ));
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     let (orphan, operation): (bool, bool) = connection
         .query_row(
@@ -278,6 +282,7 @@ fn clean_legacy_41_reopens_without_implicit_conversion() {
         .unwrap();
     db.initialize_durable_namespace(1).unwrap();
     db.close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection
         .execute_batch(
@@ -302,6 +307,7 @@ fn clean_legacy_41_reopens_without_implicit_conversion() {
 fn legacy_42_reconstructs_kept_rows_without_implicit_conversion() {
     let fixture = Fixture::new();
     drop(with_kept(&fixture));
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection.execute_batch("DROP TABLE durable_checkpoint_attempt; DROP TABLE durable_operation_owner; DROP TABLE durable_orphan_owner; DROP TABLE durable_owner_counts; PRAGMA user_version=42;").unwrap();
     drop(connection);
@@ -348,6 +354,7 @@ fn a_failed_kept_insert_rolls_back_the_inode_and_custody() {
     )
     .unwrap();
     db.close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_keep BEFORE INSERT ON durable_kept_live BEGIN SELECT RAISE(ABORT, 'injected keep failure'); END;").unwrap();
     drop(connection);
@@ -371,6 +378,7 @@ fn a_failed_kept_insert_rolls_back_the_inode_and_custody() {
 fn a_failed_capture_preserves_the_kept_set_and_dirty_accounting() {
     let fixture = Fixture::new();
     drop(with_kept(&fixture));
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_capture BEFORE DELETE ON durable_kept_live BEGIN SELECT RAISE(ABORT, 'injected capture failure'); END;").unwrap();
     drop(connection);

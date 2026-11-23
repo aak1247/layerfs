@@ -591,7 +591,7 @@ impl PreparedCatalogTransition {
                 match entry {
                     OverlayCatalogRecovery::Ready(ready) => match ready.schema_version() {
                         41 | 42 => legacy = true,
-                        45 => recorded = true,
+                        45 | 46 => recorded = true,
                         43 | 44 => {
                             if matches!(purpose, PreparationPurpose::Maintenance) {
                                 legacy = true;
@@ -608,7 +608,7 @@ impl PreparedCatalogTransition {
                     },
                     OverlayCatalogRecovery::SettledConflict(conflict)
                         if matches!(purpose, PreparationPurpose::Maintenance)
-                            && matches!(conflict.schema_version(), 44 | 45) =>
+                            && matches!(conflict.schema_version(), 44..=46) =>
                     {
                         legacy = true;
                         recorded = true;

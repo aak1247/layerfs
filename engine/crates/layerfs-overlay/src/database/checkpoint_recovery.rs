@@ -114,6 +114,15 @@ fn commit_id(value: Vec<u8>) -> OverlayResult<[u8; 33]> {
 }
 
 impl PendingCheckpointRecovery {
+    /// Observe the original locally recorded identity while custody remains
+    /// unresolved. Store receipt and caller authority are separate checks.
+    pub fn observe_external_capture(
+        &self,
+        identity: crate::ExternalCapture,
+    ) -> OverlayResult<Option<crate::ExternalCaptureRecord>> {
+        self.db.observe_external_capture(identity)
+    }
+
     pub(super) fn open(db: Overlay) -> OverlayResult<Self> {
         Self::open_with_orphans(db, false)
     }
@@ -561,6 +570,7 @@ impl PendingCheckpointRecovery {
             if changed != 1 {
                 return Err(OverlayError::Invalid("checkpoint recovery fold predecessor"));
             }
+            super::durable_capture::mark_unpublished(&self.db, self.recorded.attempt)?;
             self.db.schedule_failed_capture(self.recorded.capture)
         })?;
         self.phase = 6;

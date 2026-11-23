@@ -5,6 +5,7 @@ pub(crate) mod connection_owner;
 pub(crate) mod durable;
 pub(crate) mod durable_attempt;
 pub(crate) mod durable_binding;
+pub(crate) mod durable_capture;
 pub(crate) mod durable_cleanup;
 pub(crate) mod durable_conflict;
 pub(crate) mod durable_conflict_stage;

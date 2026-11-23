@@ -45,16 +45,16 @@ pub struct DatabaseProfile {
 impl DatabaseProfile {
     /// Whether the durable format records the authenticated Branch snapshot.
     pub fn has_durable_binding(&self) -> bool {
-        matches!(self.schema_version, 40..=45)
+        matches!(self.schema_version, 40..=46)
     }
 
     /// Whether the durable format records the consumed namespace high-water.
     pub fn has_durable_namespace(&self) -> bool {
-        matches!(self.schema_version, 41..=45)
+        matches!(self.schema_version, 41..=46)
     }
 
     pub(crate) fn has_classified_custody(&self) -> bool {
-        matches!(self.schema_version, 42..=45)
+        matches!(self.schema_version, 42..=46)
     }
 
     pub(crate) fn has_recorded_owners(&self) -> bool {
@@ -63,16 +63,21 @@ impl DatabaseProfile {
 
     /// Whether durable checkpoint ownership and publication are recorded.
     pub fn has_recorded_checkpoints(&self) -> bool {
-        matches!(self.schema_version, 43..=45)
+        matches!(self.schema_version, 43..=46)
     }
 
     /// Whether the durable format records local conflict dispositions.
     pub fn has_durable_conflict(&self) -> bool {
-        matches!(self.schema_version, 44 | 45)
+        matches!(self.schema_version, 44..=46)
     }
 
     pub(crate) fn has_serial_retirement_origin(&self) -> bool {
-        self.schema_version == 45
+        matches!(self.schema_version, 45 | 46)
+    }
+
+    /// Whether this durable format records externally identified captures.
+    pub fn has_external_captures(&self) -> bool {
+        self.schema_version == 46
     }
 }
 pub(crate) fn initialize(

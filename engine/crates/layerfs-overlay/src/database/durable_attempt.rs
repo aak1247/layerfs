@@ -613,6 +613,7 @@ impl Overlay {
             if changed != 1 {
                 return Err(OverlayError::Invalid("checkpoint fold predecessor"));
             }
+            super::durable_capture::mark_unpublished(self, recorded.attempt)?;
             self.schedule_failed_capture(recorded.capture)
         })
     }
@@ -744,6 +745,14 @@ impl Overlay {
             if changed != 1 {
                 return Err(OverlayError::Invalid("checkpoint publication predecessor"));
             }
+            super::durable_capture::freeze_publication(
+                self,
+                recorded.attempt,
+                request,
+                request_digest,
+                candidate_root,
+                target_snapshot,
+            )?;
             Ok(())
         })
     }

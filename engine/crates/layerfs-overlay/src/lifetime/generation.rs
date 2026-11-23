@@ -138,6 +138,42 @@ impl Overlay {
             Ok(crate::RecordedCapture { capture, attempt })
         })
     }
+    /// Capture an externally identified frontier exactly once. The caller must
+    /// authenticate this Workspace, purpose and scope before this operation.
+    /// The original identity and checkpoint attempt commit atomically with the
+    /// generation change. A duplicate ID is observed separately, not resent.
+    pub fn capture_external(
+        &self,
+        identity: crate::ExternalCapture,
+        workspace: [u8; 32],
+        catalog: [u8; 32],
+        incarnation: u64,
+        snapshot: &[u8],
+    ) -> OverlayResult<crate::RecordedCapture> {
+        self.atomic_cleanup(|| {
+            crate::database::durable_capture::require_new(self, identity)?;
+            let capture = self.capture_inner()?;
+            let attempt = crate::database::durable_attempt::record(
+                self,
+                workspace,
+                catalog,
+                incarnation,
+                snapshot,
+                capture,
+            )?;
+            crate::database::durable_capture::record(self, identity, attempt)?;
+            Ok(crate::RecordedCapture { capture, attempt })
+        })
+    }
+
+    /// Reads only the exact identity in this Workspace's durable overlay.
+    /// Store authority and the original publication receipt are separate.
+    pub fn observe_external_capture(
+        &self,
+        identity: crate::ExternalCapture,
+    ) -> OverlayResult<Option<crate::ExternalCaptureRecord>> {
+        crate::database::durable_capture::observe(self, identity)
+    }
     fn capture_inner(&self) -> OverlayResult<Capture> {
         if crate::database::durable_attempt::pending(self)? {
             return Err(OverlayError::Invalid(

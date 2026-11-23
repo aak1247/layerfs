@@ -1,6 +1,9 @@
 //! Durable owner records preserve custody without guessing an interrupted outcome.
 #![cfg(target_os = "linux")]
 
+#[path = "support/durable_schema45.rs"]
+mod durable_schema45;
+
 mod payload_support;
 
 use layerfs_overlay::{Changes, Overlay, OverlayError, ProfileConfig};
@@ -33,7 +36,7 @@ impl Fixture {
     }
     fn create(&self, namespace: bool) -> Overlay {
         let db = Overlay::create_durable(&self.path(), ProfileConfig::default(), IDENTITY).unwrap();
-        assert_eq!(db.profile().schema_version, 45);
+        assert_eq!(db.profile().schema_version, 46);
         db.open_workspace(ROOT).unwrap();
         db.initialize_durable_binding(ROOT, b"original snapshot")
             .unwrap();
@@ -105,6 +108,7 @@ fn captured_owner_records_the_exact_reader_but_does_not_authorize_recovery() {
 fn failed_owner_record_insert_rolls_back_sql_and_memory_custody() {
     let fixture = Fixture::new();
     fixture.create(true).close_database().unwrap();
+    durable_schema45::convert(&fixture.path());
     let connection = rusqlite::Connection::open(fixture.path()).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_owner BEFORE INSERT ON durable_operation_owner BEGIN SELECT RAISE(ABORT, 'injected owner failure'); END;").unwrap();
     drop(connection);
