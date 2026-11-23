@@ -121,6 +121,9 @@ impl Service {
             }),
             Request::Capture(control) => self.capture_external(*control),
             Request::ObserveCapture(control) => self.observe_capture(*control),
+            Request::OpenCapture(_) | Request::ReadCapture(_) | Request::CloseCapture(_) => Err(
+                Failure::Rejected(ControlCode::Invalid, "capture read requires its authenticated connection"),
+            ),
             Request::Unmount(control) => {
                 #[cfg(target_os = "linux")]
                 if let Some(result) = self.durable_unmount(*control) {

@@ -66,6 +66,9 @@ pub(crate) fn request_token(request: &Request) -> Option<WorkspaceToken> {
     match request {
         Request::Commit(control) => Some(control.token),
         Request::Capture(control) | Request::ObserveCapture(control) => Some(control.token),
+        Request::OpenCapture(open) => Some(open.control.token),
+        Request::ReadCapture(read) => Some(read.handle.token),
+        Request::CloseCapture(handle) => Some(handle.token),
         Request::Unmount(control) => Some(control.token),
         Request::Status(token)
         | Request::Attach(token)

@@ -3,6 +3,7 @@
 mod attach;
 mod capture;
 mod capture_read;
+mod capture_session;
 #[cfg(target_os = "linux")]
 mod catalog_transition;
 mod cleanup;
@@ -44,6 +45,7 @@ mod status;
 mod types;
 mod unmount;
 pub use capture_read::CapturedRoot;
+pub use capture_session::CaptureSession;
 #[cfg(target_os = "linux")]
 pub use catalog_transition::{
     CatalogCohortCause, CatalogCohortEntry, CatalogCohortFailure, CatalogCohortProgress,

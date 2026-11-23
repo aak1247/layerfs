@@ -54,6 +54,18 @@ impl Call {
                 out.byte(23)?;
                 crate::control_capture::put_control(&mut out, *value)?;
             }
+            Request::OpenCapture(value) => {
+                out.byte(24)?;
+                crate::control_capture_read::put_open(&mut out, *value)?;
+            }
+            Request::ReadCapture(value) => {
+                out.byte(25)?;
+                crate::control_capture_read::put_read(&mut out, value)?;
+            }
+            Request::CloseCapture(value) => {
+                out.byte(26)?;
+                crate::control_capture_read::put_handle(&mut out, *value)?;
+            }
             Request::Status(token) => {
                 out.byte(3)?;
                 put_token(&mut out, *token)?;
@@ -162,6 +174,9 @@ impl Call {
             2 => Request::Commit(crate::control_merge::commit_control(&mut input)?),
             22 => Request::Capture(crate::control_capture::control(&mut input)?),
             23 => Request::ObserveCapture(crate::control_capture::control(&mut input)?),
+            24 => Request::OpenCapture(crate::control_capture_read::open(&mut input)?),
+            25 => Request::ReadCapture(crate::control_capture_read::read(&mut input)?),
+            26 => Request::CloseCapture(crate::control_capture_read::handle(&mut input)?),
             20 => Request::Sdk(crate::control_sdk::call(&mut input)?),
             3 => Request::Status(token(&mut input)?),
             4 => Request::Unmount(crate::control_unmount::unmount(&mut input)?),

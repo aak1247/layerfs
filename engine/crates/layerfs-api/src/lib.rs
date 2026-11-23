@@ -30,4 +30,6 @@ pub use sandbox::{
     connect_address, ManagedSandbox, SandboxApi, SandboxCause, SandboxCreate, SandboxFailure,
     SandboxPhase,
 };
-pub use sandbox::{BoundWorkspace, MountFailure, MountedWorkspace, Unmounted, WorkspaceApi};
+pub use sandbox::{
+    BoundWorkspace, CapturedWorkspace, MountFailure, MountedWorkspace, Unmounted, WorkspaceApi,
+};

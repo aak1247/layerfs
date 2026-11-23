@@ -54,6 +54,12 @@ pub enum Request {
     Capture(crate::control_capture::CaptureControl),
     /// Observe only the original capture and its exact Store receipt.
     ObserveCapture(crate::control_capture::CaptureControl),
+    /// Open an original receipt's root for this authenticated connection.
+    OpenCapture(crate::control_capture_read::CaptureOpen),
+    /// Read one bounded window from this connection's original captured root.
+    ReadCapture(crate::control_capture_read::CaptureReadRequest),
+    /// Release this connection's captured-root handle without closing its Workspace.
+    CloseCapture(crate::control_capture_read::CaptureReadHandle),
     /// Observe maintained local state without reading or refreshing the Store.
     Status(WorkspaceToken),
     /// Terminally close a quiescent local binding and transfer cleanup to the
@@ -227,6 +233,12 @@ pub enum Reply {
     Committed(CommitOutcome),
     /// Original external capture observation, never permission to resend.
     Capture(crate::control_capture::CaptureObservation),
+    /// Connection-local handle for one original receipt's immutable root.
+    CaptureOpened(crate::control_capture_read::CaptureReadHandle),
+    /// Exact captured-root byte window.
+    CaptureRead(crate::control_capture_read::CaptureReadResult),
+    /// The connection-local read handle was released.
+    CaptureClosed(crate::control_capture_read::CaptureReadHandle),
     /// A Commit published after merging with a moved head.
     MergeCommitted(Box<crate::control_merge::MergedCommit>),
     /// The value an SDK call returned.

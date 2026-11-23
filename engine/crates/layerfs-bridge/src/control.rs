@@ -168,6 +168,9 @@ pub use crate::control_capture::{
     CaptureControl, CaptureIdentity, CaptureObservation, CaptureOutcome, CaptureProof,
     CapturePurpose,
 };
+pub use crate::control_capture_read::{
+    CaptureOpen, CaptureReadHandle, CaptureReadRequest, CaptureReadResult, CAPTURE_READ_LIMIT,
+};
 pub use crate::control_forced::{
     AbortDisposition, CommitKnowledge, DetachDisposition, ForceUnmounted, ForcedCleanup,
     ForcedFacts, ForcedOutcome,

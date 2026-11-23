@@ -57,6 +57,18 @@ impl Answer {
                 out.byte(24)?;
                 crate::control_capture::put_observation(&mut out, value)?;
             }
+            Reply::CaptureOpened(value) => {
+                out.byte(25)?;
+                crate::control_capture_read::put_handle(&mut out, *value)?;
+            }
+            Reply::CaptureRead(value) => {
+                out.byte(26)?;
+                crate::control_capture_read::put_result(&mut out, value)?;
+            }
+            Reply::CaptureClosed(value) => {
+                out.byte(27)?;
+                crate::control_capture_read::put_handle(&mut out, *value)?;
+            }
             Reply::MergeCommitted(value) => {
                 out.byte(18)?;
                 crate::control_merge::put_merged(&mut out, value)?;
@@ -197,6 +209,9 @@ impl Answer {
             },
             2 => Reply::Committed(outcome(&mut input)?),
             24 => Reply::Capture(crate::control_capture::observation(&mut input)?),
+            25 => Reply::CaptureOpened(crate::control_capture_read::handle(&mut input)?),
+            26 => Reply::CaptureRead(crate::control_capture_read::result(&mut input)?),
+            27 => Reply::CaptureClosed(crate::control_capture_read::handle(&mut input)?),
             18 => Reply::MergeCommitted(Box::new(crate::control_merge::merged(&mut input)?)),
             19 => Reply::Conflict(Box::new(crate::control_merge::report(&mut input)?)),
             20 => Reply::Sdk(crate::control_sdk::value(&mut input, 0)?),

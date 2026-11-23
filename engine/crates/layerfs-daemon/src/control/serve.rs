@@ -52,6 +52,17 @@ impl Service {
         let call = receive_call(connection)?;
         self.serve_control_call(connection, call)
     }
+    /// Receives one control with the caller's connection-local captured roots.
+    /// Keep the same session for this authenticated channel and drop it on end.
+    pub fn serve_one_control_session(
+        &self,
+        connection: &mut Connection,
+        session: &mut super::CaptureSession,
+    ) -> Result<Served, Box<ServeFailure>> {
+        let call = receive_call(connection)?;
+        let outcome = self.execute_session(session, &call.request);
+        answer_call(connection, call, outcome, None)
+    }
     pub(crate) fn serve_control_call(
         &self,
         connection: &mut Connection,

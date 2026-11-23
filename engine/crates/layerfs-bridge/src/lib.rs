@@ -9,6 +9,7 @@ mod provision_wire;
 mod wire;
 
 mod control_capture;
+mod control_capture_read;
 mod control_forced;
 mod control_history;
 mod control_merge;

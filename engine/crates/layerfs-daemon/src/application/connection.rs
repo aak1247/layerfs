@@ -125,6 +125,7 @@ impl Application {
                 },
             )?;
         let mut first = true;
+        let mut captures = crate::control::CaptureSession::default();
         loop {
             let request = {
                 let bytes = match connection.receive.receive() {
@@ -187,9 +188,9 @@ impl Application {
                     let bodies = super::bodies::Bodies::of(&call.request, &mut connection.receive);
                     let (outcome, diagnostic_error, telemetry) =
                         if matches!(call.request, Request::Observed { .. }) {
-                            self.observed_control(&call, slot)
+                            self.observed_control(&call, slot, &mut captures)
                         } else {
-                            (self.control(&call, slot), None, None)
+                            (self.control(&call, slot, &mut captures), None, None)
                         };
                     if let Err(cause) = bodies.finish() {
                         return Err(ConnectionFailure {
@@ -254,6 +255,9 @@ impl Application {
                         }
                     }
                     if session_end {
+                        // The session is already acknowledged. A peer that
+                        // delays its TCP close must not retain captured roots.
+                        drop(captures);
                         connection
                             .receive
                             .wait_peer_end()
@@ -290,13 +294,15 @@ impl Application {
         &self,
         call: &Call,
         slot: usize,
+        captures: &mut crate::control::CaptureSession,
     ) -> Result<crate::control::Success, crate::control::Failure> {
-        self.control_operation(&call.request, slot)
+        self.control_operation(&call.request, slot, captures)
     }
     pub(super) fn control_operation(
         &self,
         request: &Request,
         slot: usize,
+        captures: &mut crate::control::CaptureSession,
     ) -> Result<crate::control::Success, crate::control::Failure> {
         use crate::control::{Failure, Success};
         use layerfs_bridge::control::{ControlCode, DaemonPhase};
@@ -321,7 +327,7 @@ impl Application {
         let phase = state.startup.phase;
         drop(state);
         match service {
-            Some(service) => service.execute_control(request),
+            Some(service) => service.execute_session(captures, request),
             None if phase == DaemonPhase::Retained => Err(Failure::Rejected(
                 ControlCode::Unknown,
                 "original Store startup custody retained",

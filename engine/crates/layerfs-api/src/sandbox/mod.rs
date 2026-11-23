@@ -19,6 +19,7 @@ mod status;
 mod unmount;
 mod unmount_observed;
 pub mod values;
+pub use capture::CapturedWorkspace;
 #[cfg(unix)]
 pub use close_observed::{
     ObservedSandboxCloseFailure, SandboxCloseAttempt, SandboxCloseMilestone,

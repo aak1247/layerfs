@@ -294,6 +294,15 @@ fn matches_reply(request: &Request, reply: &Reply) -> bool {
             }
             _ => true,
         },
+        (Request::OpenCapture(open), Reply::CaptureOpened(handle)) => {
+            handle.token == open.control.token && handle.receipt_sha256 == open.receipt_sha256
+        }
+        (Request::ReadCapture(read), Reply::CaptureRead(result)) => {
+            result.handle == read.handle
+                && result.offset == read.offset
+                && result.bytes.len() == read.length as usize
+        }
+        (Request::CloseCapture(handle), Reply::CaptureClosed(closed)) => handle == closed,
         (Request::Status(token), Reply::Status(status)) => *token == status.token,
         (Request::Unmount(control), Reply::Unmounted(closed)) => control.token == *closed,
         (Request::Unmount(control), Reply::Dirty(report)) => control.token == report.token,
