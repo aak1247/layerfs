@@ -72,6 +72,26 @@ impl Failure {
                 owner_detail(error),
                 None,
             ),
+            Self::CaptureObservation(error) => {
+                let (code, moved, detail) = commit(error);
+                (
+                    code,
+                    moved,
+                    "capture observation".into(),
+                    super::kernel::bounded(&detail),
+                    None,
+                )
+            }
+            Self::CaptureRead(error) => {
+                let (code, moved, detail) = commit(error);
+                (
+                    code,
+                    moved,
+                    "capture read".into(),
+                    super::kernel::bounded(&detail),
+                    None,
+                )
+            }
 
             Self::Bind(failed) => {
                 let (code, moved, detail) = match &failed.error {

@@ -280,6 +280,20 @@ fn matches_reply(request: &Request, reply: &Reply) -> bool {
             Request::Commit(_),
             Reply::Committed(_) | Reply::MergeCommitted(_) | Reply::Conflict(_),
         ) => true,
+        (
+            Request::Capture(control),
+            Reply::Capture(layerfs_bridge::control::CaptureObservation::Published(proof)),
+        ) => {
+            proof.identity == control.identity
+                && proof.workspace == control.token.workspace
+                && proof.original_namespace == control.token.namespace
+        }
+        (Request::ObserveCapture(control), Reply::Capture(observed)) => match observed {
+            layerfs_bridge::control::CaptureObservation::Published(proof) => {
+                proof.identity == control.identity && proof.workspace == control.token.workspace
+            }
+            _ => true,
+        },
         (Request::Status(token), Reply::Status(status)) => *token == status.token,
         (Request::Unmount(control), Reply::Unmounted(closed)) => control.token == *closed,
         (Request::Unmount(control), Reply::Dirty(report)) => control.token == report.token,

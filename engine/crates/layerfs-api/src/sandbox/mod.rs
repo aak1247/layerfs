@@ -1,4 +1,5 @@
 //! Actual ordinary Sandbox lifecycle and its Workspaces, with exact logical and kernel readiness.
+mod capture;
 #[cfg(unix)]
 mod close;
 #[cfg(unix)]

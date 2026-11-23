@@ -1,6 +1,6 @@
 //! Original control operation receipts, independent of delivery acknowledgement.
 use crate::{
-    store::{BindRefusal, CommitFailure, CommitSuccess},
+    store::{BindRefusal, CommitError, CommitFailure, CommitSuccess},
     OwnerError,
 };
 use layerfs_bridge::control::{ControlCode, Reply};
@@ -41,6 +41,10 @@ pub enum Failure {
     Custody(Box<layerfs_bridge::control::ControlRefusal>),
     Bind(Box<BindRefusal>),
     Commit(Box<CommitFailure>),
+    /// Read-only observation failed; preserve its original cause.
+    CaptureObservation(CommitError),
+    /// A bounded read of an authenticated captured root failed.
+    CaptureRead(CommitError),
     Owner(OwnerError),
     History(HistoryError),
     Workspace(WorkspaceError),

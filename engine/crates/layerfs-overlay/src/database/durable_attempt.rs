@@ -157,7 +157,7 @@ pub(crate) fn record(
     Ok(attempt)
 }
 
-fn identity(
+pub(super) fn identity(
     workspace: &[u8],
     catalog: &[u8],
     incarnation: i64,

@@ -46,6 +46,14 @@ impl Call {
                 out.byte(2)?;
                 crate::control_merge::put_commit_control(&mut out, value)?;
             }
+            Request::Capture(value) => {
+                out.byte(22)?;
+                crate::control_capture::put_control(&mut out, *value)?;
+            }
+            Request::ObserveCapture(value) => {
+                out.byte(23)?;
+                crate::control_capture::put_control(&mut out, *value)?;
+            }
             Request::Status(token) => {
                 out.byte(3)?;
                 put_token(&mut out, *token)?;
@@ -152,6 +160,8 @@ impl Call {
                 branch: history(BranchId::from_bytes(input.array()?))?,
             },
             2 => Request::Commit(crate::control_merge::commit_control(&mut input)?),
+            22 => Request::Capture(crate::control_capture::control(&mut input)?),
+            23 => Request::ObserveCapture(crate::control_capture::control(&mut input)?),
             20 => Request::Sdk(crate::control_sdk::call(&mut input)?),
             3 => Request::Status(token(&mut input)?),
             4 => Request::Unmount(crate::control_unmount::unmount(&mut input)?),

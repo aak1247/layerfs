@@ -119,6 +119,8 @@ impl Service {
                     message: control.message.clone(),
                 })
             }),
+            Request::Capture(control) => self.capture_external(*control),
+            Request::ObserveCapture(control) => self.observe_capture(*control),
             Request::Unmount(control) => {
                 #[cfg(target_os = "linux")]
                 if let Some(result) = self.durable_unmount(*control) {
@@ -231,7 +233,7 @@ impl Service {
         }
         Ok(success)
     }
-    fn commit(
+    pub(super) fn commit(
         &self,
         token: WorkspaceToken,
         run: impl FnOnce(&BoundWorkspace) -> Result<CommitSuccess, Box<CommitFailure>>,

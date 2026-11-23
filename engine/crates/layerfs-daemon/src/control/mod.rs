@@ -1,6 +1,8 @@
 //! Bounded kernel control over a direct Store and one local overlay owner.
 #[cfg(target_os = "linux")]
 mod attach;
+mod capture;
+mod capture_read;
 #[cfg(target_os = "linux")]
 mod catalog_transition;
 mod cleanup;
@@ -41,6 +43,7 @@ mod serving;
 mod status;
 mod types;
 mod unmount;
+pub use capture_read::CapturedRoot;
 #[cfg(target_os = "linux")]
 pub use catalog_transition::{
     CatalogCohortCause, CatalogCohortEntry, CatalogCohortFailure, CatalogCohortProgress,

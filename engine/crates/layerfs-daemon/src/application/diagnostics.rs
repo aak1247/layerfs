@@ -382,6 +382,8 @@ fn operation_code(operation: &Request) -> u64 {
     match operation {
         Request::Mount { .. } => 1,
         Request::Commit(_) => 2,
+        Request::Capture(_) => 16,
+        Request::ObserveCapture(_) => 17,
         Request::Status(_) => 3,
         Request::Unmount(_) => 4,
         Request::Fork(_) => 5,

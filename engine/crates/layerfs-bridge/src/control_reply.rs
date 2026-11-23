@@ -53,6 +53,10 @@ impl Answer {
                 out.byte(2)?;
                 put_outcome(&mut out, value)?;
             }
+            Reply::Capture(value) => {
+                out.byte(24)?;
+                crate::control_capture::put_observation(&mut out, value)?;
+            }
             Reply::MergeCommitted(value) => {
                 out.byte(18)?;
                 crate::control_merge::put_merged(&mut out, value)?;
@@ -192,6 +196,7 @@ impl Answer {
                 binding: binding(&mut input)?,
             },
             2 => Reply::Committed(outcome(&mut input)?),
+            24 => Reply::Capture(crate::control_capture::observation(&mut input)?),
             18 => Reply::MergeCommitted(Box::new(crate::control_merge::merged(&mut input)?)),
             19 => Reply::Conflict(Box::new(crate::control_merge::report(&mut input)?)),
             20 => Reply::Sdk(crate::control_sdk::value(&mut input, 0)?),

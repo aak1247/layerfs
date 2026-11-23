@@ -50,6 +50,10 @@ pub enum Request {
     /// Capture the published frontier, construct it in the daemon, merge it
     /// with a moved head unless forced, Save and publish.
     Commit(crate::control_merge::CommitControl),
+    /// Capture one explicitly identified frontier without merging a moved head.
+    Capture(crate::control_capture::CaptureControl),
+    /// Observe only the original capture and its exact Store receipt.
+    ObserveCapture(crate::control_capture::CaptureControl),
     /// Observe maintained local state without reading or refreshing the Store.
     Status(WorkspaceToken),
     /// Terminally close a quiescent local binding and transfer cleanup to the
@@ -221,6 +225,8 @@ pub enum Reply {
     },
     /// Original known history outcome after paired local installation.
     Committed(CommitOutcome),
+    /// Original external capture observation, never permission to resend.
+    Capture(crate::control_capture::CaptureObservation),
     /// A Commit published after merging with a moved head.
     MergeCommitted(Box<crate::control_merge::MergedCommit>),
     /// The value an SDK call returned.

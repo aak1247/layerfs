@@ -62,6 +62,11 @@ pub(crate) fn require_new(db: &Overlay, identity: ExternalCapture) -> OverlayRes
             "external capture capability or identity",
         ));
     }
+    if super::durable_conflict_stage::active_conflict(db)?.is_some() {
+        return Err(OverlayError::Invalid(
+            "external capture has pending conflict",
+        ));
+    }
     let exists: Vec<bool> = db.query(
         StatementKind::Frontier,
         "SELECT EXISTS(SELECT 1 FROM durable_external_capture WHERE capture_id=?1)",
@@ -276,6 +281,34 @@ pub(crate) fn observe(
             .filter(|v| *v > 0)
             .ok_or(OverlayError::Invalid("external capture record number"))
     };
+    let attempt = fixed(attempt)?;
+    let workspace = fixed(workspace)?;
+    let catalog = fixed(catalog)?;
+    let base_root = fixed(base_root)?;
+    positive(incarnation)?;
+    positive(namespace)?;
+    positive(generation)?;
+    if revision < 0 {
+        return Err(OverlayError::Invalid("external capture revision"));
+    }
+    let original = crate::Capture {
+        engine: db.engine(),
+        generation: crate::Generation(generation),
+        revision,
+        base_root,
+    };
+    if super::durable_attempt::identity(
+        &workspace,
+        &catalog,
+        incarnation,
+        namespace,
+        original,
+        &snapshot,
+        None,
+    ) != attempt
+    {
+        return Err(OverlayError::Invalid("external capture attempt identity"));
+    }
     let publication = match (request, digest, candidate, target) {
         (None, None, None, None) => None,
         (Some(request), Some(digest), Some(candidate), Some(target_snapshot)) => {
@@ -300,15 +333,15 @@ pub(crate) fn observe(
     };
     Ok(Some(ExternalCaptureRecord {
         identity,
-        attempt: fixed(attempt)?,
-        workspace: fixed(workspace)?,
-        catalog: fixed(catalog)?,
+        attempt,
+        workspace,
+        catalog,
         incarnation: positive(incarnation)?,
         namespace: positive(namespace)?,
         generation: positive(generation)?,
         revision: u64::try_from(revision)
             .map_err(|_| OverlayError::Invalid("external capture revision"))?,
-        base_root: fixed(base_root)?,
+        base_root,
         original_snapshot: snapshot,
         publication,
         disposition: match disposition {

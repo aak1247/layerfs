@@ -11,6 +11,7 @@ pub mod commit_types;
 mod conflict_paths;
 pub mod digests;
 pub mod durable_bind;
+mod external_capture;
 pub mod hints;
 pub mod open;
 pub mod operation;

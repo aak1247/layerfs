@@ -410,3 +410,30 @@ fn branch_page_bounds_are_checked_before_encoding_or_allocating_records() {
         "branches result window"
     );
 }
+
+#[test]
+fn legacy_commit_control_and_uptodate_reply_keep_original_wire_bytes() {
+    let command = Call {
+        id: 9,
+        request: Request::Commit(CommitControl {
+            token: token(),
+            force: false,
+            message: None,
+        }),
+    };
+    let mut request_bytes = b"LFSC\x01\0\0\0\0\0\0\0\x09\x02".to_vec();
+    request_bytes.extend_from_slice(&[3; 32]);
+    request_bytes.extend_from_slice(b"\0\0\0\0\0\0\0\x07\0\0");
+    assert_eq!(command.encode().unwrap(), request_bytes);
+    assert_eq!(Call::decode(&request_bytes).unwrap(), command);
+
+    let root = ObjectId::for_bytes(b"legacy-capture-control-root");
+    let answer = Answer {
+        id: 9,
+        reply: Reply::Committed(CommitOutcome::UpToDate { head: None, root }),
+    };
+    let mut reply_bytes = b"LFSA\x02\0\0\0\0\0\0\0\x09\x02\x02\0".to_vec();
+    reply_bytes.extend_from_slice(root.as_bytes());
+    assert_eq!(answer.encode().unwrap(), reply_bytes);
+    assert_eq!(Answer::decode(&reply_bytes).unwrap(), answer);
+}

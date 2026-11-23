@@ -164,6 +164,10 @@ fn boolean(value: u8) -> Result<bool, ControlError> {
     }
 }
 
+pub use crate::control_capture::{
+    CaptureControl, CaptureIdentity, CaptureObservation, CaptureOutcome, CaptureProof,
+    CapturePurpose,
+};
 pub use crate::control_forced::{
     AbortDisposition, CommitKnowledge, DetachDisposition, ForceUnmounted, ForcedCleanup,
     ForcedFacts, ForcedOutcome,

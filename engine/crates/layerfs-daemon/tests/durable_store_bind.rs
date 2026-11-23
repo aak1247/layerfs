@@ -1771,6 +1771,29 @@ fn recorded_conflict_keeps_markers_until_resolved_then_publishes_once() {
     assert!(refused_capture.recorded.is_none());
     assert_eq!(owner2.client().state(second.route()).unwrap(), state);
     assert_eq!(observed_external(&owner2, &second, capture), None);
+    // The lower-level public Overlay route must refuse the same conflict too,
+    // before capture advances any generation or writes an external record.
+    let catalog = store.history().catalog_id().to_bytes();
+    let incarnation = store.history().incarnation();
+    let snapshot = layerfs_bridge::snapshot::encode(&second.snapshot().unwrap()).unwrap();
+    let direct = owner2
+        .client()
+        .call(second.route(), ServiceClass::General, None, move |db| {
+            db.capture_external(capture, id2.to_bytes(), catalog, incarnation, &snapshot)
+        })
+        .unwrap_err();
+    let cause = match &direct {
+        OwnerError::Attempted(failed) => failed.cause.as_ref(),
+        cause => cause,
+    };
+    assert!(matches!(
+        cause,
+        OwnerError::Overlay(OverlayError::Invalid(
+            "external capture has pending conflict"
+        ))
+    ));
+    assert_eq!(owner2.client().state(second.route()).unwrap(), state);
+    assert_eq!(observed_external(&owner2, &second, capture), None);
     assert_eq!(read(&second, "file-000000"), marker);
     assert_eq!(
         second.pending_conflicts().unwrap(),
@@ -2756,5 +2779,226 @@ fn legacy_binding_requires_external_namespace_freshness() {
     assert_eq!(version, 40);
     drop(connection);
     drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn capture_control_observes_original_receipt_and_reads_its_root_after_head_moves() {
+    use layerfs_bridge::control::{
+        Answer, Call, CaptureControl, CaptureIdentity, CaptureObservation,
+        CapturePurpose as WirePurpose,
+    };
+
+    let fixture = support::Fixture::new_durable(2, "capture-control-root");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("capture-control-durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let identity = WorkspaceId::from_authority([42; 32]).unwrap();
+    let owner = Owner::create_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: identity,
+                branch: fixture.branch,
+            },
+            initial,
+        )
+        .unwrap()
+        .workspace;
+    let mut captured = support::bytes(0);
+    captured[0] = b'A';
+    write(&workspace, "file-000000", &captured);
+    let service = Service::new(store.clone(), &owner);
+    let token = service.register_durable(workspace).unwrap();
+    let control = CaptureControl {
+        token,
+        identity: CaptureIdentity {
+            id: [111; 32],
+            scope_digest: [89; 32],
+            purpose: WirePurpose::ManagedWorkspace,
+        },
+    };
+    let call = Call {
+        id: 7,
+        request: Request::Capture(control),
+    };
+    assert_eq!(Call::decode(&call.encode().unwrap()).unwrap(), call);
+    let result = service.execute_control(&call.request).unwrap();
+    let Reply::Capture(CaptureObservation::Published(proof)) = result.reply else {
+        panic!("original capture did not return a proved receipt")
+    };
+    let receipt = proof.sha256().unwrap();
+    assert_eq!(
+        layerfs_bridge::control::CaptureProof::decode(&proof.encode().unwrap()).unwrap(),
+        *proof
+    );
+    let answer = Answer {
+        id: call.id,
+        reply: Reply::Capture(CaptureObservation::Published(proof.clone())),
+    };
+    assert_eq!(Answer::decode(&answer.encode().unwrap()).unwrap(), answer);
+    let observed = || {
+        service
+            .execute_control(&Request::ObserveCapture(control))
+            .unwrap()
+            .reply
+    };
+    assert_eq!(
+        observed(),
+        Reply::Capture(CaptureObservation::Published(proof.clone()))
+    );
+    assert!(service.execute_control(&call.request).is_err());
+    let wrong_scope = CaptureControl {
+        identity: CaptureIdentity {
+            scope_digest: [90; 32],
+            ..control.identity
+        },
+        ..control
+    };
+    assert_eq!(
+        service
+            .execute_control(&Request::ObserveCapture(wrong_scope))
+            .unwrap()
+            .reply,
+        Reply::Capture(CaptureObservation::Unknown)
+    );
+    assert!(service.open_captured_root(wrong_scope, receipt).is_err());
+    assert!(service.open_captured_root(control, [9; 32]).is_err());
+    let handle = service.open_captured_root(control, receipt).unwrap();
+    assert_eq!(
+        service
+            .read_captured_range(&handle, token, "file-000000", 0, captured.len() as u32)
+            .unwrap(),
+        captured
+    );
+    assert!(service
+        .read_captured_range(&handle, token, "../file-000000", 0, 1)
+        .is_err());
+    assert!(service
+        .read_captured_range(&handle, token, "file-000000", 0, 48 * 1024 + 1)
+        .is_err());
+    assert!(service
+        .read_captured_range(&handle, token, "file-000000", captured.len() as u64, 1)
+        .is_err());
+    let stale = WorkspaceToken {
+        namespace: token.namespace + 1,
+        ..token
+    };
+    assert!(service
+        .read_captured_range(&handle, stale, "file-000000", 0, 1)
+        .is_err());
+    assert!(service
+        .open_captured_root(
+            CaptureControl {
+                token: stale,
+                ..control
+            },
+            receipt
+        )
+        .is_err());
+
+    let operation = service.operation(token).unwrap();
+    access_operation(&operation, |operation, view| {
+        let file = view
+            .lookup(
+                operation.overlay(),
+                view.root_serial(),
+                &PathName::new("file-000000").unwrap(),
+            )
+            .unwrap();
+        let changed = [b'B'];
+        let result = operation
+            .workspace()
+            .mutate(
+                operation.overlay(),
+                operation.ports(),
+                view,
+                Operation::Write {
+                    serial: file.serial,
+                    position: Position::At(0),
+                    data: changed.as_slice().into(),
+                },
+                Time {
+                    seconds: file.metadata.mtime_seconds,
+                    nanoseconds: file.metadata.mtime_nanoseconds,
+                },
+            )
+            .unwrap();
+        let Outcome::Applied { publication, .. } = result else {
+            panic!("write was not applied")
+        };
+        operation.overlay().reply_attempted(publication).unwrap();
+    });
+    drop(operation);
+    let advanced = service
+        .execute_control(&Request::Commit(CommitControl {
+            token,
+            force: false,
+            message: None,
+        }))
+        .unwrap();
+    assert!(matches!(
+        advanced.reply,
+        Reply::Committed(CommitOutcome::Committed { .. })
+    ));
+    assert_eq!(
+        observed(),
+        Reply::Capture(CaptureObservation::Published(proof.clone()))
+    );
+    assert_eq!(
+        service
+            .read_captured_range(&handle, token, "file-000000", 0, captured.len() as u32)
+            .unwrap(),
+        captured
+    );
+    let reopen = service.open_captured_root(control, receipt).unwrap();
+    assert_eq!(
+        service
+            .read_captured_range(&reopen, token, "file-000000", 0, 1)
+            .unwrap(),
+        b"A"
+    );
+    assert!(matches!(
+        service
+            .execute_control(&Request::Unmount(UnmountControl {
+                token,
+                discard: false
+            }))
+            .unwrap()
+            .reply,
+        Reply::Unmounted(_)
+    ));
+    assert!(service
+        .read_captured_range(&handle, token, "file-000000", 0, 1)
+        .is_err());
+    drop((handle, reopen, service));
+    owner.stop().unwrap();
+    drop(store);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: (i64, i64) = history
+        .query_row(
+            "SELECT count(*),count(DISTINCT attempt_id) FROM checkpoint_receipt",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipts, (2, 2));
+    drop(history);
     fixture.cleanup();
 }
