@@ -2,8 +2,8 @@
 use super::WorkspaceApi;
 use crate::OperationFailure;
 use layerfs_bridge::control::{
-    CaptureControl, CaptureObservation, CaptureOpen, CaptureProof, CaptureReadHandle,
-    CaptureReadRequest, Reply, Request,
+    CaptureControl, CaptureList, CaptureObservation, CaptureOpen, CapturePage, CapturePath,
+    CaptureProof, CaptureReadHandle, CaptureReadRequest, CaptureStat, Reply, Request,
 };
 
 /// A captured root owned by the same authenticated control connection.
@@ -83,6 +83,60 @@ impl WorkspaceApi<'_> {
         let request = Request::CloseCapture(captured.handle);
         match self.exchange(request.clone())? {
             Reply::CaptureClosed(_) => Ok(()),
+            reply => Err(OperationFailure::unexpected(request, reply)),
+        }
+    }
+
+    /// Reads original metadata without following the selected link.
+    pub fn stat_captured(
+        &mut self,
+        captured: &CapturedWorkspace,
+        path: &str,
+    ) -> Result<CaptureStat, Box<OperationFailure>> {
+        let request = Request::StatCapture(CapturePath {
+            handle: captured.handle,
+            path: path.into(),
+        });
+        match self.exchange(request.clone())? {
+            Reply::CaptureStat(value) => Ok(value),
+            reply => Err(OperationFailure::unexpected(request, reply)),
+        }
+    }
+
+    /// Lists one bounded page using this connection's directory-bound cursor.
+    pub fn list_captured(
+        &mut self,
+        captured: &CapturedWorkspace,
+        path: &str,
+        cursor: Option<[u8; 32]>,
+        limit: u16,
+    ) -> Result<CapturePage, Box<OperationFailure>> {
+        let request = Request::ListCapture(CaptureList {
+            path: CapturePath {
+                handle: captured.handle,
+                path: path.into(),
+            },
+            cursor,
+            limit,
+        });
+        match self.exchange(request.clone())? {
+            Reply::CapturePage(value) => Ok(value),
+            reply => Err(OperationFailure::unexpected(request, reply)),
+        }
+    }
+
+    /// Reads exact stored symbolic-link bytes without following the link.
+    pub fn readlink_captured(
+        &mut self,
+        captured: &CapturedWorkspace,
+        path: &str,
+    ) -> Result<Vec<u8>, Box<OperationFailure>> {
+        let request = Request::ReadlinkCapture(CapturePath {
+            handle: captured.handle,
+            path: path.into(),
+        });
+        match self.exchange(request.clone())? {
+            Reply::CaptureLink(value) => Ok(value.target),
             reply => Err(OperationFailure::unexpected(request, reply)),
         }
     }

@@ -60,6 +60,12 @@ pub enum Request {
     ReadCapture(crate::control_capture_read::CaptureReadRequest),
     /// Release this connection's captured-root handle without closing its Workspace.
     CloseCapture(crate::control_capture_read::CaptureReadHandle),
+    /// Read portable metadata at one path without following its last link.
+    StatCapture(crate::control_capture_tree::CapturePath),
+    /// List one bounded page of an original captured directory.
+    ListCapture(crate::control_capture_tree::CaptureList),
+    /// Read the exact stored target of a captured symbolic link.
+    ReadlinkCapture(crate::control_capture_tree::CapturePath),
     /// Observe maintained local state without reading or refreshing the Store.
     Status(WorkspaceToken),
     /// Terminally close a quiescent local binding and transfer cleanup to the
@@ -239,6 +245,12 @@ pub enum Reply {
     CaptureRead(crate::control_capture_read::CaptureReadResult),
     /// The connection-local read handle was released.
     CaptureClosed(crate::control_capture_read::CaptureReadHandle),
+    /// Original captured inode metadata.
+    CaptureStat(crate::control_capture_tree::CaptureStat),
+    /// Original captured directory page.
+    CapturePage(crate::control_capture_tree::CapturePage),
+    /// Original captured symbolic-link target.
+    CaptureLink(crate::control_capture_tree::CaptureLink),
     /// A Commit published after merging with a moved head.
     MergeCommitted(Box<crate::control_merge::MergedCommit>),
     /// The value an SDK call returned.

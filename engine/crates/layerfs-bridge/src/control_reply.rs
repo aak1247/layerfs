@@ -69,6 +69,18 @@ impl Answer {
                 out.byte(27)?;
                 crate::control_capture_read::put_handle(&mut out, *value)?;
             }
+            Reply::CaptureStat(value) => {
+                out.byte(28)?;
+                crate::control_capture_tree::put_stat(&mut out, value)?;
+            }
+            Reply::CapturePage(value) => {
+                out.byte(29)?;
+                crate::control_capture_tree::put_page(&mut out, value)?;
+            }
+            Reply::CaptureLink(value) => {
+                out.byte(30)?;
+                crate::control_capture_tree::put_link(&mut out, value)?;
+            }
             Reply::MergeCommitted(value) => {
                 out.byte(18)?;
                 crate::control_merge::put_merged(&mut out, value)?;
@@ -212,6 +224,9 @@ impl Answer {
             25 => Reply::CaptureOpened(crate::control_capture_read::handle(&mut input)?),
             26 => Reply::CaptureRead(crate::control_capture_read::result(&mut input)?),
             27 => Reply::CaptureClosed(crate::control_capture_read::handle(&mut input)?),
+            28 => Reply::CaptureStat(crate::control_capture_tree::stat(&mut input)?),
+            29 => Reply::CapturePage(crate::control_capture_tree::page(&mut input)?),
+            30 => Reply::CaptureLink(crate::control_capture_tree::link(&mut input)?),
             18 => Reply::MergeCommitted(Box::new(crate::control_merge::merged(&mut input)?)),
             19 => Reply::Conflict(Box::new(crate::control_merge::report(&mut input)?)),
             20 => Reply::Sdk(crate::control_sdk::value(&mut input, 0)?),

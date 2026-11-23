@@ -303,6 +303,9 @@ fn matches_reply(request: &Request, reply: &Reply) -> bool {
                 && result.bytes.len() == read.length as usize
         }
         (Request::CloseCapture(handle), Reply::CaptureClosed(closed)) => handle == closed,
+        (Request::StatCapture(path), Reply::CaptureStat(value)) => path == &value.path,
+        (Request::ListCapture(request), Reply::CapturePage(value)) => request == &value.request,
+        (Request::ReadlinkCapture(path), Reply::CaptureLink(value)) => path == &value.path,
         (Request::Status(token), Reply::Status(status)) => *token == status.token,
         (Request::Unmount(control), Reply::Unmounted(closed)) => control.token == *closed,
         (Request::Unmount(control), Reply::Dirty(report)) => control.token == report.token,

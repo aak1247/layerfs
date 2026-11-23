@@ -66,6 +66,18 @@ impl Call {
                 out.byte(26)?;
                 crate::control_capture_read::put_handle(&mut out, *value)?;
             }
+            Request::StatCapture(value) => {
+                out.byte(27)?;
+                crate::control_capture_tree::put_path(&mut out, value)?;
+            }
+            Request::ListCapture(value) => {
+                out.byte(28)?;
+                crate::control_capture_tree::put_list(&mut out, value)?;
+            }
+            Request::ReadlinkCapture(value) => {
+                out.byte(29)?;
+                crate::control_capture_tree::put_path(&mut out, value)?;
+            }
             Request::Status(token) => {
                 out.byte(3)?;
                 put_token(&mut out, *token)?;
@@ -177,6 +189,9 @@ impl Call {
             24 => Request::OpenCapture(crate::control_capture_read::open(&mut input)?),
             25 => Request::ReadCapture(crate::control_capture_read::read(&mut input)?),
             26 => Request::CloseCapture(crate::control_capture_read::handle(&mut input)?),
+            27 => Request::StatCapture(crate::control_capture_tree::path(&mut input)?),
+            28 => Request::ListCapture(crate::control_capture_tree::list(&mut input)?),
+            29 => Request::ReadlinkCapture(crate::control_capture_tree::path(&mut input)?),
             20 => Request::Sdk(crate::control_sdk::call(&mut input)?),
             3 => Request::Status(token(&mut input)?),
             4 => Request::Unmount(crate::control_unmount::unmount(&mut input)?),

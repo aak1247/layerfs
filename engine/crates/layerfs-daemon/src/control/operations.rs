@@ -121,7 +121,8 @@ impl Service {
             }),
             Request::Capture(control) => self.capture_external(*control),
             Request::ObserveCapture(control) => self.observe_capture(*control),
-            Request::OpenCapture(_) | Request::ReadCapture(_) | Request::CloseCapture(_) => Err(
+            Request::OpenCapture(_) | Request::ReadCapture(_) | Request::CloseCapture(_)
+            | Request::StatCapture(_) | Request::ListCapture(_) | Request::ReadlinkCapture(_) => Err(
                 Failure::Rejected(ControlCode::Invalid, "capture read requires its authenticated connection"),
             ),
             Request::Unmount(control) => {

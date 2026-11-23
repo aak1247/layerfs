@@ -8,12 +8,12 @@ mod support;
 use layerfs_api::internal::{self, Control};
 use layerfs_bridge::{
     control::{
-        CaptureControl, CaptureIdentity, CapturePurpose, CommitControl, Reply, Request,
-        UnmountControl, WorkspaceToken,
+        CaptureControl, CaptureIdentity, CaptureKind, CapturePurpose, CommitControl, Reply,
+        Request, UnmountControl, WorkspaceToken,
     },
     duplex,
 };
-use layerfs_content::filesystem::PathName;
+use layerfs_content::filesystem::{PathName, SymlinkTarget};
 use layerfs_daemon::{
     bootstrap::open_store,
     control::{CaptureSession, Service},
@@ -114,6 +114,56 @@ fn original_bytes() -> Vec<u8> {
     bytes[0] = b'A';
     bytes
 }
+fn add_tree(operation: &StoreOperation) {
+    for name in ["dir-a", "dir-b"] {
+        access(operation, |operation, view| {
+            let result = operation
+                .workspace()
+                .mutate(
+                    operation.overlay(),
+                    operation.ports(),
+                    view,
+                    Operation::Mkdir {
+                        parent: view.root_serial(),
+                        name: PathName::new(name).unwrap(),
+                        mode: 0o755,
+                    },
+                    Time {
+                        seconds: 123,
+                        nanoseconds: 456,
+                    },
+                )
+                .unwrap();
+            let Outcome::Applied { publication, .. } = result else {
+                panic!("mkdir not applied")
+            };
+            operation.overlay().reply_attempted(publication).unwrap();
+        });
+    }
+    access(operation, |operation, view| {
+        let result = operation
+            .workspace()
+            .mutate(
+                operation.overlay(),
+                operation.ports(),
+                view,
+                Operation::Symlink {
+                    parent: view.root_serial(),
+                    name: PathName::new("link").unwrap(),
+                    target: SymlinkTarget::new(b"../outside-\xff".to_vec()).unwrap(),
+                },
+                Time {
+                    seconds: 123,
+                    nanoseconds: 456,
+                },
+            )
+            .unwrap();
+        let Outcome::Applied { publication, .. } = result else {
+            panic!("symlink not applied")
+        };
+        operation.overlay().reply_attempted(publication).unwrap();
+    });
+}
 fn connect(address: SocketAddr) -> Control {
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
     stream
@@ -184,6 +234,7 @@ fn child(dir: &Path) {
         .unwrap()
         .workspace;
     write_bytes(&workspace.operation().unwrap(), &original_bytes());
+    add_tree(&workspace.operation().unwrap());
     let service = Service::new(store.clone(), &owner);
     assert_eq!(service.register_durable(workspace).unwrap(), token());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -326,6 +377,67 @@ fn original_capture_read_handles_are_connection_local_across_processes() {
             .unwrap(),
         b"A"
     );
+    let root_stat = internal::workspace(&mut first)
+        .stat_captured(&first_handle, "")
+        .unwrap();
+    assert_eq!(
+        (root_stat.kind, root_stat.namespace_references),
+        (CaptureKind::Directory, 0)
+    );
+    let file_stat = internal::workspace(&mut first)
+        .stat_captured(&first_handle, "file-000000")
+        .unwrap();
+    assert_eq!(
+        (
+            file_stat.kind,
+            file_stat.size,
+            file_stat.namespace_references
+        ),
+        (CaptureKind::File, 48 * 1024, 1)
+    );
+    assert!(file_stat.portable_attributes_only);
+    let link_stat = internal::workspace(&mut first)
+        .stat_captured(&first_handle, "link")
+        .unwrap();
+    assert_eq!(
+        (link_stat.kind, link_stat.size),
+        (CaptureKind::Symlink, b"../outside-\xff".len() as u64)
+    );
+    assert_eq!(
+        internal::workspace(&mut first)
+            .readlink_captured(&first_handle, "link")
+            .unwrap(),
+        b"../outside-\xff"
+    );
+    assert!(internal::workspace(&mut first)
+        .read_captured(&first_handle, "link/file", 0, 1)
+        .is_err());
+
+    let first_page = internal::workspace(&mut first)
+        .list_captured(&first_handle, "", None, 2)
+        .unwrap();
+    assert_eq!(first_page.names, ["dir-a", "dir-b"]);
+    let first_cursor = first_page.continuation.unwrap();
+    assert!(internal::workspace(&mut first)
+        .list_captured(&first_handle, "dir-a", Some(first_cursor), 2)
+        .is_err());
+    let second_page = internal::workspace(&mut first)
+        .list_captured(&first_handle, "", Some(first_cursor), 2)
+        .unwrap();
+    assert_eq!(second_page.names, ["file-000000", "file-000001"]);
+    assert!(internal::workspace(&mut first)
+        .list_captured(&first_handle, "", Some(first_cursor), 2)
+        .is_err());
+    let third_page = internal::workspace(&mut first)
+        .list_captured(&first_handle, "", second_page.continuation, 2)
+        .unwrap();
+    assert_eq!(third_page.names, ["link"]);
+    assert_eq!(third_page.continuation, None);
+    let old_cursor = internal::workspace(&mut first)
+        .list_captured(&first_handle, "", None, 2)
+        .unwrap()
+        .continuation
+        .unwrap();
     assert!(internal::workspace(&mut first)
         .open_captured(capture(), sha)
         .is_err());
@@ -339,6 +451,16 @@ fn original_capture_read_handles_are_connection_local_across_processes() {
     let second_handle = internal::workspace(&mut second)
         .open_captured(capture(), sha)
         .unwrap();
+    assert!(internal::workspace(&mut second)
+        .list_captured(&second_handle, "", Some(old_cursor), 2)
+        .is_err());
+    assert_eq!(
+        internal::workspace(&mut second)
+            .list_captured(&second_handle, "", None, 2)
+            .unwrap()
+            .names,
+        ["dir-a", "dir-b"]
+    );
     assert!(internal::workspace(&mut second)
         .read_captured(&first_handle, "file-000000", 0, 1)
         .is_err());
@@ -368,6 +490,15 @@ fn original_capture_read_handles_are_connection_local_across_processes() {
     ));
     assert!(internal::workspace(&mut second)
         .read_captured(&third_handle, "file-000000", 0, 1)
+        .is_err());
+    assert!(internal::workspace(&mut second)
+        .stat_captured(&third_handle, "")
+        .is_err());
+    assert!(internal::workspace(&mut second)
+        .list_captured(&third_handle, "", None, 2)
+        .is_err());
+    assert!(internal::workspace(&mut second)
+        .readlink_captured(&third_handle, "link")
         .is_err());
     assert!(matches!(
         second.call(Request::EndSession).unwrap(),

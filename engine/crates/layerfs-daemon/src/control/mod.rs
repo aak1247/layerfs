@@ -4,6 +4,7 @@ mod attach;
 mod capture;
 mod capture_read;
 mod capture_session;
+mod capture_tree;
 #[cfg(target_os = "linux")]
 mod catalog_transition;
 mod cleanup;

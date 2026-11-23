@@ -20,11 +20,11 @@ const RANGE_LIMIT: u32 = 48 * 1024;
 pub struct CapturedRoot {
     token: WorkspaceToken,
     workspace: Weak<BoundWorkspace>,
-    ports: Arc<StorePorts>,
-    root: FilesystemRootId,
+    pub(super) ports: Arc<StorePorts>,
+    pub(super) root: FilesystemRootId,
 }
 
-fn content(error: ContentError, ports: &StorePorts) -> Failure {
+pub(super) fn content(error: ContentError, ports: &StorePorts) -> Failure {
     Failure::CaptureRead(CommitError::Content {
         error,
         provider: ports.failure().ok().flatten(),
@@ -47,6 +47,27 @@ impl Service {
             ));
         }
         Ok(value.workspace.clone())
+    }
+
+    pub(super) fn verify_captured(
+        &self,
+        handle: &CapturedRoot,
+        token: WorkspaceToken,
+    ) -> Result<(), Failure> {
+        if token != handle.token {
+            return Err(Failure::Rejected(
+                ControlCode::Invalid,
+                "capture read scope",
+            ));
+        }
+        let current = self.capture_read_workspace(token)?;
+        if !Weak::ptr_eq(&Arc::downgrade(&current), &handle.workspace) {
+            return Err(Failure::Rejected(
+                ControlCode::Invalid,
+                "capture Workspace changed",
+            ));
+        }
+        Ok(())
     }
 
     /// Opens the original receipt's root, never a caller-selected object ID.
@@ -104,19 +125,13 @@ impl Service {
         offset: u64,
         length: u32,
     ) -> Result<Vec<u8>, Failure> {
-        if token != handle.token || length > RANGE_LIMIT {
+        if length > RANGE_LIMIT {
             return Err(Failure::Rejected(
                 ControlCode::Invalid,
                 "capture read scope or range",
             ));
         }
-        let current = self.capture_read_workspace(token)?;
-        if !Weak::ptr_eq(&Arc::downgrade(&current), &handle.workspace) {
-            return Err(Failure::Rejected(
-                ControlCode::Invalid,
-                "capture Workspace changed",
-            ));
-        }
+        self.verify_captured(handle, token)?;
         let end = offset
             .checked_add(u64::from(length))
             .ok_or(Failure::Rejected(
@@ -153,13 +168,7 @@ impl Service {
                 "capture read length changed",
             ));
         }
-        let current = self.capture_read_workspace(token)?;
-        if !Weak::ptr_eq(&Arc::downgrade(&current), &handle.workspace) {
-            return Err(Failure::Rejected(
-                ControlCode::Invalid,
-                "capture Workspace changed during read",
-            ));
-        }
+        self.verify_captured(handle, token)?;
         Ok(bytes)
     }
 }
