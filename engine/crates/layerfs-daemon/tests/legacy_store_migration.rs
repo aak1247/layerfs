@@ -798,6 +798,23 @@ fn ready_current_overlay_keeps_legacy_store_readable_without_receipts() {
     opened.store.close_reader(record.workspace).unwrap();
     owner.stop().unwrap();
     drop(opened);
+    let overlay = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(
+        overlay
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        45
+    );
+    assert_eq!(
+        overlay
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='durable_external_capture'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
 }
 
 mod interrupted_catalog {
@@ -813,7 +830,7 @@ mod interrupted_catalog {
         io::{ErrorKind, Write},
         process::{Command, Stdio},
         sync::{
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Mutex,
         },
         thread,
@@ -823,6 +840,7 @@ mod interrupted_catalog {
     const CHILD: &str = "LAYERFS_TEST_INTERRUPTED_CATALOG_CHILD";
     static WATCHED: Mutex<Option<(u64, u64)>> = Mutex::new(None);
     static FIRED: AtomicU64 = AtomicU64::new(0);
+    static FAIL_CAPTURE_EXTENSION: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "C" fn authorize(
         _: *mut c_void,
@@ -832,9 +850,14 @@ mod interrupted_catalog {
         _: *const c_char,
         _: *const c_char,
     ) -> c_int {
+        let table = if FAIL_CAPTURE_EXTENSION.load(Ordering::Relaxed) {
+            &b"durable_external_capture"[..]
+        } else {
+            &b"durable_owner_counts"[..]
+        };
         if action == ffi::SQLITE_CREATE_TABLE
             && !first.is_null()
-            && unsafe { CStr::from_ptr(first) }.to_bytes() == b"durable_owner_counts"
+            && unsafe { CStr::from_ptr(first) }.to_bytes() == table
         {
             FIRED.fetch_add(1, Ordering::Relaxed);
             return ffi::SQLITE_DENY;
@@ -1271,7 +1294,7 @@ mod interrupted_catalog {
             assert_eq!(
                 db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                45
+                46
             );
             assert_eq!(
                 db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
@@ -1493,7 +1516,7 @@ mod interrupted_catalog {
             assert_eq!(
                 db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                if index == 0 { 45 } else { 41 }
+                if index == 0 { 46 } else { 41 }
             );
             assert_eq!(
                 db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
@@ -1518,7 +1541,7 @@ mod interrupted_catalog {
                 .iter()
                 .map(|entry| entry.source_version())
                 .collect::<Vec<_>>(),
-            vec![45, 41, 41]
+            vec![46, 41, 41]
         );
         for byte in [42_u8, 43, 44] {
             cohort_lease_is_held(root, byte);
@@ -1527,6 +1550,178 @@ mod interrupted_catalog {
         owner.stop().unwrap();
         recover_cohort(root);
         assert_eq!(cohort_receipts(root), 0);
+    }
+
+    const CAPTURE_FAILURE_CHILD: &str = "LAYERFS_TEST_COHORT_CAPTURE_FAILURE_CHILD";
+
+    fn capture_failure_child(root: &Path) {
+        let target = fs::metadata(cohort_overlay(root, 43)).unwrap();
+        *WATCHED.lock().unwrap() = Some((target.dev(), target.ino()));
+        FAIL_CAPTURE_EXTENSION.store(true, Ordering::Relaxed);
+        // SAFETY: the SQLite callback is scoped to this child and the held
+        // test-owned Overlay connection, as in the legacy fault fixture.
+        unsafe { auto_extension::register_auto_extension(opened).unwrap() };
+        let owner = cohort_owner(root, "failed-capture-cohort.sqlite");
+        let plan = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(root.join("store-private/store.sqlite")).unwrap(),
+            &owner,
+        )
+        .unwrap();
+        assert!(auto_extension::cancel_auto_extension(opened));
+        let failure = plan.execute().err().unwrap();
+        assert!(matches!(failure.cause(),
+            CatalogCohortCause::Migration { index: 1, record: failed, failure }
+            if *failed == record(43) && matches!(failure.as_ref(),
+                layerfs_daemon::store::CatalogMigrationFailure::Upgrade {
+                    cause: layerfs_daemon::store::BindError::Owner(layerfs_daemon::OwnerError::Overlay(OverlayError::Sql(rusqlite::Error::SqliteFailure(error,_)))), ..
+                } if error.extended_code == ffi::SQLITE_AUTH)));
+        assert!(FIRED.load(Ordering::Relaxed) > 0);
+        let progress = failure.progress();
+        assert_eq!(progress.store_upgraded, Some(false));
+        assert_eq!(progress.completed.len(), 1);
+        assert_eq!(progress.completed[0].record, record(42));
+        assert_eq!(progress.completed[0].source_version, 45);
+        assert_eq!(progress.pending, vec![(1, record(43)), (1, record(44))]);
+        signal(&root.join("capture-failure-held"));
+        await_file(
+            &root.join("release-capture-failure"),
+            Duration::from_secs(30),
+        );
+        drop(failure);
+        drop(owner);
+    }
+
+    fn predecessor_schema(path: &Path) -> Vec<(String, String, String, Option<String>)> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut statement = db.prepare(
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name<>'durable_external_capture' ORDER BY type,name",
+        ).unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn cohort_capture_extension_rolls_back_middle_then_resumes_original_prefix() {
+        if let Some(root) = std::env::var_os(CAPTURE_FAILURE_CHILD) {
+            capture_failure_child(Path::new(&root));
+            return;
+        }
+        let fixture = Fixture::named("legacy_44_two_rosters");
+        let root = &fixture.0;
+        for byte in [42_u8, 43, 44] {
+            let ready = match OverlayCatalogRecovery::open(
+                &cohort_overlay(root, byte),
+                ProfileConfig::default(),
+                [byte; 32],
+            )
+            .unwrap()
+            {
+                OverlayCatalogRecovery::Ready(ready) => ready,
+                _ => panic!("expected original ready Workspace"),
+            };
+            let observed = ready.observed().clone();
+            let ready = ready.upgrade_legacy(&observed).unwrap();
+            assert_eq!(ready.preflight_upgrade(&observed).unwrap(), 45);
+            drop(ready);
+        }
+        let before = [42_u8, 43, 44].map(|byte| {
+            let path = cohort_overlay(root, byte);
+            let schema = predecessor_schema(&path);
+            assert_eq!(schema.len(), 49);
+            (
+                fs::metadata(&path).unwrap().ino(),
+                dirty_rows(&path),
+                schema,
+            )
+        });
+        let original_receipts = cohort_receipts(root);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("interrupted_catalog::cohort_capture_extension_rolls_back_middle_then_resumes_original_prefix")
+            .arg("--exact").arg("--nocapture").env(CAPTURE_FAILURE_CHILD, root)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !root.join("capture-failure-held").exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "capture failure child exited early"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "bounded capture failure handoff expired"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        for byte in [42_u8, 43, 44] {
+            cohort_lease_is_held(root, byte);
+        }
+        signal(&root.join("release-capture-failure"));
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for (index, byte) in [42_u8, 43, 44].into_iter().enumerate() {
+            let path = cohort_overlay(root, byte);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), before[index].0);
+            assert_eq!(dirty_rows(&path), before[index].1);
+            assert_eq!(predecessor_schema(&path), before[index].2);
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                if index == 0 { 46 } else { 45 }
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name='durable_external_capture'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                if index == 0 { 1 } else { 0 }
+            );
+        }
+        assert_eq!(cohort_receipts(root), original_receipts);
+        let owner = cohort_owner(root, "resumed-capture-cohort.sqlite");
+        let result = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(root.join("store-private/store.sqlite")).unwrap(),
+            &owner,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert_eq!(
+            result
+                .completed()
+                .iter()
+                .map(|entry| entry.source_version())
+                .collect::<Vec<_>>(),
+            vec![46, 45, 45]
+        );
+        drop(result);
+        owner.stop().unwrap();
+        for (index, byte) in [42_u8, 43, 44].into_iter().enumerate() {
+            let path = cohort_overlay(root, byte);
+            assert_eq!(predecessor_schema(&path), before[index].2);
+            assert_eq!(dirty_rows(&path), before[index].1);
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                46
+            );
+        }
+        assert_eq!(cohort_receipts(root), original_receipts);
+        recover_cohort(root);
     }
 
     #[test]
@@ -1572,6 +1767,112 @@ mod interrupted_catalog {
         drop(result);
         owner.stop().unwrap();
         assert_eq!(cohort_receipts(root), 0);
+    }
+
+    #[test]
+    fn cohort_preserves_an_existing_schema46_capture_and_original_receipt() {
+        use layerfs_bridge::control::{
+            CaptureControl, CaptureIdentity, CaptureObservation, CapturePurpose,
+        };
+        let fixture = Fixture::named("legacy_44_two_rosters");
+        let root = &fixture.0;
+        let store_path = root.join("store-private/store.sqlite");
+        let maintenance = cohort_owner(root, "first-capture-maintenance.sqlite");
+        let result = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(&store_path).unwrap(),
+            &maintenance,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert_eq!(result.completed().len(), 3);
+        drop(result);
+        maintenance.stop().unwrap();
+
+        let store = open_current(config(root).store);
+        let owner = cohort_owner(root, "capture-current-owner.sqlite");
+        let mut service = Service::new(store.clone(), &owner);
+        let tokens = service
+            .recover_durable_control(
+                &owner,
+                RecoverControlConfig {
+                    catalog_directory: root.join("sandbox-a/catalog"),
+                    overlay_directory: root.join("sandbox-a/overlays"),
+                    sandbox: [8; 32],
+                    profile: ProfileConfig::default(),
+                    minimum_namespace: 1,
+                    store_device: fs::metadata(&store_path).unwrap().dev(),
+                },
+            )
+            .unwrap();
+        assert_eq!(tokens.len(), 1);
+        let token = tokens[0];
+        let result = service
+            .execute_control(&Request::Capture(CaptureControl {
+                token,
+                identity: CaptureIdentity {
+                    id: [91; 32],
+                    scope_digest: [92; 32],
+                    purpose: CapturePurpose::ManagedWorkspace,
+                },
+            }))
+            .unwrap();
+        assert!(matches!(
+            result.reply,
+            Reply::Capture(CaptureObservation::Published(_))
+        ));
+        drop(service);
+        store.close_reader(token.workspace).unwrap();
+        owner.stop().unwrap();
+        drop(store);
+        assert_eq!(cohort_receipts(root), 1);
+
+        fn captured(path: &Path) -> Vec<rusqlite::types::Value> {
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let mut statement = db.prepare("SELECT capture_id,scope_digest,purpose,attempt,workspace,catalog,incarnation,namespace,generation,revision,base_root,snapshot,request,request_digest,candidate_root,target_snapshot,disposition FROM durable_external_capture").unwrap();
+            let count = statement.column_count();
+            statement
+                .query_row([], |row| (0..count).map(|index| row.get(index)).collect())
+                .unwrap()
+        }
+        fn receipts(path: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let mut statement = db
+                .prepare("SELECT * FROM checkpoint_receipt ORDER BY attempt_id")
+                .unwrap();
+            let count = statement.column_count();
+            statement
+                .query_map([], |row| (0..count).map(|index| row.get(index)).collect())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        }
+        let path = cohort_overlay(root, 42);
+        let original = captured(&path);
+        let original_receipts = receipts(&store_path);
+        assert_eq!(original_receipts.len(), 1);
+        let maintenance = cohort_owner(root, "repeat-capture-maintenance.sqlite");
+        let result = PreparedCatalogCohort::prepare(
+            cohort_configs(root),
+            fs::File::open(&store_path).unwrap(),
+            &maintenance,
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        assert_eq!(
+            result
+                .completed()
+                .iter()
+                .map(|entry| entry.source_version())
+                .collect::<Vec<_>>(),
+            vec![46, 46, 46]
+        );
+        drop(result);
+        maintenance.stop().unwrap();
+        assert_eq!(captured(&path), original);
+        assert_eq!(receipts(&store_path), original_receipts);
     }
 
     #[test]
@@ -1648,7 +1949,7 @@ mod interrupted_catalog {
             assert_eq!(
                 db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                45
+                46
             );
             assert_eq!(
                 db.query_row("SELECT high_namespace FROM durable_route", [], |row| row
@@ -1871,7 +2172,7 @@ mod interrupted_catalog {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            45
+            46
         );
         drop(db);
 

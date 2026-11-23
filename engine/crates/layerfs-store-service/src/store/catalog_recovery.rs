@@ -1,4 +1,6 @@
 //! One Store-authenticated catalog binding prepared under its original lease.
+#[cfg(target_os = "linux")]
+mod maintenance;
 use super::{
     bind::checked_base,
     conflict_paths::{ConflictDecoder, ConflictDescription},
@@ -794,94 +796,6 @@ impl Store {
             record,
             snapshot,
             conflict,
-        })
-    }
-
-    /// Migrate and checked-close one already authenticated Workspace for a
-    /// full-Store maintenance batch. The caller must retain its original
-    /// Store-wide writer and consumer fence and the original roster throughout.
-    /// This does not advance a namespace, register a Workspace or publish.
-    #[cfg(target_os = "linux")]
-    pub fn migrate_catalog_for_maintenance(
-        self: &Arc<Self>,
-        original: PreparedLegacyRecovery,
-    ) -> Result<MaintainedCatalogRecovery, Box<CatalogMigrationFailure>> {
-        let source_version = original.version;
-        let prepared = self.prepare_migrated_catalog_recovery(original)?;
-        let PreparedCatalogRecovery {
-            pending,
-            record,
-            request,
-            ..
-        } = prepared;
-        let verify_version = |result: layerfs_overlay::OverlayResult<i64>| {
-            result.and_then(|version| {
-                if matches!(version, 45 | 46) {
-                    Ok(())
-                } else {
-                    Err(layerfs_overlay::OverlayError::Invalid(
-                        "maintenance migration schema",
-                    ))
-                }
-            })
-        };
-        let (db, previous_namespace, disposition) = match (pending, record) {
-            (OverlayCatalogRecovery::Ready(ready), LocalRecord::Ready(observed)) => {
-                if let Err(cause) = verify_version(ready.preflight_upgrade(&observed)) {
-                    return Err(Box::new(CatalogMigrationFailure::Upgrade {
-                        cause: BindError::Owner(OwnerError::Overlay(cause)),
-                        custody: RetainedCatalogRecovery {
-                            _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
-                        },
-                    }));
-                }
-                let db = ready.complete(&observed).map_err(|(cause, ready)| {
-                    Box::new(CatalogMigrationFailure::Upgrade {
-                        cause: BindError::Owner(OwnerError::Overlay(cause)),
-                        custody: RetainedCatalogRecovery {
-                            _pending: Box::new(OverlayCatalogRecovery::Ready(ready)),
-                        },
-                    })
-                })?;
-                (
-                    db,
-                    observed.previous_namespace,
-                    MaintainedDisposition::Ready,
-                )
-            }
-            (OverlayCatalogRecovery::SettledConflict(value), LocalRecord::Conflict(observed)) => {
-                if let Err(cause) = verify_version(value.preflight_upgrade(&observed)) {
-                    return Err(Box::new(CatalogMigrationFailure::Upgrade {
-                        cause: BindError::Owner(OwnerError::Overlay(cause)),
-                        custody: RetainedCatalogRecovery {
-                            _pending: Box::new(OverlayCatalogRecovery::SettledConflict(value)),
-                        },
-                    }));
-                }
-                let namespace = observed.previous_namespace;
-                let db = value
-                    .complete_settled_active(&observed, namespace)
-                    .map_err(|(cause, value)| {
-                        Box::new(CatalogMigrationFailure::Upgrade {
-                            cause: BindError::Owner(OwnerError::Overlay(cause)),
-                            custody: RetainedCatalogRecovery {
-                                _pending: Box::new(OverlayCatalogRecovery::SettledConflict(value)),
-                            },
-                        })
-                    })?;
-                (db, namespace, MaintainedDisposition::SettledConflict)
-            }
-            _ => unreachable!("legacy migration prepared a settled Workspace"),
-        };
-        let closed = db
-            .close_database_file()
-            .map_err(|cause| Box::new(CatalogMigrationFailure::Close { cause }))?;
-        Ok(MaintainedCatalogRecovery {
-            request,
-            previous_namespace,
-            source_version,
-            disposition,
-            _closed: closed,
         })
     }
 }
