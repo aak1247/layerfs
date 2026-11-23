@@ -1,5 +1,5 @@
 //! One synchronous Content/Save/history producer and exact paired local install.
-use super::checkpoint::{CommitCapture, LiveCheckpoint, LiveConflict};
+use super::checkpoint::{CaptureIntent, CommitCapture, LiveCheckpoint, LiveConflict};
 use super::{
     bind::checked_base, BoundWorkspace, CommitError, CommitFailure, CommitOptions, CommitPhase,
     CommitSuccess, MergeReport,
@@ -59,6 +59,7 @@ impl BoundWorkspace {
                 || (),
                 &CommitOptions::default(),
                 CommitVia::Workspace,
+                CaptureIntent::Commit,
                 timing,
             )
         });
@@ -111,6 +112,7 @@ impl BoundWorkspace {
         published: impl FnOnce(),
         options: &CommitOptions,
         via: CommitVia,
+        intent: CaptureIntent,
         timing: &TimingScope<'_, Active>,
     ) -> Result<CommitRun, Box<CommitFailure>> {
         let force = options.force;
@@ -128,6 +130,16 @@ impl BoundWorkspace {
         let result = (|| {
             let snapshot = self.snapshot().map_err(CommitError::Workspace)?;
             retained.binding = Some(snapshot.clone());
+            if !intent.ordinary()
+                && self
+                    .pending_snapshot()
+                    .map_err(CommitError::Workspace)?
+                    .is_some()
+            {
+                return Err(CommitError::Context(
+                    "external capture has pending conflict",
+                ));
+            }
             let local = self.local_root(&snapshot)?;
             let original_base = self.workspace.base().map_err(CommitError::Workspace)?;
             // Nothing above the installed floor and the head where the
@@ -137,7 +149,8 @@ impl BoundWorkspace {
                 self.job(|job_client: &crate::OwnerClient, job_route| job_client.state(job_route))
                     .map_err(CommitError::Owner)
             })?;
-            if state.dirty_inodes == 0
+            if intent.ordinary()
+                && state.dirty_inodes == 0
                 && state.dirty_directory_entries == 0
                 && state.captured.is_none()
                 && state.consolidating.is_none()
@@ -167,7 +180,7 @@ impl BoundWorkspace {
                 }
             }
             retained.phase = CommitPhase::Capture;
-            let selected = phase(timing, "capture", || self.capture_commit(&snapshot))?;
+            let selected = phase(timing, "capture", || self.capture_commit(&snapshot, intent))?;
             let capture = selected.capture();
             retained.capture = Some(capture);
             retained.recorded = selected.recorded();
@@ -207,7 +220,9 @@ impl BoundWorkspace {
                 // again: if it moved meanwhile, only what landed in between
                 // is merged into the result, in memory, then published.
                 let current = phase(timing, "head", || {
-                    self.refuse_markers(&save, candidate)?;
+                    if intent.ordinary() {
+                        self.refuse_markers(&save, candidate)?;
+                    }
                     self.store
                         .history
                         .branch_snapshot(snapshot.branch.id)
@@ -216,6 +231,7 @@ impl BoundWorkspace {
                 })?;
                 let moved = current.branch.head_commit != snapshot.branch.head_commit
                     || current.branch.base_layer != snapshot.branch.base_layer;
+                intent.check_head(moved)?;
                 let root = if moved && !force {
                     let (root, report) = phase(timing, "merge", || {
                         self.merge_candidate(&save, &snapshot, &current, candidate)
@@ -279,6 +295,7 @@ impl BoundWorkspace {
                     {
                         (current, root, moved, logical)
                     } else {
+                        intent.check_head(true)?;
                         // The in-lane step has its own Save; its count and
                         // hints cover only what it changed in the result.
                         let step_save = storage.begin_save().map_err(CommitError::Storage)?;

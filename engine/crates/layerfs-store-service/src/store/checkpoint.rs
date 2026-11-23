@@ -11,8 +11,28 @@ use layerfs_history::{
 };
 use layerfs_overlay::{
     Capture, CapturedReader, CheckpointCompletion, ConflictCompletion, ConflictStage,
-    OperationOwner, RecordedCapture,
+    ExternalCapture, OperationOwner, RecordedCapture,
 };
+
+/// A background capture preserves its exact frontier and never merges a head
+/// that moved concurrently. Ordinary Commit retains its original semantics.
+#[derive(Clone, Copy)]
+pub(super) enum CaptureIntent {
+    Commit,
+    External(ExternalCapture),
+}
+impl CaptureIntent {
+    pub(super) fn ordinary(self) -> bool {
+        matches!(self, Self::Commit)
+    }
+
+    pub(super) fn check_head(self, moved: bool) -> Result<(), CommitError> {
+        if moved && !self.ordinary() {
+            return Err(CommitError::Context("external capture Branch changed"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum CommitCapture {
@@ -65,22 +85,27 @@ impl BoundWorkspace {
     pub(super) fn capture_commit(
         &self,
         snapshot: &BranchSnapshot,
+        intent: CaptureIntent,
     ) -> Result<CommitCapture, CommitError> {
         let identity = self.owner.durable_identity().map_err(CommitError::Owner)?;
         if let Some(identity) = identity {
             if identity != self.identity.to_bytes() {
                 return Err(CommitError::Context("checkpoint Workspace identity"));
             }
-            let (recorded, version) = self
+            let (recorded, external, version) = self
                 .job(|client, route| {
                     client.call(route, ServiceClass::General, None, |db| {
                         Ok((
                             db.profile().has_recorded_checkpoints(),
+                            db.profile().has_external_captures(),
                             db.profile().schema_version,
                         ))
                     })
                 })
                 .map_err(CommitError::Owner)?;
+            if matches!(intent, CaptureIntent::External(_)) && !external {
+                return Err(CommitError::Context("external capture format unavailable"));
+            }
             if recorded {
                 if !self.store.has_durable_writer() {
                     return Err(CommitError::History(HistoryError::Unsupported(
@@ -98,8 +123,18 @@ impl BoundWorkspace {
                 let catalog = history.catalog_id().to_bytes();
                 let incarnation = history.incarnation();
                 return self
-                    .job(|client, route| {
-                        client.capture_checkpoint(route, identity, catalog, incarnation, bytes)
+                    .job(|client, route| match intent {
+                        CaptureIntent::Commit => {
+                            client.capture_checkpoint(route, identity, catalog, incarnation, bytes)
+                        }
+                        CaptureIntent::External(capture) => client.capture_external_checkpoint(
+                            route,
+                            capture,
+                            identity,
+                            catalog,
+                            incarnation,
+                            bytes,
+                        ),
                     })
                     .map(CommitCapture::Recorded)
                     .map_err(CommitError::Owner);
@@ -107,6 +142,11 @@ impl BoundWorkspace {
             if !matches!(version, 39..=42) {
                 return Err(CommitError::Context("unsupported durable overlay format"));
             }
+        }
+        if !intent.ordinary() {
+            return Err(CommitError::Context(
+                "external capture requires durable Workspace",
+            ));
         }
         self.job(|client, route| client.capture(route))
             .map(CommitCapture::Legacy)

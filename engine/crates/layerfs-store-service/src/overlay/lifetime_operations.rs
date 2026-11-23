@@ -153,6 +153,25 @@ impl OwnerClient {
             move |db| db.capture_recorded(workspace, catalog, incarnation, &snapshot),
         )
     }
+
+    /// Captures one externally identified frontier in the original
+    /// checkpoint transaction. Authority is checked by the caller.
+    pub fn capture_external_checkpoint(
+        &self,
+        route: Route,
+        capture: layerfs_overlay::ExternalCapture,
+        workspace: [u8; 32],
+        catalog: [u8; 32],
+        incarnation: u64,
+        snapshot: Vec<u8>,
+    ) -> Result<RecordedCapture, OwnerError> {
+        self.call(
+            route,
+            ServiceClass::General,
+            Some(Readiness::Capture),
+            move |db| db.capture_external(capture, workspace, catalog, incarnation, &snapshot),
+        )
+    }
     /// Freezes one publication before the caller's single Store attempt.
     pub fn prepare_checkpoint_publication(
         &self,

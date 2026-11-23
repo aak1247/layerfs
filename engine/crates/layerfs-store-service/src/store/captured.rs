@@ -1,7 +1,7 @@
 //! The product Commit constructor: one captured namespace attempt inside the
 //! unchanged driver. Its reader and operation owner are released only after
 //! the driver's outcome is known; unresolved custody stays with the failure.
-use super::checkpoint::CommitCapture;
+use super::checkpoint::{CaptureIntent, CommitCapture};
 use super::{
     BoundWorkspace, CapturedConstruction, CommitError, CommitFailure, CommitOptions, CommitSuccess,
     PortError, ReleasedOwner, StoreOperation,
@@ -49,6 +49,29 @@ impl BoundWorkspace {
         options: &CommitOptions,
         via: layerfs_history::CommitVia,
     ) -> Result<CommitSuccess, Box<CommitFailure>> {
+        self.commit_captured_with_intent(options, via, CaptureIntent::Commit)
+    }
+
+    /// Captures the exact current frontier under an Owner-authenticated
+    /// identity. A moved Branch refuses publication without merging or
+    /// installing another writer's content into this Workspace.
+    pub fn capture_external(
+        &self,
+        capture: layerfs_overlay::ExternalCapture,
+    ) -> Result<CommitSuccess, Box<CommitFailure>> {
+        self.commit_captured_with_intent(
+            &CommitOptions::default(),
+            layerfs_history::CommitVia::Workspace,
+            CaptureIntent::External(capture),
+        )
+    }
+
+    fn commit_captured_with_intent(
+        &self,
+        options: &CommitOptions,
+        via: layerfs_history::CommitVia,
+        intent: CaptureIntent,
+    ) -> Result<CommitSuccess, Box<CommitFailure>> {
         let mut admission = self.admit_commit()?;
         let held = RefCell::new(None);
         // What construction staged for the shared cache. It is placed there
@@ -76,6 +99,7 @@ impl BoundWorkspace {
                 },
                 options,
                 via,
+                intent,
                 timing,
             )
         });

@@ -78,6 +78,15 @@ same lease; production use still requires the existing whole-Store roster and
 consumer fence. Store capture, authenticated immutable reading and the full
 maintenance coordinator are not provided by this local association alone.
 
+The in-process `BoundWorkspace::capture_external` uses that association and
+the original durable Store checkpoint receipt. It constructs the captured
+frontier even for a clean Workspace. The original Branch must still match
+both before and inside the publication lane; the capture never merges a moved
+head or forces publication. An existing unresolved LayerFS merge is refused
+before capture and remains available for explicit resolution. Ordinary Commit
+keeps its existing merge and clean fast-path behavior. These calls alone do not
+provide daemon transport, a per-read authority check or an immutable reader.
+
 An explicitly fenced `Service::recover_catalog`
 can reopen a settled active local conflict while retaining the original Overlay
 lease and namespace. It checks the original roster record, Store catalog and

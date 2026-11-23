@@ -18,7 +18,7 @@ use layerfs_daemon::{
         BindError, BindRequest, BoundWorkspace, CommitError, CommitOptions, StoreOperation,
         SynchronizeStep,
     },
-    Owner, OwnerConfig, OwnerError,
+    Owner, OwnerConfig, OwnerError, ServiceClass,
 };
 use layerfs_fuse::{
     operations::{KernelData, KernelRead, ReadDataInput},
@@ -27,8 +27,9 @@ use layerfs_fuse::{
 };
 use layerfs_history::{CheckpointAttemptId, CommitOutcome, HistoryError, WorkspaceId};
 use layerfs_overlay::{
-    conflict_page_digest, ConflictCompletion, ConflictStageInput, MaintenanceCursor, Overlay,
-    OverlayError, ProfileConfig, CONFLICT_PAGE_BYTES,
+    conflict_page_digest, CapturePurpose, ConflictCompletion, ConflictStageInput, ExternalCapture,
+    ExternalCaptureDisposition, ExternalCaptureRecord, MaintenanceCursor, Overlay, OverlayError,
+    ProfileConfig, CONFLICT_PAGE_BYTES,
 };
 use layerfs_storage::ReservationBlocks;
 use layerfs_store_service::DurableWorkspace;
@@ -811,6 +812,27 @@ fn write(workspace: &BoundWorkspace, name: &str, bytes: &[u8]) {
         };
         operation.overlay().reply_attempted(publication).unwrap();
     });
+}
+
+fn external_capture(id: u8) -> ExternalCapture {
+    ExternalCapture {
+        id: [id; 32],
+        scope_digest: [89; 32],
+        purpose: CapturePurpose::ManagedWorkspace,
+    }
+}
+
+fn observed_external(
+    owner: &Owner,
+    workspace: &BoundWorkspace,
+    capture: ExternalCapture,
+) -> Option<ExternalCaptureRecord> {
+    owner
+        .client()
+        .call(workspace.route(), ServiceClass::General, None, move |db| {
+            db.observe_external_capture(capture)
+        })
+        .unwrap()
 }
 
 fn checkpoint_recovery_after_original_commit(published: bool, mixed_orphan: bool) {
@@ -1738,6 +1760,30 @@ fn recorded_conflict_keeps_markers_until_resolved_then_publishes_once() {
         second.pending_conflicts().unwrap(),
         Some(vec!["/file-000000".into()])
     );
+    let capture = external_capture(91);
+    let state = owner2.client().state(second.route()).unwrap();
+    let refused_capture = second.capture_external(capture).unwrap_err();
+    assert!(matches!(
+        refused_capture.error,
+        CommitError::Context("external capture has pending conflict")
+    ));
+    assert!(refused_capture.capture.is_none());
+    assert!(refused_capture.recorded.is_none());
+    assert_eq!(owner2.client().state(second.route()).unwrap(), state);
+    assert_eq!(observed_external(&owner2, &second, capture), None);
+    assert_eq!(read(&second, "file-000000"), marker);
+    assert_eq!(
+        second.pending_conflicts().unwrap(),
+        Some(vec!["/file-000000".into()])
+    );
+    assert_eq!(
+        store
+            .history()
+            .branch_snapshot(fixture.branch)
+            .unwrap()
+            .unwrap(),
+        winning
+    );
     let pending_operation = second.operation().unwrap();
     assert_eq!(read(&first, "file-000000"), ours);
     let refused = second
@@ -2029,6 +2075,253 @@ fn recorded_live_commits_publish_once_and_finish_original_custody() {
 }
 
 #[test]
+fn external_capture_uses_real_receipts_for_clean_and_dirty_frontiers() {
+    let fixture = support::Fixture::new_durable(2, "external-capture-receipts");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    assert!(initial.branch.head_commit.is_none());
+    let directory = fixture.directory.join("external-durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let identity = WorkspaceId::from_authority([42; 32]).unwrap();
+    let owner = Owner::create_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: identity,
+                branch: fixture.branch,
+            },
+            initial,
+        )
+        .unwrap()
+        .workspace;
+
+    let clean_initial = external_capture(101);
+    let clean = workspace.capture_external(clean_initial).unwrap();
+    assert!(matches!(
+        clean.history,
+        Some(CommitOutcome::UpToDate { head: None, .. })
+    ));
+    assert!(clean.capture.is_some());
+    let clean_record = observed_external(&owner, &workspace, clean_initial).unwrap();
+    assert_eq!(
+        clean_record.disposition,
+        ExternalCaptureDisposition::Unresolved
+    );
+    assert!(store
+        .history()
+        .checkpoint_receipt(CheckpointAttemptId::from_bytes(clean_record.attempt))
+        .unwrap()
+        .is_some());
+
+    truncate(&workspace, "file-000000");
+    write(&workspace, "file-000000", b"<<<<<<< ordinary Git content\n");
+    let mut second = support::bytes(1);
+    second[0] = b'Z';
+    write(&workspace, "file-000001", &second);
+    let dirty_id = external_capture(102);
+    let dirty = workspace.capture_external(dirty_id).unwrap();
+    assert!(matches!(
+        dirty.history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    assert_eq!(
+        read(&workspace, "file-000000"),
+        b"<<<<<<< ordinary Git content\n"
+    );
+    assert_eq!(read(&workspace, "file-000001"), second);
+    let original = observed_external(&owner, &workspace, dirty_id).unwrap();
+    let publication = original.publication.as_ref().unwrap();
+    let target = layerfs_bridge::snapshot::decode(&publication.target_snapshot).unwrap();
+    let root = layerfs_content::ObjectId::from_bytes(&publication.candidate_root).unwrap();
+    let observe = || {
+        store
+            .observe_original_checkpoint(layerfs_daemon::store::OriginalCheckpoint {
+                catalog: store.history().catalog_id(),
+                incarnation: store.history().incarnation(),
+                attempt: CheckpointAttemptId::from_bytes(original.attempt),
+                request: &publication.request,
+                request_digest: publication.request_digest,
+                candidate_root: root,
+                target: &target,
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let original_receipt = observe();
+    assert_eq!(Some(original_receipt.outcome.clone()), dirty.history);
+    assert_eq!(original_receipt.installed.effective_root, root);
+    let mut wrong_scope = dirty_id;
+    wrong_scope.scope_digest = [90; 32];
+    assert_eq!(observed_external(&owner, &workspace, wrong_scope), None);
+
+    let clean_later_id = external_capture(103);
+    let clean_later = workspace.capture_external(clean_later_id).unwrap();
+    assert!(matches!(
+        clean_later.history,
+        Some(CommitOutcome::UpToDate { head: Some(_), .. })
+    ));
+    assert!(clean_later.capture.is_some());
+    let later_record = observed_external(&owner, &workspace, clean_later_id).unwrap();
+    assert!(store
+        .history()
+        .checkpoint_receipt(CheckpointAttemptId::from_bytes(later_record.attempt))
+        .unwrap()
+        .is_some());
+    assert!(workspace.capture_external(dirty_id).is_err());
+
+    second[0] = b'W';
+    write(&workspace, "file-000001", &second);
+    let moved = workspace
+        .commit_captured(&CommitOptions::default())
+        .unwrap();
+    assert!(matches!(
+        moved.history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    assert_eq!(
+        observed_external(&owner, &workspace, dirty_id),
+        Some(original.clone())
+    );
+    assert_eq!(observe(), original_receipt);
+    assert_eq!(read(&workspace, "file-000001"), second);
+    drop(workspace);
+    store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+    drop(store);
+    let history = rusqlite::Connection::open(&fixture.config.path).unwrap();
+    let receipts: (i64, i64) = history
+        .query_row(
+            "SELECT count(*),count(DISTINCT attempt_id) FROM checkpoint_receipt",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipts, (4, 4));
+    drop(history);
+    fixture.cleanup();
+}
+
+#[test]
+fn external_capture_refuses_a_moved_head_without_merging_user_changes() {
+    let fixture = support::Fixture::new_durable(1, "external-capture-head-moved");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("external-durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let one = directory.join("one.sqlite");
+    let two = directory.join("two.sqlite");
+    let id1 = WorkspaceId::from_authority([42; 32]).unwrap();
+    let id2 = WorkspaceId::from_authority([43; 32]).unwrap();
+    let owner1 = Owner::create_durable(spec(&one, initial.effective_root.to_bytes())).unwrap();
+    let mut second_spec = spec(&two, initial.effective_root.to_bytes());
+    second_spec.identity = [43; 32];
+    second_spec.namespace = 2;
+    let owner2 = Owner::create_durable(second_spec).unwrap();
+    let first = store
+        .bind_durable(
+            owner1.client(),
+            BindRequest {
+                workspace: id1,
+                branch: fixture.branch,
+            },
+            initial.clone(),
+        )
+        .unwrap()
+        .workspace;
+    let second = store
+        .bind_durable(
+            owner2.client(),
+            BindRequest {
+                workspace: id2,
+                branch: fixture.branch,
+            },
+            initial.clone(),
+        )
+        .unwrap()
+        .workspace;
+    let mut local = support::bytes(0);
+    local[0] = b'A';
+    let mut concurrent = support::bytes(0);
+    concurrent[0] = b'B';
+    write(&first, "file-000000", &local);
+    write(&second, "file-000000", &concurrent);
+    let winner = second.commit_captured(&CommitOptions::default()).unwrap();
+    assert!(matches!(
+        winner.history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    let winning = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let capture = external_capture(104);
+    let failure = first.capture_external(capture).unwrap_err();
+    assert!(matches!(
+        failure.error,
+        CommitError::Context("external capture Branch changed")
+    ));
+    assert!(!failure.publication_prepared);
+    assert!(failure.published.is_none());
+    assert_eq!(first.snapshot().unwrap(), initial);
+    assert_eq!(first.pending_conflicts().unwrap(), None);
+    assert_eq!(read(&first, "file-000000"), local);
+    assert_eq!(read(&second, "file-000000"), concurrent);
+    assert_eq!(
+        store
+            .history()
+            .branch_snapshot(fixture.branch)
+            .unwrap()
+            .unwrap(),
+        winning
+    );
+    let record = observed_external(&owner1, &first, capture).unwrap();
+    assert_eq!(record.disposition, ExternalCaptureDisposition::Unpublished);
+    assert!(record.publication.is_none());
+    assert!(store
+        .history()
+        .checkpoint_receipt(CheckpointAttemptId::from_bytes(record.attempt))
+        .unwrap()
+        .is_none());
+    drop(first);
+    drop(second);
+    store.close_reader(id1).unwrap();
+    store.close_reader(id2).unwrap();
+    owner1.stop().unwrap();
+    owner2.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
 fn recorded_capture_rejects_store_without_receipts_before_any_capture() {
     let fixture = support::Fixture::new(1, "recorded-unsupported-store");
     let store = open_store(
@@ -2078,8 +2371,98 @@ fn recorded_capture_rejects_store_without_receipts_before_any_capture() {
     assert_eq!(owner.client().state(workspace.route()).unwrap(), before);
     assert_eq!(workspace.snapshot().unwrap(), initial);
     assert_eq!(read(&workspace, "file-000000"), content);
+    let external = workspace
+        .capture_external(external_capture(105))
+        .unwrap_err();
+    assert!(matches!(
+        external.error,
+        CommitError::History(HistoryError::Unsupported(_))
+    ));
+    assert!(external.capture.is_none());
+    assert_eq!(owner.client().state(workspace.route()).unwrap(), before);
+    assert_eq!(read(&workspace, "file-000000"), content);
     drop(workspace);
     store.close_reader(identity).unwrap();
+    owner.stop().unwrap();
+    drop(store);
+    fixture.cleanup();
+}
+
+#[test]
+fn old_overlay_refuses_external_capture_without_stopping_ordinary_commit() {
+    let fixture = support::Fixture::new_durable(1, "external-capture-old-overlay");
+    let store = open_store(
+        fixture.config.clone(),
+        support::BINDING,
+        support::CURSOR,
+        16,
+        2 * 1024 * 1024,
+        ReservationBlocks::default(),
+    )
+    .unwrap();
+    let initial = store
+        .history()
+        .branch_snapshot(fixture.branch)
+        .unwrap()
+        .unwrap();
+    let directory = fixture.directory.join("external-durable");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.join("workspace.sqlite");
+    let id = WorkspaceId::from_authority([42; 32]).unwrap();
+    let owner = Owner::create_durable(spec(&path, initial.effective_root.to_bytes())).unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: id,
+                branch: fixture.branch,
+            },
+            initial,
+        )
+        .unwrap()
+        .workspace;
+    drop(workspace);
+    store.close_reader(id).unwrap();
+    owner.stop().unwrap();
+    durable_schema45::convert(&path);
+    let (owner, original) =
+        Owner::recover_recorded(&path, ProfileConfig::default(), [42; 32], 2).unwrap();
+    let workspace = store
+        .bind_durable(
+            owner.client(),
+            BindRequest {
+                workspace: id,
+                branch: fixture.branch,
+            },
+            original.clone(),
+        )
+        .unwrap()
+        .workspace;
+    let mut dirty = support::bytes(0);
+    dirty[0] = b'X';
+    write(&workspace, "file-000000", &dirty);
+    let before = owner.client().state(workspace.route()).unwrap();
+    let failed = workspace
+        .capture_external(external_capture(106))
+        .unwrap_err();
+    assert!(matches!(
+        failed.error,
+        CommitError::Context("external capture format unavailable")
+    ));
+    assert!(failed.capture.is_none());
+    assert_eq!(owner.client().state(workspace.route()).unwrap(), before);
+    assert_eq!(workspace.snapshot().unwrap(), original);
+    assert_eq!(read(&workspace, "file-000000"), dirty);
+    assert!(matches!(
+        workspace
+            .commit_captured(&CommitOptions::default())
+            .unwrap()
+            .history,
+        Some(CommitOutcome::Committed { .. })
+    ));
+    drop(workspace);
+    store.close_reader(id).unwrap();
     owner.stop().unwrap();
     drop(store);
     fixture.cleanup();
