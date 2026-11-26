@@ -14,6 +14,8 @@ mod install_file;
 pub mod install_types;
 mod operator;
 mod service;
+#[cfg(target_os = "linux")]
+pub use service::SnapshotPort;
 pub use service::{request as mount_request, Mounted};
 pub mod telemetry;
 pub use layerfs_store_service::{bootstrap, install as shared_install, store};
