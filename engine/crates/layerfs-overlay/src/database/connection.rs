@@ -378,10 +378,11 @@ impl Overlay {
         }
         self.transaction.set(Transaction::Wanted);
         self.release_step.set(true);
-        let (orphans, pieces, mount) = (
+        let (orphans, pieces, mount, snapshot) = (
             self.orphan_seen.get(),
             self.pieces_seen.get(),
             self.open.borrow().mount,
+            self.open.borrow().snapshot,
         );
         let workspace = self.workspace.get();
         let volatile = self
@@ -463,6 +464,7 @@ impl Overlay {
         self.pieces_seen.set(pieces);
         self.open.borrow_mut().rollback();
         self.open.borrow_mut().mount = mount;
+        self.open.borrow_mut().snapshot = snapshot;
         self.workspace.set(workspace);
         for revision in issued {
             self.tickets.withdraw(revision);

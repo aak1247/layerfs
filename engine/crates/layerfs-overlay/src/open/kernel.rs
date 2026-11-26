@@ -5,6 +5,7 @@ use super::journal::{JournalMap, OwnerTable};
 use crate::lifetime::orphan::Orphan;
 use crate::{
     BaseSource, CapturedReader, FileRead, KernelMount, LookupOwner, OpenFile, OperationOwner,
+    SnapshotPin,
 };
 use std::collections::BTreeMap;
 
@@ -39,6 +40,8 @@ pub(crate) struct OpenState {
     pub directories: OwnerTable<(u64, u64), DirectoryState>,
     pub operations: OwnerTable<i64, OperationOwner>,
     pub captured: OwnerTable<i64, CapturedReader>,
+    /// The single nonpublishing capture owner, restored on known rollback.
+    pub snapshot: Option<SnapshotPin>,
     pub captured_generations: JournalMap<i64, u64>,
     pub sources: JournalMap<(u64, i64), BaseSource>,
     pub cookies: BTreeMap<u64, CookieStore>,

@@ -11,31 +11,48 @@ impl Overlay {
         capture: Capture,
         request: u64,
     ) -> OverlayResult<CapturedReader> {
+        self.atomic(|| {
+            if self
+                .open
+                .borrow()
+                .snapshot
+                .is_some_and(|pin| pin.capture() == capture)
+            {
+                return Err(OverlayError::Invalid(
+                    "snapshot capture already owns its reader",
+                ));
+            }
+            self.acquire_captured_reader_inner(capture, request)
+        })
+    }
+    pub(crate) fn acquire_captured_reader_inner(
+        &self,
+        capture: Capture,
+        request: u64,
+    ) -> OverlayResult<CapturedReader> {
         let request = integer(request)?;
         if request == 0 {
             return Err(OverlayError::Invalid("zero captured request"));
         }
-        self.atomic(|| {
-            self.checked_capture(capture)?;
-            let state = self.state()?;
-            if state.closed {
-                return Err(OverlayError::Closed);
-            }
-            let owner = self.mint_owner()?;
-            let reader = CapturedReader {
-                capture,
-                owner,
-                installed: state.installed,
-            };
-            self.open.borrow_mut().captured.insert(
-                owner,
-                request,
-                reader,
-                "duplicate captured request",
-            )?;
-            self.captured_reference(capture.generation.0, true)?;
-            Ok(reader)
-        })
+        self.checked_capture(capture)?;
+        let state = self.state()?;
+        if state.closed {
+            return Err(OverlayError::Closed);
+        }
+        let owner = self.mint_owner()?;
+        let reader = CapturedReader {
+            capture,
+            owner,
+            installed: state.installed,
+        };
+        self.open.borrow_mut().captured.insert(
+            owner,
+            request,
+            reader,
+            "duplicate captured request",
+        )?;
+        self.captured_reference(capture.generation.0, true)?;
+        Ok(reader)
     }
     /// Coherent original custody; absence is not permission to repeat acquisition.
     pub fn retained_captured_reader(&self, request: u64) -> OverlayResult<Option<CapturedReader>> {
@@ -147,16 +164,32 @@ impl Overlay {
     /// Exact release after all captured consumers and external calls finish.
     pub fn release_captured_reader(&self, reader: CapturedReader) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
-            self.check_captured_reader(reader)?;
-            let c = reader.capture;
-            self.open
-                .borrow_mut()
-                .captured
-                .remove(reader.owner, |held| *held == reader)?;
-            self.captured_reference(c.generation.0, false)?;
-            self.wake_generation(c.generation.0 as u64)?;
-            Ok(())
+            if self
+                .open
+                .borrow()
+                .snapshot
+                .is_some_and(|pin| pin.reader() == reader)
+            {
+                return Err(OverlayError::Invalid(
+                    "snapshot reader requires exact pin release",
+                ));
+            }
+            self.release_captured_reader_inner(reader)
         })
+    }
+    pub(crate) fn release_captured_reader_inner(
+        &self,
+        reader: CapturedReader,
+    ) -> OverlayResult<()> {
+        self.check_captured_reader(reader)?;
+        let c = reader.capture;
+        self.open
+            .borrow_mut()
+            .captured
+            .remove(reader.owner, |held| *held == reader)?;
+        self.captured_reference(c.generation.0, false)?;
+        self.wake_generation(c.generation.0 as u64)?;
+        Ok(())
     }
     /// One immutable captured byte window, independent of current installed floor.
     pub fn read_captured(

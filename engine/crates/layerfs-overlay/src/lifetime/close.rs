@@ -47,6 +47,9 @@ impl Overlay {
     pub fn close(&self) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
             self.live()?;
+            if self.open.borrow().snapshot.is_some() {
+                return Err(OverlayError::CaptureInFlight);
+            }
             self.change_state(|state| {
                 state.closed = true;
                 Ok(())

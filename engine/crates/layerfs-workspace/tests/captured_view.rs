@@ -186,3 +186,88 @@ fn captured_view_rejects_another_engine_and_a_released_source() {
         Err(WorkspaceError::Content(ContentError::PathNotFound))
     ));
 }
+
+#[test]
+fn snapshot_pin_is_atomic_exact_and_prevents_early_release_or_close() {
+    let b = Bench::new("snapshot-pin");
+    let file = b.applied(create(1, "pinned"), T1).unwrap().serial;
+    b.applied(write(file, 0, b"before"), T1);
+    let before = b.overlay.state().unwrap();
+    assert!(b.overlay.pin_snapshot(0).is_err());
+    assert!(b.overlay.pin_snapshot(u64::MAX).is_err());
+    assert_eq!(b.overlay.state().unwrap(), before);
+
+    // An unrelated existing capture refuses before the new attempt changes
+    // either the frontier or any of its owners.
+    let other = b.overlay.capture().unwrap();
+    let held = b.overlay.state().unwrap();
+    assert!(b.overlay.pin_snapshot(77_001).is_err());
+    assert_eq!(b.overlay.state().unwrap(), held);
+    assert!(b.overlay.retained_snapshot_pin(77_001).unwrap().is_none());
+    b.overlay.resolve_failed_capture(other).unwrap();
+    drain(&b);
+
+    let pin = b.overlay.pin_snapshot(77_001).unwrap();
+    let source_view = b.workspace.view_for_source(pin.source()).unwrap();
+    let snapshot = source_view.captured(&b.overlay, pin.reader()).unwrap();
+    assert_eq!(
+        b.overlay.retained_snapshot_pin(pin.request()).unwrap(),
+        Some(pin)
+    );
+    assert!(b.overlay.retained_snapshot_pin(77_002).unwrap().is_none());
+    let pinned = b.overlay.state().unwrap();
+    assert!(b.overlay.pin_snapshot(77_002).is_err());
+    assert!(b
+        .overlay
+        .acquire_captured_reader(pin.capture(), 77_002)
+        .is_err());
+    assert!(b.overlay.release_base_source(pin.source()).is_err());
+    assert!(b.overlay.release_captured_reader(pin.reader()).is_err());
+    assert!(b.overlay.resolve_failed_capture(pin.capture()).is_err());
+    assert!(b.overlay.close().is_err());
+    assert_eq!(b.overlay.state().unwrap(), pinned);
+
+    b.applied(write(file, 0, b"after!"), T2);
+    let mut captured = Vec::new();
+    snapshot.read(file, 0, 64, &mut captured).unwrap();
+    assert_eq!(captured, b"before");
+    assert_eq!(b.read_at(file, 0, 64), b"after!");
+    drop(snapshot);
+    b.overlay.release_snapshot_pin(pin).unwrap();
+    assert!(b
+        .overlay
+        .retained_snapshot_pin(pin.request())
+        .unwrap()
+        .is_none());
+    assert!(source_view.captured(&b.overlay, pin.reader()).is_err());
+    assert!(b.overlay.release_snapshot_pin(pin).is_err());
+    drain(&b);
+    assert!(b.overlay.capture_ready().unwrap());
+    assert_eq!(b.read_at(file, 0, 64), b"after!");
+}
+
+#[test]
+fn snapshot_pin_rolls_back_frontier_and_source_when_reader_request_collides() {
+    let b = Bench::new("snapshot-pin-collision");
+    let original = b.overlay.capture().unwrap();
+    let reader = b.overlay.acquire_captured_reader(original, 88_001).unwrap();
+    // A reader remains independently owned after a known install. It can
+    // collide only after the new capture and source have been prepared.
+    b.overlay
+        .install(original, b.fixture.root.0.to_bytes())
+        .unwrap();
+    let before = b.overlay.state().unwrap();
+    assert!(b.overlay.pin_snapshot(88_001).is_err());
+    assert_eq!(b.overlay.state().unwrap(), before);
+    assert_eq!(
+        b.overlay.retained_captured_reader(88_001).unwrap(),
+        Some(reader)
+    );
+    assert!(b.overlay.retained_snapshot_pin(88_001).unwrap().is_none());
+    b.overlay.release_captured_reader(reader).unwrap();
+    drain(&b);
+    let pin = b.overlay.pin_snapshot(88_002).unwrap();
+    b.overlay.release_snapshot_pin(pin).unwrap();
+    drain(&b);
+    assert!(b.overlay.capture_ready().unwrap());
+}

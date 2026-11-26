@@ -12,19 +12,32 @@ impl Overlay {
     /// This performs fixed metadata work; payload composition is maintained.
     pub fn resolve_failed_capture(&self, capture: Capture) -> OverlayResult<()> {
         self.atomic_cleanup(|| {
-            self.checked_capture(capture)?;
-            if self.state()?.closed {
-                return Err(OverlayError::Closed);
-            };
-            self.change_state(|state| {
-                state.consolidating = state.captured;
-                state.captured = None;
-                state.captured_revision = None;
-                Ok(())
-            })?;
-            self.wake_orphan_sources(capture.generation.0)?;
-            self.enqueue(FOLD, 0, capture.generation.0)
+            if self
+                .open
+                .borrow()
+                .snapshot
+                .is_some_and(|pin| pin.capture() == capture)
+            {
+                return Err(OverlayError::Invalid(
+                    "snapshot capture requires exact pin release",
+                ));
+            }
+            self.resolve_failed_capture_inner(capture)
         })
+    }
+    pub(crate) fn resolve_failed_capture_inner(&self, capture: Capture) -> OverlayResult<()> {
+        self.checked_capture(capture)?;
+        if self.state()?.closed {
+            return Err(OverlayError::Closed);
+        };
+        self.change_state(|state| {
+            state.consolidating = state.captured;
+            state.captured = None;
+            state.captured_revision = None;
+            Ok(())
+        })?;
+        self.wake_orphan_sources(capture.generation.0)?;
+        self.enqueue(FOLD, 0, capture.generation.0)
     }
     pub(crate) fn fold_namespace(&self, item: &Item) -> OverlayResult<(u64, u64, bool)> {
         let state = self.state()?;

@@ -23,23 +23,24 @@ impl Overlay {
     /// operation IDs fail atomically. Kernel service fences later acquisitions
     /// behind known install readiness, without attempting/retrying install.
     pub fn acquire_base_source(&self, owner: u64) -> OverlayResult<BaseSource> {
+        self.atomic(|| self.acquire_source_inner(owner, 0))
+    }
+    pub(crate) fn acquire_source_inner(&self, owner: u64, class: i64) -> OverlayResult<BaseSource> {
         let key = integer(owner)?;
         if key == 0 {
             return Err(OverlayError::Invalid("zero base-source owner"));
         }
-        self.atomic(|| {
-            let state = self.live()?;
-            let source = BaseSource {
-                engine: self.identity,
-                owner,
-                class: 0,
-                root: state.base_root,
-                installed: state.installed,
-            };
-            self.insert_source(source)?;
-            self.source_count(true)?;
-            Ok(source)
-        })
+        let state = self.live()?;
+        let source = BaseSource {
+            engine: self.identity,
+            owner,
+            class,
+            root: state.base_root,
+            installed: state.installed,
+        };
+        self.insert_source(source)?;
+        self.source_count(true)?;
+        Ok(source)
     }
     /// Bounded observation of original custody after a lost completion. Missing
     /// is absence, never authority to replay an acquisition or infer its fence.

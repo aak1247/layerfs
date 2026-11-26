@@ -73,6 +73,30 @@ impl CapturedReader {
     }
 }
 
+/// A nonpublishing capture and its exact independently retained read owners.
+/// Copies do not create another owner; only the original request can observe
+/// or release it, after every reader and external consumer has actually ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotPin {
+    pub(crate) request: u64,
+    pub(crate) source: BaseSource,
+    pub(crate) reader: CapturedReader,
+}
+impl SnapshotPin {
+    pub const fn request(self) -> u64 {
+        self.request
+    }
+    pub const fn source(self) -> BaseSource {
+        self.source
+    }
+    pub const fn reader(self) -> CapturedReader {
+        self.reader
+    }
+    pub const fn capture(self) -> Capture {
+        self.reader.capture()
+    }
+}
+
 /// One nonrecycled operation owner, independent of command/process lifetime.
 /// Its backed operation_record remains in cleanup custody after exact release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

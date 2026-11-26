@@ -50,9 +50,18 @@ come from that same base. The caller keeps both owners for every read and its
 consumers, and explicitly releases them after those consumers finish. A reader
 also prevents its generation from being folded while it remains held.
 
-This is an in-process read composition, not an operation to mint a capture, a
-POSIX mount or a remote snapshot API. It publishes no Branch and performs no
-Commit. A durable overlay with a captured or consolidating generation still
+`Overlay::pin_snapshot` can acquire the exact capture, source and reader for
+one original request in the same owner transaction. The owner can observe
+that request's retained pin without repeating it. While the pin is held,
+ordinary Close and individual source, reader or capture releases are refused.
+After every view and external consumer is known finished, the owner can release
+the exact pin in one transaction; this schedules the existing nonpublication
+fold and does not change the Branch. A copied token is not another owner, and
+absence during observation does not prove an unknown release succeeded.
+
+These are in-process owners and read composition, not a POSIX mount or a
+remote snapshot API. They publish no Branch and perform no Commit. A durable
+overlay with a captured or consolidating generation still
 requires reconciliation on reopen; this reader does not authorize recovering,
 replaying or releasing an earlier process's unknown work.
 

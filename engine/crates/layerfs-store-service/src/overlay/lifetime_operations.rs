@@ -1,7 +1,9 @@
 //! Direct connection operations, each one counted short job on the calling thread.
 use crate::overlay::owner::Readiness;
 use crate::{OwnerClient, OwnerError, ServiceClass};
-use layerfs_overlay::{BaseSource, Capture, CapturedReader, OperationOwner, OverlayError};
+use layerfs_overlay::{
+    BaseSource, Capture, CapturedReader, OperationOwner, OverlayError, SnapshotPin,
+};
 use layerfs_workspace::Route;
 impl OwnerClient {
     pub fn acquire_operation(
@@ -80,6 +82,31 @@ impl OwnerClient {
             Some(Readiness::Capture),
             move |db| db.capture(),
         )
+    }
+    /// The original nonpublishing capture and its reader are one owner job.
+    pub fn pin_snapshot(&self, route: Route, request: u64) -> Result<SnapshotPin, OwnerError> {
+        self.call(
+            route,
+            ServiceClass::General,
+            Some(Readiness::Capture),
+            move |db| db.pin_snapshot(request),
+        )
+    }
+    /// Observation never issues or releases an original pin.
+    pub fn retained_snapshot_pin(
+        &self,
+        route: Route,
+        request: u64,
+    ) -> Result<Option<SnapshotPin>, OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.retained_snapshot_pin(request)
+        })
+    }
+    /// The caller must have fenced every consumer before this single release.
+    pub fn release_snapshot_pin(&self, route: Route, pin: SnapshotPin) -> Result<(), OwnerError> {
+        self.call(route, ServiceClass::General, None, move |db| {
+            db.release_snapshot_pin(pin)
+        })
     }
     pub fn resolve_failed(&self, route: Route, capture: Capture) -> Result<(), OwnerError> {
         self.call(route, ServiceClass::General, None, move |db| {
