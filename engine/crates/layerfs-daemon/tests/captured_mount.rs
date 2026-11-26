@@ -19,6 +19,7 @@ use layerfs_fuse::{
     snapshot::{SnapshotConfig, SnapshotDetach, SnapshotSession},
 };
 use nix::errno::Errno;
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use std::{
     fs,
     os::unix::fs::{symlink, MetadataExt, PermissionsExt},
@@ -182,4 +183,177 @@ fn captured_mount_stays_readonly_while_original_workspace_continues_writing() {
     drop(operation);
     rig.unmount(&ready);
     rig.finish();
+}
+
+#[test]
+#[ignore = "requires a task-owned Linux mount namespace with CAP_SYS_ADMIN and /dev/fuse"]
+fn relative_snapshot_directory_is_rejected_before_effects() {
+    let rig = rig::Rig::built("-snapshot-relative", base);
+    let ready = rig.mount(23);
+    let operation = rig.harness.service.operation(ready.token).unwrap();
+    let route = operation.workspace().route();
+    let pin = operation.overlay().pin_snapshot(route, 51_002).unwrap();
+    let port = SnapshotPort::new(rig.harness.service.operation(ready.token).unwrap(), pin).unwrap();
+    let root = operation
+        .workspace()
+        .view_for_source(pin.source())
+        .unwrap()
+        .root_serial();
+    let relative = std::path::PathBuf::from(format!("relative-snapshot-{}", std::process::id()));
+    assert!(fs::symlink_metadata(&relative).is_err());
+    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let failure = match SnapshotSession::attach(config(relative.clone(), root), Arc::new(port)) {
+        Ok(_) => panic!("relative path was accepted"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.cause.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(failure.session.is_none());
+    assert!(fs::symlink_metadata(&relative).is_err());
+    assert_eq!(fs::read_to_string("/proc/self/mountinfo").unwrap(), mounts);
+    assert_eq!(
+        operation
+            .overlay()
+            .retained_snapshot_pin(route, pin.request())
+            .unwrap(),
+        Some(pin)
+    );
+    operation
+        .overlay()
+        .release_snapshot_pin(route, pin)
+        .unwrap();
+    mounted::until("relative pin fold", || {
+        operation
+            .overlay()
+            .state(route)
+            .unwrap()
+            .consolidating
+            .is_none()
+    });
+    drop(operation);
+    rig.unmount(&ready);
+    rig.finish();
+}
+
+fn config(directory: std::path::PathBuf, root: u64) -> SnapshotConfig {
+    SnapshotConfig {
+        directory,
+        owner_uid: nix::unistd::Uid::effective().as_raw(),
+        owner_gid: nix::unistd::Gid::effective().as_raw(),
+        identity: Identity {
+            root,
+            uid: mounted::COMMAND,
+            gid: mounted::COMMAND,
+        },
+        ready_wait: Duration::from_secs(5),
+        drain_wait: Duration::from_secs(5),
+    }
+}
+
+/// The test-owned preload fails just the first mountinfo open or the one
+/// outer spawn after the snapshot mount. All other calls reach the kernel.
+fn injected_attach_failure(fault: &str) {
+    assert_eq!(
+        std::env::var("LFS_SNAPSHOT_TEST_FAULT").as_deref(),
+        Ok(fault)
+    );
+    let rig = rig::Rig::built(&format!("-snapshot-{fault}"), base);
+    let ready = rig.mount(24);
+    let operation = rig.harness.service.operation(ready.token).unwrap();
+    let route = operation.workspace().route();
+    let pin = operation.overlay().pin_snapshot(route, 51_003).unwrap();
+    let port = SnapshotPort::new(rig.harness.service.operation(ready.token).unwrap(), pin).unwrap();
+    let root = operation
+        .workspace()
+        .view_for_source(pin.source())
+        .unwrap()
+        .root_serial();
+    let directory = rig.fixture.directory.join("failed-snapshot");
+    let failure = match SnapshotSession::attach(config(directory.clone(), root), Arc::new(port)) {
+        Ok(_) => panic!("the requested failure was not injected"),
+        Err(failure) => failure,
+    };
+    let expected = if fault == "mountinfo" {
+        Errno::EACCES
+    } else {
+        Errno::EAGAIN
+    };
+    assert_eq!(failure.cause.raw_os_error(), Some(expected as i32));
+    let mut session = *failure
+        .session
+        .expect("retain the original mounted session");
+    assert_eq!(
+        operation
+            .overlay()
+            .retained_snapshot_pin(route, pin.request())
+            .unwrap(),
+        Some(pin)
+    );
+    if fault == "mountinfo" {
+        assert!(session.entry().is_none());
+        let replacement = rig.fixture.directory.join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        mount(
+            Some(replacement.as_path()),
+            directory.as_path(),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .unwrap();
+        assert!(
+            session.observe_mount().is_err(),
+            "a replacement mount must not be adopted"
+        );
+        umount2(directory.as_path(), MntFlags::empty()).unwrap();
+        fs::remove_dir(replacement).unwrap();
+        assert!(session
+            .observe_mount()
+            .unwrap()
+            .source
+            .starts_with("layerfs-snapshot-"));
+    } else {
+        assert!(session.entry().is_some());
+    }
+    assert_eq!(session.detach().unwrap(), SnapshotDetach::Detached);
+    let drained = session.drain().unwrap();
+    assert!(drained.outcome().is_none(), "no receiver was started");
+    assert!(
+        !drained.is_clean(),
+        "a failed attach is not a successful archive"
+    );
+    assert_eq!(drained.pin(), pin);
+    assert_eq!(
+        operation
+            .overlay()
+            .retained_snapshot_pin(route, pin.request())
+            .unwrap(),
+        Some(pin)
+    );
+    operation
+        .overlay()
+        .release_snapshot_pin(route, drained.pin())
+        .unwrap();
+    mounted::until("failed snapshot pin fold", || {
+        operation
+            .overlay()
+            .state(route)
+            .unwrap()
+            .consolidating
+            .is_none()
+    });
+    drop(operation);
+    rig.unmount(&ready);
+    rig.finish();
+}
+
+#[test]
+#[ignore = "requires a private FUSE mount and one-shot mountinfo fault injection"]
+fn snapshot_original_mount_is_reobserved_after_mountinfo_error() {
+    injected_attach_failure("mountinfo");
+}
+
+#[test]
+#[ignore = "requires a private FUSE mount and one-shot outer-spawn fault injection"]
+fn snapshot_unstarted_receiver_does_not_prevent_drain() {
+    injected_attach_failure("spawn");
 }

@@ -10,11 +10,12 @@ use layerfs_workspace::WorkspaceError;
 use nix::errno::Errno;
 use std::{
     fmt, fs, io,
+    io::Read,
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -49,6 +50,8 @@ pub struct SnapshotSession {
     directory: PathBuf,
     directory_identity: (u64, u64),
     directory_fd: fs::File,
+    scope: MountScope,
+    mounted_fd: Option<fs::File>,
     entry: Option<MountEntry>,
     state: MountState,
     device: Option<OwnedFd>,
@@ -57,6 +60,99 @@ pub struct SnapshotSession {
     negotiation: Arc<OnceLock<Negotiation>>,
     failure: Arc<Mutex<Option<WorkspaceError>>>,
     drain_wait: Duration,
+}
+
+/// A retained parent and namespace, plus a source name unique to this one
+/// mount attempt. No caller-provided source string authorizes an observation.
+struct MountScope {
+    parent: PathBuf,
+    parent_fd: fs::File,
+    parent_identity: (u64, u64),
+    namespace_fd: fs::File,
+    namespace_identity: (u64, u64),
+    leaf: std::ffi::OsString,
+    source: String,
+}
+impl MountScope {
+    fn prepare(directory: &Path) -> io::Result<Self> {
+        if !directory.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot directory must be absolute",
+            ));
+        }
+        let Some(Component::Normal(leaf)) = directory.components().next_back() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot directory leaf",
+            ));
+        };
+        let parent = fs::canonicalize(directory.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "snapshot directory parent")
+        })?)?;
+        let parent_fd = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&parent)?;
+        let parent_metadata = parent_fd.metadata()?;
+        let namespace_fd = fs::File::open("/proc/thread-self/ns/mnt")?;
+        let namespace_metadata = namespace_fd.metadata()?;
+        let mut random = [0u8; 16];
+        fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let mut source = String::from("layerfs-snapshot-");
+        for byte in random {
+            use std::fmt::Write;
+            write!(&mut source, "{byte:02x}").expect("writing a string cannot fail");
+        }
+        let scope = Self {
+            parent,
+            parent_fd,
+            parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+            namespace_fd,
+            namespace_identity: (namespace_metadata.dev(), namespace_metadata.ino()),
+            leaf: leaf.to_os_string(),
+            source,
+        };
+        scope.verify()?;
+        Ok(scope)
+    }
+    fn directory(&self) -> PathBuf {
+        self.parent.join(&self.leaf)
+    }
+    fn held_directory(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.parent_fd.as_raw_fd())).join(&self.leaf)
+    }
+    fn verify(&self) -> io::Result<()> {
+        let held_parent = self.parent_fd.metadata()?;
+        let named_parent = fs::symlink_metadata(&self.parent)?;
+        let held_namespace = self.namespace_fd.metadata()?;
+        let current_namespace = fs::metadata("/proc/thread-self/ns/mnt")?;
+        if !named_parent.is_dir()
+            || (held_parent.dev(), held_parent.ino()) != self.parent_identity
+            || (named_parent.dev(), named_parent.ino()) != self.parent_identity
+            || (held_namespace.dev(), held_namespace.ino()) != self.namespace_identity
+            || (current_namespace.dev(), current_namespace.ino()) != self.namespace_identity
+        {
+            return Err(io::Error::other(
+                "snapshot mount parent or namespace changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn mount_id(file: &fs::File) -> io::Result<u64> {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let id = info
+        .lines()
+        .filter_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .collect::<Vec<_>>();
+    if id.len() != 1 {
+        return Err(io::Error::other("snapshot mount descriptor identity"));
+    }
+    id[0]
+        .parse()
+        .map_err(|_| io::Error::other("snapshot mount descriptor identity"))
 }
 pub struct SnapshotAttachFailure {
     pub cause: io::Error,
@@ -151,16 +247,18 @@ impl SnapshotSession {
                 directory_cleanup,
             })
         };
+        let scope = MountScope::prepare(&config.directory).map_err(|cause| before(cause, None))?;
         let pin = source.pin();
         let filesystem = SnapshotFilesystem::new(source, config.identity)
             .map_err(|cause| before(cause, None))?;
         let negotiation = filesystem.negotiation();
         let failure = filesystem.failure();
-        syscalls::create_directory(&config.directory).map_err(|cause| before(cause, None))?;
+        scope.verify().map_err(|cause| before(cause, None))?;
+        syscalls::create_directory(&scope.held_directory()).map_err(|cause| before(cause, None))?;
         let directory_fd = match fs::OpenOptions::new()
             .read(true)
             .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-            .open(&config.directory)
+            .open(scope.held_directory())
         {
             Ok(file) => file,
             Err(cause) => return Err(before(cause, None)),
@@ -176,29 +274,48 @@ impl SnapshotSession {
             Err(cause) => return Err(before(cause, None)),
         };
         let directory_identity = (metadata.dev(), metadata.ino());
+        let named = match fs::symlink_metadata(scope.held_directory()) {
+            Ok(named) => named,
+            Err(cause) => return Err(before(cause, None)),
+        };
+        if !named.is_dir() || (named.dev(), named.ino()) != directory_identity {
+            return Err(before(
+                io::Error::other("snapshot directory identity changed"),
+                None,
+            ));
+        }
+        if let Err(cause) = scope.verify() {
+            return Err(before(cause, None));
+        }
         let device = match syscalls::open_device() {
             Ok(device) => device,
             Err(cause) => {
                 return Err(before(
                     cause,
-                    remove_owned(&config.directory, directory_identity).err(),
+                    remove_owned(&scope.held_directory(), directory_identity).err(),
                 ))
             }
         };
         let target = PathBuf::from(format!("/proc/self/fd/{}", directory_fd.as_raw_fd()));
-        if let Err(errno) =
-            syscalls::attach_readonly(&device, &target, config.owner_uid, config.owner_gid)
-        {
+        if let Err(errno) = syscalls::attach_readonly(
+            &device,
+            &target,
+            config.owner_uid,
+            config.owner_gid,
+            &scope.source,
+        ) {
             return Err(before(
                 errno.into(),
-                remove_owned(&config.directory, directory_identity).err(),
+                remove_owned(&scope.held_directory(), directory_identity).err(),
             ));
         }
         let mut session = Self {
             pin,
-            directory: config.directory,
+            directory: scope.directory(),
             directory_identity,
             directory_fd,
+            scope,
+            mounted_fd: None,
             entry: None,
             state: MountState::Mounted,
             device: Some(device),
@@ -208,20 +325,22 @@ impl SnapshotSession {
             failure,
             drain_wait: config.drain_wait,
         };
-        let entry = match syscalls::mount_entry(&session.directory) {
-            Ok(entry)
-                if entry.filesystem == "fuse"
-                    && entry.source == "layerfs"
-                    && entry.options.split(',').any(|option| option == "ro") =>
-            {
-                entry
-            }
-            Ok(_) => {
-                return Err(session.retained(io::Error::other("snapshot read-only mount identity")))
-            }
+        let mounted_fd = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                nix::libc::O_PATH
+                    | nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_CLOEXEC,
+            )
+            .open(session.scope.held_directory());
+        match mounted_fd {
+            Ok(file) => session.mounted_fd = Some(file),
             Err(cause) => return Err(session.retained(cause)),
-        };
-        session.entry = Some(entry);
+        }
+        if let Err(cause) = session.observe_mount() {
+            return Err(session.retained(cause));
+        }
         let mut options = Config::default();
         options.acl = SessionACL::All;
         options.n_threads = Some(1);
@@ -232,12 +351,14 @@ impl SnapshotSession {
         };
         let runner = kernel.into_runner();
         let monitor = runner.monitor();
-        session.monitor = Some(monitor.clone());
         match thread::Builder::new()
             .name(format!("layerfs-snapshot-{}", pin.request()))
             .spawn(move || runner.run())
         {
-            Ok(owner) => session.owner = Some(owner),
+            Ok(owner) => {
+                session.monitor = Some(monitor.clone());
+                session.owner = Some(owner);
+            }
             Err(cause) => return Err(session.retained(cause)),
         }
         let ready = monitor.wait_ready(config.ready_wait);
@@ -268,12 +389,52 @@ impl SnapshotSession {
         self.entry.as_ref()
     }
 
+    /// Read the original mount again after a failed observation. Only the
+    /// held namespace, parent, unique source and mounted descriptor can bind
+    /// the first receipt; a later observation must match that whole receipt.
+    pub fn observe_mount(&mut self) -> io::Result<&MountEntry> {
+        if self.state != MountState::Mounted {
+            return Err(io::Error::other("snapshot mount is not mounted"));
+        }
+        self.scope.verify()?;
+        let directory = self.directory_fd.metadata()?;
+        if (directory.dev(), directory.ino()) != self.directory_identity {
+            return Err(io::Error::other("snapshot directory identity changed"));
+        }
+        let expected_id = match (&self.mounted_fd, &self.entry) {
+            (Some(file), _) => mount_id(file)?,
+            (None, Some(entry)) => entry.id,
+            (None, None) => {
+                return Err(io::Error::other(
+                    "original snapshot mount descriptor absent",
+                ))
+            }
+        };
+        let observed = syscalls::mount_entry(&self.directory)?;
+        if observed.id != expected_id
+            || observed.filesystem != "fuse"
+            || observed.source != self.scope.source
+            || !observed.options.split(',').any(|option| option == "ro")
+            || self.entry.as_ref().is_some_and(|entry| entry != &observed)
+        {
+            return Err(io::Error::other(
+                "snapshot read-only mount identity changed",
+            ));
+        }
+        self.entry = Some(observed);
+        Ok(self
+            .entry
+            .as_ref()
+            .expect("original mount was just observed"))
+    }
+
     /// The one plain detach. A busy answer is reversible; any other error
     /// retains unknown disposition and cannot be resent by this session.
     pub fn detach(&mut self) -> Result<SnapshotDetach, Errno> {
         if self.state != MountState::Mounted {
             return Err(Errno::EINVAL);
         }
+        self.scope.verify().map_err(|_| Errno::ESTALE)?;
         let expected = self.entry.as_ref().ok_or(Errno::ESTALE)?;
         let held = self.directory_fd.metadata().map_err(|_| Errno::ESTALE)?;
         if (held.dev(), held.ino()) != self.directory_identity {
@@ -282,6 +443,14 @@ impl SnapshotSession {
         if syscalls::mount_entry(&self.directory).map_err(|_| Errno::ESTALE)? != *expected {
             return Err(Errno::ESTALE);
         }
+        if let Some(mounted_fd) = &self.mounted_fd {
+            if mount_id(mounted_fd).map_err(|_| Errno::ESTALE)? != expected.id {
+                return Err(Errno::ESTALE);
+            }
+        }
+        // An O_PATH reference itself keeps a mount busy. Its exact mount ID was
+        // just checked and remains fixed in entry for any reversible EBUSY.
+        drop(self.mounted_fd.take());
         self.state = MountState::Unknown;
         match syscalls::detach(&self.directory) {
             Ok(()) => {
@@ -335,7 +504,10 @@ impl SnapshotSession {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .take();
-        let removed = remove_owned(&self.directory, self.directory_identity);
+        let removed = self
+            .scope
+            .verify()
+            .and_then(|()| remove_owned(&self.scope.held_directory(), self.directory_identity));
         Ok(Box::new(SnapshotDrained {
             pin: self.pin,
             entry: self.entry,

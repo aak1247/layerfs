@@ -64,7 +64,7 @@ pub(crate) fn open_device() -> io::Result<OwnedFd> {
 /// The daemon is the mount owner; ordinary commands enter through allow_other
 /// under kernel permission checks, so they cannot abort this connection.
 pub(crate) fn attach(device: &OwnedFd, target: &Path, uid: u32, gid: u32) -> Result<(), Errno> {
-    attach_mode(device, target, uid, gid, false)
+    attach_mode(device, target, uid, gid, false, SOURCE)
 }
 /// A captured view uses the same direct mount and permission checks, with the
 /// kernel itself refusing writes for this separate connection.
@@ -73,8 +73,9 @@ pub(crate) fn attach_readonly(
     target: &Path,
     uid: u32,
     gid: u32,
+    source: &str,
 ) -> Result<(), Errno> {
-    attach_mode(device, target, uid, gid, true)
+    attach_mode(device, target, uid, gid, true, source)
 }
 fn attach_mode(
     device: &OwnedFd,
@@ -82,6 +83,7 @@ fn attach_mode(
     uid: u32,
     gid: u32,
     readonly: bool,
+    source: &str,
 ) -> Result<(), Errno> {
     let data = format!(
         "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other,default_permissions,max_read={}",
@@ -93,7 +95,7 @@ fn attach_mode(
         flags |= MsFlags::MS_RDONLY;
     }
     mount(
-        Some(SOURCE),
+        Some(source),
         target,
         Some(FILESYSTEM),
         flags,
