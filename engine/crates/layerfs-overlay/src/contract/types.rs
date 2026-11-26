@@ -291,6 +291,10 @@ impl BaseSource {
     pub const fn root(self) -> [u8; 32] {
         self.root
     }
+    /// Installed generation pinned by this source.
+    pub const fn installed_floor(self) -> u64 {
+        self.installed as u64
+    }
     /// True when this source's base cannot hold an inode created at `born`:
     /// install is fenced while the source is owned, so the floor is stable.
     pub const fn created_above(self, born: u64) -> bool {

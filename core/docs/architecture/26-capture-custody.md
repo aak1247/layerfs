@@ -40,6 +40,22 @@ independent reader/orphan ownership and live generation cleanup remain S6.
 The daemon exposes typed bounded capture/name/cell/ticket observations with charged
 reply windows, without holding SQL across content demand or whole operations.
 
+## Captured Workspace read composition
+
+`SourceView::captured` composes an already-retained `CapturedReader` with an
+already-retained base source. It checks the engine, immutable root, installed
+floor and both original owners before returning. Name and metadata reads use
+the captured rows, never the later active generation; unchanged names and bytes
+come from that same base. The caller keeps both owners for every read and its
+consumers, and explicitly releases them after those consumers finish. A reader
+also prevents its generation from being folded while it remains held.
+
+This is an in-process read composition, not an operation to mint a capture, a
+POSIX mount or a remote snapshot API. It publishes no Branch and performs no
+Commit. A durable overlay with a captured or consolidating generation still
+requires reconciliation on reopen; this reader does not authorize recovering,
+replaying or releasing an earlier process's unknown work.
+
 Actual EXPLAIN and correlated VM/row counters, source identities, covering host/
 Linux checks and precise milestone/resource boundaries are in the
 [S2 exit audit](../issues/307/S2-EXIT-AUDIT.md). Ticket/capture probes are scope

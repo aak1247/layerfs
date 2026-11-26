@@ -1,4 +1,5 @@
 //! Responsibility-scoped implementation modules and reexports.
+pub(crate) mod captured_view;
 pub(crate) mod install;
 pub(crate) mod serials;
 pub(crate) mod state;

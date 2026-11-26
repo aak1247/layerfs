@@ -25,6 +25,7 @@ mod ports;
 pub(crate) use operations::namespace::remove;
 pub(crate) use operations::namespace::rename;
 pub(crate) use ports as port;
+pub(crate) use workspace::captured_view;
 pub(crate) use workspace::serials;
 pub(crate) use workspace::view;
 
@@ -32,6 +33,7 @@ pub(crate) use operations::file::write;
 
 pub use base::{BaseContent, BaseRead, BaseStat, BaseView, DIRECTORY_COUNT_CAPACITY};
 pub use cache::{CanonicalCache, ConstructedObjects};
+pub use captured_view::CapturedView;
 pub use client::{CanonicalClient, ClientWork};
 pub use construction::{
     CapturedFileAttempt, CapturedFileCustody, CapturedFileEdits, CapturedFileWork,
