@@ -210,6 +210,19 @@ fn relative_snapshot_directory_is_rejected_before_effects() {
     assert!(failure.session.is_none());
     assert!(fs::symlink_metadata(&relative).is_err());
     assert_eq!(fs::read_to_string("/proc/self/mountinfo").unwrap(), mounts);
+    let public_parent = rig.fixture.directory.join("public-parent");
+    fs::create_dir(&public_parent).unwrap();
+    fs::set_permissions(&public_parent, fs::Permissions::from_mode(0o777)).unwrap();
+    let child = public_parent.join("snapshot");
+    let port = SnapshotPort::new(rig.harness.service.operation(ready.token).unwrap(), pin).unwrap();
+    let failure = match SnapshotSession::attach(config(child.clone(), root), Arc::new(port)) {
+        Ok(_) => panic!("writable foreign parent was accepted"),
+        Err(failure) => failure,
+    };
+    assert!(failure.session.is_none());
+    assert!(fs::symlink_metadata(&child).is_err());
+    assert_eq!(fs::read_to_string("/proc/self/mountinfo").unwrap(), mounts);
+    fs::remove_dir(public_parent).unwrap();
     assert_eq!(
         operation
             .overlay()
@@ -249,8 +262,8 @@ fn config(directory: std::path::PathBuf, root: u64) -> SnapshotConfig {
     }
 }
 
-/// The test-owned preload fails just the first mountinfo open or the one
-/// outer spawn after the snapshot mount. All other calls reach the kernel.
+/// The test-owned preload fails just the first mountinfo or mounted O_PATH
+/// open, or the one outer spawn. All other calls reach the kernel.
 fn injected_attach_failure(fault: &str) {
     assert_eq!(
         std::env::var("LFS_SNAPSHOT_TEST_FAULT").as_deref(),
@@ -272,10 +285,11 @@ fn injected_attach_failure(fault: &str) {
         Ok(_) => panic!("the requested failure was not injected"),
         Err(failure) => failure,
     };
-    let expected = if fault == "mountinfo" {
-        Errno::EACCES
-    } else {
-        Errno::EAGAIN
+    let expected = match fault {
+        "mountinfo" => Errno::EACCES,
+        "open" => Errno::EMFILE,
+        "spawn" => Errno::EAGAIN,
+        _ => panic!("unknown fault"),
     };
     assert_eq!(failure.cause.raw_os_error(), Some(expected as i32));
     let mut session = *failure
@@ -288,7 +302,7 @@ fn injected_attach_failure(fault: &str) {
             .unwrap(),
         Some(pin)
     );
-    if fault == "mountinfo" {
+    if fault == "mountinfo" || fault == "open" {
         assert!(session.entry().is_none());
         let replacement = rig.fixture.directory.join("replacement");
         fs::create_dir(&replacement).unwrap();
@@ -356,4 +370,10 @@ fn snapshot_original_mount_is_reobserved_after_mountinfo_error() {
 #[ignore = "requires a private FUSE mount and one-shot outer-spawn fault injection"]
 fn snapshot_unstarted_receiver_does_not_prevent_drain() {
     injected_attach_failure("spawn");
+}
+
+#[test]
+#[ignore = "requires a private FUSE mount and one-shot mounted O_PATH fault injection"]
+fn snapshot_original_mount_is_reobserved_after_mounted_open_error() {
+    injected_attach_failure("open");
 }

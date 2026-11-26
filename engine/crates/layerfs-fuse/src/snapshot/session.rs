@@ -128,6 +128,8 @@ impl MountScope {
         let held_namespace = self.namespace_fd.metadata()?;
         let current_namespace = fs::metadata("/proc/thread-self/ns/mnt")?;
         if !named_parent.is_dir()
+            || held_parent.uid() != nix::unistd::Uid::effective().as_raw()
+            || held_parent.mode() & 0o022 != 0
             || (held_parent.dev(), held_parent.ino()) != self.parent_identity
             || (named_parent.dev(), named_parent.ino()) != self.parent_identity
             || (held_namespace.dev(), held_namespace.ino()) != self.namespace_identity
@@ -325,19 +327,6 @@ impl SnapshotSession {
             failure,
             drain_wait: config.drain_wait,
         };
-        let mounted_fd = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(
-                nix::libc::O_PATH
-                    | nix::libc::O_DIRECTORY
-                    | nix::libc::O_NOFOLLOW
-                    | nix::libc::O_CLOEXEC,
-            )
-            .open(session.scope.held_directory());
-        match mounted_fd {
-            Ok(file) => session.mounted_fd = Some(file),
-            Err(cause) => return Err(session.retained(cause)),
-        }
         if let Err(cause) = session.observe_mount() {
             return Err(session.retained(cause));
         }
@@ -389,9 +378,11 @@ impl SnapshotSession {
         self.entry.as_ref()
     }
 
-    /// Read the original mount again after a failed observation. Only the
-    /// held namespace, parent, unique source and mounted descriptor can bind
-    /// the first receipt; a later observation must match that whole receipt.
+    /// Read the original mount again after a failed observation. The first
+    /// receipt requires matching observations on both sides of opening its
+    /// mounted descriptor, and that descriptor's kernel mount ID. The parent
+    /// is private to the mounting owner and the source is unique to this call.
+    /// Later observations must also match the whole original receipt.
     pub fn observe_mount(&mut self) -> io::Result<&MountEntry> {
         if self.state != MountState::Mounted {
             return Err(io::Error::other("snapshot mount is not mounted"));
@@ -401,27 +392,55 @@ impl SnapshotSession {
         if (directory.dev(), directory.ino()) != self.directory_identity {
             return Err(io::Error::other("snapshot directory identity changed"));
         }
-        let expected_id = match (&self.mounted_fd, &self.entry) {
-            (Some(file), _) => mount_id(file)?,
-            (None, Some(entry)) => entry.id,
-            (None, None) => {
-                return Err(io::Error::other(
-                    "original snapshot mount descriptor absent",
-                ))
-            }
-        };
-        let observed = syscalls::mount_entry(&self.directory)?;
-        if observed.id != expected_id
-            || observed.filesystem != "fuse"
-            || observed.source != self.scope.source
-            || !observed.options.split(',').any(|option| option == "ro")
-            || self.entry.as_ref().is_some_and(|entry| entry != &observed)
+        let before = syscalls::mount_entry(&self.directory)?;
+        if before.filesystem != "fuse"
+            || before.source != self.scope.source
+            || !before.options.split(',').any(|option| option == "ro")
+            || self.entry.as_ref().is_some_and(|entry| entry != &before)
         {
             return Err(io::Error::other(
                 "snapshot read-only mount identity changed",
             ));
         }
-        self.entry = Some(observed);
+        let new_fd = if self.mounted_fd.is_none() && self.entry.is_none() {
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        nix::libc::O_PATH
+                            | nix::libc::O_DIRECTORY
+                            | nix::libc::O_NOFOLLOW
+                            | nix::libc::O_CLOEXEC,
+                    )
+                    .open(self.scope.held_directory())?,
+            )
+        } else {
+            None
+        };
+        let expected_id = match self.mounted_fd.as_ref().or(new_fd.as_ref()) {
+            Some(file) => mount_id(file)?,
+            None => {
+                self.entry
+                    .as_ref()
+                    .expect("a known mount has its receipt")
+                    .id
+            }
+        };
+        let after = syscalls::mount_entry(&self.directory)?;
+        self.scope.verify()?;
+        let directory = self.directory_fd.metadata()?;
+        if before != after
+            || expected_id != before.id
+            || (directory.dev(), directory.ino()) != self.directory_identity
+        {
+            return Err(io::Error::other(
+                "snapshot read-only mount changed during observation",
+            ));
+        }
+        if let Some(file) = new_fd {
+            self.mounted_fd = Some(file);
+        }
+        self.entry = Some(before);
         Ok(self
             .entry
             .as_ref()
